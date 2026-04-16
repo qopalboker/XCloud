@@ -1380,11 +1380,8 @@ elseif($action=='dashboard'){
     $canShare=($role==='admin')?true:(bool)($perms['can_share']??0);
 
     // Shared files: files shared WITH the current view user
-    $sharedWithMe=[];
-    if($viewUser===$_SESSION['user']){
-        $ss=$pdo->prepare("SELECT fs.*, fs.id as share_id FROM file_shares fs WHERE fs.shared_with=? ORDER BY fs.created_at DESC");
-        $ss->execute([$_SESSION['user']]);$sharedWithMe=$ss->fetchAll(PDO::FETCH_ASSOC);
-    }
+    $ss=$pdo->prepare("SELECT fs.*, fs.id as share_id FROM file_shares fs WHERE fs.shared_with=? ORDER BY fs.created_at DESC");
+    $ss->execute([$viewUser]);$sharedWithMe=$ss->fetchAll(PDO::FETCH_ASSOC);
 
     // Public files
     $publicFiles=[];

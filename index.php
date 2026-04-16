@@ -87,11 +87,45 @@ function maybeRunTrashCleanup($pdo,$trash_base){
 $MAX_FILE_SIZE=1*1024*1024*1024;
 $MAX_STORAGE_PER_USER=3*1073741824;
 
+// قبل از session_start()
+ini_set('session.gc_maxlifetime', 86400); // 24 ساعت به جای 24 دقیقه
+ini_set('session.cookie_lifetime', 86400);
+session_set_cookie_params([
+    'lifetime' => 86400,
+    'path' => '/',
+    'domain' => '',
+    'secure' => !empty($_SERVER['HTTPS']),
+    'httponly' => true,
+    'samesite' => 'Lax'
+]);
 session_start();
 ini_set('display_errors',0);
 
 function generateCsrfToken(){if(empty($_SESSION['csrf_token']))$_SESSION['csrf_token']=bin2hex(random_bytes(32));return $_SESSION['csrf_token'];}
-function verifyCsrf(){$t=$_POST['csrf_token']??'';if(empty($t)||!hash_equals($_SESSION['csrf_token']??'',$t))die("خطای امنیتی: توکن CSRF نامعتبر است.");}
+function renderCsrfError(){
+    http_response_code(419);
+    $back=isset($_SESSION['user'])?'?action=dashboard':'index.php';
+    echo '<!DOCTYPE html><html lang="fa" dir="rtl"><head><meta charset="UTF-8">'
+        .'<meta name="viewport" content="width=device-width,initial-scale=1">'
+        .'<title>نشست منقضی شد</title>'
+        .'<style>body{margin:0;font-family:Tahoma,system-ui,sans-serif;background:#0f172a;color:#e2e8f0;'
+        .'display:flex;align-items:center;justify-content:center;min-height:100vh;padding:20px}'
+        .'.card{max-width:440px;width:100%;background:#1e293b;border:1px solid #334155;border-radius:14px;'
+        .'padding:32px;text-align:center;box-shadow:0 10px 40px rgba(0,0,0,.3)}'
+        .'.icon{font-size:3rem;margin-bottom:12px}'
+        .'h1{font-size:1.15rem;margin:0 0 10px;color:#f1f5f9}'
+        .'p{font-size:.88rem;line-height:1.7;color:#94a3b8;margin:0 0 22px}'
+        .'a.btn{display:inline-block;padding:10px 22px;background:#3b82f6;color:#fff;text-decoration:none;'
+        .'border-radius:8px;font-weight:600;font-size:.85rem;transition:background .2s}'
+        .'a.btn:hover{background:#2563eb}</style></head><body>'
+        .'<div class="card"><div class="icon">⏳</div>'
+        .'<h1>نشست شما منقضی شده است</h1>'
+        .'<p>توکن امنیتی فرم نامعتبر یا منقضی شده است. لطفاً صفحه را دوباره باز کنید و عملیات را از نو انجام دهید.</p>'
+        .'<a class="btn" href="'.h($back).'">بازگشت</a>'
+        .'</div></body></html>';
+    exit;
+}
+function verifyCsrf(){$t=$_POST['csrf_token']??'';if(empty($t)||!hash_equals($_SESSION['csrf_token']??'',$t))renderCsrfError();}
 
 $host='localhost';$db='retrivoi_xcloud';$user='retrivoi_user';$pass='Parsa1590320';
 try{$pdo=new PDO("mysql:host=$host;dbname=$db;charset=utf8mb4",$user,$pass);$pdo->setAttribute(PDO::ATTR_ERRMODE,PDO::ERRMODE_EXCEPTION);}
@@ -1380,11 +1414,8 @@ elseif($action=='dashboard'){
     $canShare=($role==='admin')?true:(bool)($perms['can_share']??0);
 
     // Shared files: files shared WITH the current view user
-    $sharedWithMe=[];
-    if($viewUser===$_SESSION['user']){
-        $ss=$pdo->prepare("SELECT fs.*, fs.id as share_id FROM file_shares fs WHERE fs.shared_with=? ORDER BY fs.created_at DESC");
-        $ss->execute([$_SESSION['user']]);$sharedWithMe=$ss->fetchAll(PDO::FETCH_ASSOC);
-    }
+    $ss=$pdo->prepare("SELECT fs.*, fs.id as share_id FROM file_shares fs WHERE fs.shared_with=? ORDER BY fs.created_at DESC");
+    $ss->execute([$viewUser]);$sharedWithMe=$ss->fetchAll(PDO::FETCH_ASSOC);
 
     // Public files
     $publicFiles=[];

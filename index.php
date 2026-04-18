@@ -182,6 +182,35 @@ $pdo->exec("CREATE TABLE IF NOT EXISTS file_shares (
     INDEX idx_owner (original_owner)
 )");
 
+$pdo->exec("CREATE TABLE IF NOT EXISTS email_otps (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    email VARCHAR(255) NOT NULL,
+    otp_hash CHAR(64) NOT NULL,
+    purpose VARCHAR(30) NOT NULL DEFAULT 'register',
+    attempts TINYINT UNSIGNED NOT NULL DEFAULT 0,
+    max_attempts TINYINT UNSIGNED NOT NULL DEFAULT 5,
+    ip_address VARCHAR(45) DEFAULT NULL,
+    user_agent VARCHAR(255) DEFAULT NULL,
+    payload TEXT DEFAULT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    expires_at TIMESTAMP NOT NULL,
+    consumed_at TIMESTAMP NULL DEFAULT NULL,
+    INDEX idx_email_purpose (email, purpose),
+    INDEX idx_expires (expires_at)
+)");
+
+$pdo->exec("CREATE TABLE IF NOT EXISTS email_send_log (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    email VARCHAR(255) NOT NULL,
+    ip_address VARCHAR(45) NOT NULL,
+    purpose VARCHAR(30) NOT NULL DEFAULT 'register',
+    status ENUM('sent','failed','rate_limited') NOT NULL,
+    error_message TEXT DEFAULT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_email_time (email, created_at),
+    INDEX idx_ip_time (ip_address, created_at)
+)");
+
 // Add can_share permission for users
 foreach(['ALTER TABLE users ADD COLUMN can_share TINYINT(1) NOT NULL DEFAULT 0'] as $q){try{$pdo->exec($q);}catch(Exception $e){}}
 $pdo->exec("UPDATE users SET can_share=1 WHERE role='admin'");
@@ -320,9 +349,37 @@ function pk_origin(){
 
 
 // Migrations
-foreach(['ALTER TABLE users MODIFY COLUMN password VARCHAR(255) NOT NULL','ALTER TABLE users ADD COLUMN created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP','ALTER TABLE users ADD COLUMN can_download TINYINT(1) NOT NULL DEFAULT 0','ALTER TABLE users ADD COLUMN can_change_password TINYINT(1) NOT NULL DEFAULT 0','ALTER TABLE users ADD COLUMN can_delete TINYINT(1) NOT NULL DEFAULT 0'] as $q){try{$pdo->exec($q);}catch(Exception $e){}}
+foreach(['ALTER TABLE users MODIFY COLUMN password VARCHAR(255) NOT NULL','ALTER TABLE users ADD COLUMN created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP','ALTER TABLE users ADD COLUMN can_download TINYINT(1) NOT NULL DEFAULT 0','ALTER TABLE users ADD COLUMN can_change_password TINYINT(1) NOT NULL DEFAULT 0','ALTER TABLE users ADD COLUMN can_delete TINYINT(1) NOT NULL DEFAULT 0','ALTER TABLE users ADD COLUMN email VARCHAR(255) DEFAULT NULL','ALTER TABLE users ADD COLUMN email_verified TINYINT(1) NOT NULL DEFAULT 0','ALTER TABLE users ADD COLUMN email_verified_at TIMESTAMP NULL DEFAULT NULL','ALTER TABLE users ADD UNIQUE KEY uq_email (email)'] as $q){try{$pdo->exec($q);}catch(Exception $e){}}
 
 $pdo->exec("UPDATE users SET can_download=1,can_change_password=1,can_delete=1,can_share=1 WHERE role='admin'");
+
+$defaultSettings = [
+    'smtp_host'                       => 'xcloud.retrivo.ir',
+    'smtp_port'                       => '465',
+    'smtp_encryption'                 => 'ssl',
+    'smtp_username'                   => 'otp@xcloud.retrivo.ir',
+    'smtp_password'                   => '',
+    'smtp_from_email'                 => 'otp@xcloud.retrivo.ir',
+    'smtp_from_name'                  => 'XCloud',
+    'smtp_timeout'                    => '15',
+    'smtp_debug'                      => '0',
+    'registration_enabled'            => '0',
+    'otp_length'                      => '6',
+    'otp_ttl_minutes'                 => '10',
+    'otp_resend_cooldown_seconds'     => '60',
+    'otp_max_attempts'                => '5',
+    'otp_max_per_email_per_hour'      => '5',
+    'otp_max_per_ip_per_hour'         => '10',
+    'otp_pepper'                      => bin2hex(random_bytes(16)),
+    'default_user_can_download'       => '1',
+    'default_user_can_change_password'=> '1',
+    'default_user_can_delete'         => '0',
+    'default_user_can_share'          => '0',
+];
+foreach($defaultSettings as $k=>$v){
+    $pdo->prepare("INSERT IGNORE INTO settings (setting_key,setting_value) VALUES(?,?)")
+        ->execute([$k,$v]);
+}
 
 $ca=$pdo->query("SELECT id,password FROM users WHERE username='admin'")->fetch();
 if(!$ca){$h=password_hash('1234',PASSWORD_DEFAULT);$s=$pdo->prepare("INSERT INTO users (username,password,role) VALUES('admin',?,'admin')");$s->execute([$h]);}

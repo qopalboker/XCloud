@@ -204,6 +204,146 @@ function render_otp_email($purpose, $code, $ttlMinutes) {
 
     return [$subject, $html, $text];
 }
+
+// ================================================================
+// EMAIL OTP SERVICE
+// ================================================================
+
+function generate_otp_code($length = 6) {
+    $code = '';
+    for ($i = 0; $i < $length; $i++) {
+        $code .= random_int(0, 9);
+    }
+    return $code;
+}
+
+function hash_otp($pdo, $code) {
+    $pepper = getSetting($pdo, 'otp_pepper', 'xcloud_default_pepper');
+    return hash('sha256', $pepper . '|' . $code);
+}
+
+/**
+ * Request a new OTP for a given email and purpose. Sends the email.
+ *
+ * @param string $purpose 'register' | 'password_reset' | 'email_add'
+ * @param string|null $payload JSON string with extra context (e.g., username, user_id)
+ * @return array ['ok' => bool, 'reason' => string|null, 'expires_at' => string|null, 'retry_after' => int|null]
+ */
+function request_email_otp($pdo, $email, $purpose = 'register', $payload = null) {
+    $email = trim(mb_strtolower($email));
+    $ip    = $_SERVER['REMOTE_ADDR'] ?? 'unknown';
+    $ua    = mb_substr($_SERVER['HTTP_USER_AGENT'] ?? '', 0, 250);
+
+    // Rate limit (function from Phase 4)
+    $rl = check_otp_rate_limit($pdo, $email, $ip);
+    if (!$rl['ok']) {
+        $pdo->prepare("INSERT INTO email_send_log (email,ip_address,purpose,status,error_message) VALUES(?,?,?,'rate_limited',?)")
+            ->execute([$email, $ip, $purpose, $rl['reason']]);
+        return $rl;
+    }
+
+    $length     = max(4, min(8, (int)getSetting($pdo, 'otp_length', 6)));
+    $ttlMin     = max(1, min(60, (int)getSetting($pdo, 'otp_ttl_minutes', 10)));
+    $maxAttempt = max(3, min(10, (int)getSetting($pdo, 'otp_max_attempts', 5)));
+    $code       = generate_otp_code($length);
+    $hash       = hash_otp($pdo, $code);
+    $expiresAt  = date('Y-m-d H:i:s', time() + $ttlMin * 60);
+
+    // Invalidate prior unconsumed OTPs
+    $pdo->prepare("UPDATE email_otps SET consumed_at = NOW() WHERE email = ? AND purpose = ? AND consumed_at IS NULL")
+        ->execute([$email, $purpose]);
+
+    // Insert new OTP
+    $pdo->prepare("INSERT INTO email_otps
+        (email, otp_hash, purpose, max_attempts, ip_address, user_agent, payload, expires_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+        ->execute([$email, $hash, $purpose, $maxAttempt, $ip, $ua, $payload, $expiresAt]);
+    $otpId = (int)$pdo->lastInsertId();
+
+    // Render and send email (function from Phase 10)
+    [$subject, $html, $text] = render_otp_email($purpose, $code, $ttlMin);
+    $send = xcloud_send_email($pdo, $email, $subject, $html, $text, $purpose);
+
+    if (!$send['ok']) {
+        // Burn this OTP if delivery failed
+        $pdo->prepare("UPDATE email_otps SET consumed_at = NOW() WHERE id = ?")->execute([$otpId]);
+        return ['ok' => false, 'reason' => 'send_failed', 'error' => $send['error']];
+    }
+
+    return ['ok' => true, 'expires_at' => $expiresAt];
+}
+
+/**
+ * Verify an OTP code. Uses transactional row locking to prevent race conditions.
+ *
+ * @return array ['ok' => bool, 'reason' => string|null, 'payload' => string|null, 'remaining' => int|null]
+ */
+function verify_email_otp($pdo, $email, $code, $purpose = 'register') {
+    $email = trim(mb_strtolower($email));
+    $code  = trim($code);
+
+    if (!preg_match('/^\d{4,8}$/', $code)) {
+        return ['ok' => false, 'reason' => 'invalid_format'];
+    }
+
+    $pdo->beginTransaction();
+    try {
+        $st = $pdo->prepare("SELECT id, otp_hash, attempts, max_attempts, payload, expires_at
+            FROM email_otps
+            WHERE email = ? AND purpose = ? AND consumed_at IS NULL
+            ORDER BY id DESC LIMIT 1 FOR UPDATE");
+        $st->execute([$email, $purpose]);
+        $row = $st->fetch();
+
+        if (!$row) {
+            $pdo->commit();
+            return ['ok' => false, 'reason' => 'not_found'];
+        }
+
+        if (strtotime($row['expires_at']) < time()) {
+            $pdo->prepare("UPDATE email_otps SET consumed_at = NOW() WHERE id = ?")->execute([$row['id']]);
+            $pdo->commit();
+            return ['ok' => false, 'reason' => 'expired'];
+        }
+
+        if ((int)$row['attempts'] >= (int)$row['max_attempts']) {
+            $pdo->prepare("UPDATE email_otps SET consumed_at = NOW() WHERE id = ?")->execute([$row['id']]);
+            $pdo->commit();
+            return ['ok' => false, 'reason' => 'too_many_attempts'];
+        }
+
+        $pdo->prepare("UPDATE email_otps SET attempts = attempts + 1 WHERE id = ?")->execute([$row['id']]);
+        $expectedHash = hash_otp($pdo, $code);
+
+        if (!hash_equals($row['otp_hash'], $expectedHash)) {
+            $remaining = (int)$row['max_attempts'] - (int)$row['attempts'] - 1;
+            $pdo->commit();
+            return ['ok' => false, 'reason' => 'wrong_code', 'remaining' => max(0, $remaining)];
+        }
+
+        $pdo->prepare("UPDATE email_otps SET consumed_at = NOW() WHERE id = ?")->execute([$row['id']]);
+        $pdo->commit();
+        return ['ok' => true, 'payload' => $row['payload']];
+
+    } catch (\Exception $e) {
+        $pdo->rollBack();
+        return ['ok' => false, 'reason' => 'db_error'];
+    }
+}
+
+/**
+ * Periodic cleanup, throttled to once per hour. Removes expired OTPs and old send logs.
+ */
+function maybeRunOtpCleanup($pdo) {
+    $last = getSetting($pdo, 'otp_last_cleanup', '2000-01-01 00:00:00');
+    if (strtotime($last) > strtotime('-1 hour')) return;
+    try {
+        $pdo->exec("DELETE FROM email_otps WHERE expires_at < (NOW() - INTERVAL 1 DAY)");
+        $pdo->exec("DELETE FROM email_send_log WHERE created_at < (NOW() - INTERVAL 30 DAY)");
+        setSetting($pdo, 'otp_last_cleanup', date('Y-m-d H:i:s'));
+    } catch (\Exception $e) { /* swallow */ }
+}
+
 function maybeRunTrashCleanup($pdo,$trash_base){
     $last=getSetting($pdo,'trash_last_cleanup','2000-01-01 00:00:00');
     if(strtotime($last)>strtotime('-1 day'))return;
@@ -545,6 +685,7 @@ if(isset($_SESSION['user'])&&$_SESSION['role']==='admin'){
 
 // Auto cleanup check (once per day)
 if(isset($_SESSION['user']))maybeRunTrashCleanup($pdo,$trash_base);
+maybeRunOtpCleanup($pdo);
 
 // Trash count for admin badge
 $trashCount=0;

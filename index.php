@@ -908,14 +908,31 @@ if($action==='passkey_delete'){
     exit;
 }
 
-if($action=='login_process'){
-    verifyCsrf();$u=trim($_POST['username']??'');$p=$_POST['password']??'';
-    $st=$pdo->prepare("SELECT username,password,role FROM users WHERE username=?");$st->execute([$u]);$ud=$st->fetch();
-    if($ud&&password_verify($p,$ud['password'])){
-        session_regenerate_id(true);$_SESSION['user']=$ud['username'];$_SESSION['role']=$ud['role'];
-        logActivity($pdo,$ud['username'],'login',null,'ورود موفق');header("Location: ?action=dashboard");exit;
+if ($action == 'login_process') {
+    verifyCsrf();
+    $identifier = trim($_POST['username'] ?? '');
+    $p = $_POST['password'] ?? '';
+
+    if ($identifier === '' || $p === '') {
+        header("Location: index.php?error=1"); exit;
     }
-    logActivity($pdo,$u?:'unknown','login_failed',null,'تلاش ناموفق');header("Location: index.php?error=1");exit;
+
+    // Lookup by username OR email (case-insensitive for email)
+    $st = $pdo->prepare("SELECT username, password, role FROM users
+        WHERE username = ? OR email = LOWER(?) LIMIT 1");
+    $st->execute([$identifier, $identifier]);
+    $ud = $st->fetch();
+
+    if ($ud && password_verify($p, $ud['password'])) {
+        session_regenerate_id(true);
+        $_SESSION['user'] = $ud['username'];
+        $_SESSION['role'] = $ud['role'];
+        logActivity($pdo, $ud['username'], 'login', null, 'ورود موفق');
+        header("Location: ?action=dashboard"); exit;
+    }
+
+    logActivity($pdo, $identifier ?: 'unknown', 'login_failed', null, 'تلاش ناموفق');
+    header("Location: index.php?error=1"); exit;
 }
 
 if($action=='logout'){if(isset($_SESSION['user']))logActivity($pdo,$_SESSION['user'],'logout');session_destroy();header("Location: index.php");exit;}
@@ -1756,7 +1773,7 @@ if ('serviceWorker' in navigator) {
         <?php if($hasError):?><div class="error-box">نام کاربری یا رمز عبور اشتباه است!</div><?php endif;?>
         <form action="?action=login_process" method="POST">
             <input type="hidden" name="csrf_token" value="<?php echo $csrf;?>">
-            <div class="field"><label>نام کاربری</label><input type="text" name="username" placeholder="Username" required autocomplete="username"></div>
+            <div class="field"><label>نام کاربری یا ایمیل</label><input type="text" name="username" placeholder="نام کاربری یا ایمیل" required autocomplete="username"></div>
             <div class="field"><label>رمز عبور</label><input type="password" name="password" placeholder="••••••••" required autocomplete="current-password"></div>
             <button type="submit" class="submit-btn">ورود به سیستم</button>
         </form>

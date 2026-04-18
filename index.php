@@ -745,6 +745,7 @@ $defaultSettings = [
     'default_user_can_change_password'=> '1',
     'default_user_can_delete'         => '0',
     'default_user_can_share'          => '0',
+    'setup_completed'                 => '0',
 ];
 foreach($defaultSettings as $k=>$v){
     $pdo->prepare("INSERT IGNORE INTO settings (setting_key,setting_value) VALUES(?,?)")
@@ -793,6 +794,386 @@ if(isset($_SESSION['user'])&&$_SESSION['role']==='admin'){
 // ACTION HANDLERS
 // ================================================================
 
+// ================================================================
+// SETUP WIZARD (one-time, post-deploy automation)
+// ================================================================
+
+if ($action == 'setup_wizard' || strpos($action, 'setup_') === 0) {
+    if (!isset($_SESSION['user']) || $_SESSION['role'] !== 'admin') {
+        die('Forbidden');
+    }
+    if (getSetting($pdo, 'setup_completed', '0') === '1' && empty($_GET['unlock'])) {
+        header("Location: ?action=dashboard&msg=setup_already_done"); exit;
+    }
+}
+
+// ─── Pre-flight check (returns array of [name, ok, detail]) ──
+function setup_preflight_checks($pdo) {
+    $checks = [];
+
+    // PHP version
+    $checks[] = ['PHP version (>= 7.4)', version_compare(PHP_VERSION, '7.4.0', '>='), PHP_VERSION];
+
+    // Required extensions
+    foreach (['pdo_mysql', 'openssl', 'mbstring', 'fileinfo'] as $ext) {
+        $checks[] = ["PHP extension: $ext", extension_loaded($ext), extension_loaded($ext) ? 'loaded' : 'MISSING'];
+    }
+
+    // PHPMailer files
+    $files = ['PHPMailer.php', 'SMTP.php', 'Exception.php'];
+    foreach ($files as $f) {
+        $p = __DIR__ . "/lib/PHPMailer/$f";
+        $checks[] = ["lib/PHPMailer/$f", file_exists($p), file_exists($p) ? 'present' : 'MISSING'];
+    }
+
+    // PHPMailer class loadable
+    $checks[] = ['PHPMailer class', class_exists('PHPMailer\PHPMailer\PHPMailer'),
+                 class_exists('PHPMailer\PHPMailer\PHPMailer') ? 'loaded' : 'NOT LOADED'];
+
+    // Required tables
+    foreach (['users', 'settings', 'email_otps', 'email_send_log', 'activity_log'] as $tbl) {
+        try {
+            $pdo->query("SELECT 1 FROM `$tbl` LIMIT 1");
+            $checks[] = ["Table: $tbl", true, 'exists'];
+        } catch (\Exception $e) {
+            $checks[] = ["Table: $tbl", false, 'MISSING'];
+        }
+    }
+
+    // Required users columns
+    try {
+        $cols = $pdo->query("SHOW COLUMNS FROM users")->fetchAll(PDO::FETCH_COLUMN);
+        foreach (['email', 'email_verified', 'email_verified_at'] as $c) {
+            $checks[] = ["users.$c column", in_array($c, $cols), in_array($c, $cols) ? 'exists' : 'MISSING'];
+        }
+    } catch (\Exception $e) {
+        $checks[] = ['users columns check', false, $e->getMessage()];
+    }
+
+    // Required settings keys
+    $required = ['smtp_host', 'smtp_port', 'smtp_username', 'smtp_from_email', 'otp_pepper',
+                 'registration_enabled', 'otp_length', 'otp_ttl_minutes'];
+    foreach ($required as $key) {
+        $val = getSetting($pdo, $key, null);
+        $checks[] = ["Setting: $key", $val !== null, $val !== null ? 'present' : 'MISSING'];
+    }
+
+    // SMTP password set
+    $smtpPass = getSetting($pdo, 'smtp_password', '');
+    $checks[] = ['SMTP password configured', !empty($smtpPass), !empty($smtpPass) ? 'set' : 'EMPTY (will be set in next step)'];
+
+    // Admin has email
+    $st = $pdo->prepare("SELECT email FROM users WHERE username = ?");
+    $st->execute([$_SESSION['user']]);
+    $adminEmail = $st->fetchColumn();
+    $checks[] = ['Admin user has email', !empty($adminEmail), !empty($adminEmail) ? $adminEmail : 'OPTIONAL (will be set if needed for tests)'];
+
+    return $checks;
+}
+
+// ─── POST: Save SMTP config ──────────────────────────────────
+if ($action == 'setup_save_smtp') {
+    verifyCsrf();
+    $fields = ['smtp_host', 'smtp_port', 'smtp_encryption', 'smtp_username',
+               'smtp_from_email', 'smtp_from_name'];
+    foreach ($fields as $f) {
+        if (isset($_POST[$f])) setSetting($pdo, $f, trim($_POST[$f]));
+    }
+    // Password only updates if non-empty (preserves existing on re-save)
+    if (!empty($_POST['smtp_password'])) {
+        setSetting($pdo, 'smtp_password', $_POST['smtp_password']);
+    }
+    logActivity($pdo, $_SESSION['user'], 'setup_smtp_saved');
+    header("Location: ?action=setup_wizard&msg=smtp_saved"); exit;
+}
+
+// ─── POST: Send test email ───────────────────────────────────
+if ($action == 'setup_test_email') {
+    verifyCsrf();
+    $to = trim($_POST['test_email'] ?? '');
+    if (!validate_email_address($to)) {
+        header("Location: ?action=setup_wizard&error=invalid_email"); exit;
+    }
+    $subject = 'XCloud — تست SMTP';
+    $html = '<!DOCTYPE html><html lang="fa" dir="rtl"><body style="font-family:Tahoma">'
+          . '<div style="max-width:500px;margin:30px auto;padding:24px;background:#f1f5f9;border-radius:12px">'
+          . '<h2 style="color:#1e40af">✅ XCloud SMTP کار می‌کند</h2>'
+          . '<p>این یک پیام تست از Setup Wizard است. اگر این ایمیل را دریافت کردید، '
+          . 'پیکربندی SMTP شما کاملاً موفق بوده است.</p>'
+          . '<p style="color:#64748b;font-size:.85rem">زمان ارسال: ' . date('Y-m-d H:i:s') . '</p>'
+          . '</div></body></html>';
+    $result = xcloud_send_email($pdo, $to, $subject, $html, null, 'setup_test');
+    if ($result['ok']) {
+        $_SESSION['setup_test_email_ok'] = true;
+        logActivity($pdo, $_SESSION['user'], 'setup_test_email_sent', $to);
+        header("Location: ?action=setup_wizard&msg=test_sent&to=" . urlencode($to)); exit;
+    }
+    header("Location: ?action=setup_wizard&error=test_failed&detail=" . urlencode(mb_substr($result['error'], 0, 200))); exit;
+}
+
+// ─── POST: Smoke test - send OTP for a purpose ──────────────
+if ($action == 'setup_smoke_send') {
+    verifyCsrf();
+    $purpose = $_POST['purpose'] ?? 'register';
+    $email = trim(mb_strtolower($_POST['smoke_email'] ?? ''));
+    if (!in_array($purpose, ['register', 'password_reset', 'email_add'], true)) {
+        die('Invalid purpose');
+    }
+    if (!validate_email_address($email)) {
+        header("Location: ?action=setup_wizard&error=invalid_email"); exit;
+    }
+    $payload = json_encode(['smoke_test' => true, 'admin' => $_SESSION['user']]);
+    $result = request_email_otp($pdo, $email, $purpose, $payload);
+    if (!$result['ok']) {
+        header("Location: ?action=setup_wizard&error=smoke_send_failed&purpose=" . urlencode($purpose)
+             . "&detail=" . urlencode($result['reason'] ?? 'unknown')); exit;
+    }
+    $_SESSION['setup_smoke'][$purpose] = ['email' => $email, 'expires_at' => $result['expires_at']];
+    header("Location: ?action=setup_wizard&msg=smoke_sent&purpose=" . urlencode($purpose)); exit;
+}
+
+// ─── POST: Smoke test - verify OTP that admin received ──────
+if ($action == 'setup_smoke_verify') {
+    verifyCsrf();
+    $purpose = $_POST['purpose'] ?? 'register';
+    $code = trim($_POST['smoke_code'] ?? '');
+    if (empty($_SESSION['setup_smoke'][$purpose])) {
+        header("Location: ?action=setup_wizard&error=smoke_no_pending"); exit;
+    }
+    $email = $_SESSION['setup_smoke'][$purpose]['email'];
+    $verify = verify_email_otp($pdo, $email, $code, $purpose);
+    if ($verify['ok']) {
+        $_SESSION['setup_smoke_done'][$purpose] = true;
+        unset($_SESSION['setup_smoke'][$purpose]);
+        logActivity($pdo, $_SESSION['user'], 'setup_smoke_verified', $purpose);
+        header("Location: ?action=setup_wizard&msg=smoke_ok&purpose=" . urlencode($purpose)); exit;
+    }
+    header("Location: ?action=setup_wizard&error=smoke_verify_failed&purpose=" . urlencode($purpose)
+         . "&reason=" . urlencode($verify['reason'])); exit;
+}
+
+// ─── POST: Enable registration ───────────────────────────────
+if ($action == 'setup_enable_registration') {
+    verifyCsrf();
+    setSetting($pdo, 'registration_enabled', '1');
+    logActivity($pdo, $_SESSION['user'], 'setup_registration_enabled');
+    header("Location: ?action=setup_wizard&msg=registration_on"); exit;
+}
+
+// ─── POST: Lock the wizard ───────────────────────────────────
+if ($action == 'setup_lock') {
+    verifyCsrf();
+    setSetting($pdo, 'setup_completed', '1');
+    logActivity($pdo, $_SESSION['user'], 'setup_completed');
+    unset($_SESSION['setup_smoke'], $_SESSION['setup_smoke_done'], $_SESSION['setup_test_email_ok']);
+    header("Location: ?action=dashboard&msg=setup_locked"); exit;
+}
+
+// ─── GET: The wizard page itself ─────────────────────────────
+if ($action == 'setup_wizard') {
+    $checks = setup_preflight_checks($pdo);
+    $allGreen = true;
+    foreach ($checks as $c) if (!$c[1]) { $allGreen = false; break; }
+    $csrf = generateCsrfToken();
+    $msg = $_GET['msg'] ?? '';
+    $err = $_GET['error'] ?? '';
+    $smokeDone = $_SESSION['setup_smoke_done'] ?? [];
+    $testEmailOk = !empty($_SESSION['setup_test_email_ok']);
+    $regEnabled = getSetting($pdo, 'registration_enabled') === '1';
+
+    // Current SMTP values for the form
+    $smtpVals = [
+        'smtp_host' => getSetting($pdo, 'smtp_host'),
+        'smtp_port' => getSetting($pdo, 'smtp_port'),
+        'smtp_encryption' => getSetting($pdo, 'smtp_encryption', 'ssl'),
+        'smtp_username' => getSetting($pdo, 'smtp_username'),
+        'smtp_from_email' => getSetting($pdo, 'smtp_from_email'),
+        'smtp_from_name' => getSetting($pdo, 'smtp_from_name', 'XCloud'),
+        'smtp_password_set' => !empty(getSetting($pdo, 'smtp_password')),
+    ];
+?>
+<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Setup Wizard — XCloud</title>
+<style>
+body{margin:0;font-family:Tahoma,sans-serif;background:#0f172a;color:#e2e8f0;padding:30px 15px}
+.wrap{max-width:760px;margin:0 auto}
+h1{color:#f1f5f9;font-size:1.6rem;margin:0 0 4px}
+.lead{color:#94a3b8;margin:0 0 24px}
+.card{background:#1e293b;border:1px solid #334155;border-radius:12px;padding:22px 24px;margin-bottom:18px}
+.card h2{margin:0 0 14px;color:#f1f5f9;font-size:1.05rem;display:flex;align-items:center;gap:8px}
+.badge{font-size:.7rem;padding:2px 8px;border-radius:99px;font-weight:600}
+.badge-ok{background:#14532d;color:#bbf7d0}
+.badge-pending{background:#713f12;color:#fde68a}
+.check-row{display:flex;justify-content:space-between;align-items:center;padding:7px 0;border-bottom:1px solid #334155;font-size:.85rem}
+.check-row:last-child{border:none}
+.check-ok{color:#86efac}
+.check-fail{color:#fca5a5}
+.field{margin-bottom:12px}
+label{display:block;color:#cbd5e1;font-size:.8rem;margin-bottom:4px;font-weight:600}
+input,select{width:100%;background:#0f172a;border:1px solid #334155;color:#f1f5f9;padding:9px 11px;border-radius:7px;font-family:inherit;font-size:.85rem;box-sizing:border-box}
+.row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.btn{background:#3b82f6;color:#fff;border:none;padding:10px 18px;border-radius:7px;font-weight:600;cursor:pointer;font-family:inherit;font-size:.85rem}
+.btn-green{background:#16a34a}
+.btn-red{background:#dc2626}
+.btn-gray{background:#475569}
+.btn:disabled{background:#334155;color:#64748b;cursor:not-allowed}
+.msg{padding:10px 14px;border-radius:7px;margin-bottom:14px;font-size:.85rem}
+.msg-ok{background:#14532d;color:#bbf7d0}
+.msg-err{background:#7f1d1d;color:#fee2e2}
+.msg-info{background:#1e3a8a;color:#dbeafe}
+.inline-form{display:flex;gap:8px;flex-wrap:wrap;align-items:end}
+.inline-form .field{flex:1;min-width:200px;margin:0}
+.smoke-grid{display:grid;grid-template-columns:1fr;gap:12px}
+.smoke-item{background:#0f172a;border:1px solid #334155;border-radius:8px;padding:14px}
+.smoke-item h3{margin:0 0 10px;color:#cbd5e1;font-size:.9rem}
+.hint{color:#64748b;font-size:.75rem;margin-top:4px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>🛠️ Setup Wizard — XCloud v3.2</h1>
+  <p class="lead">پیکربندی خودکار پس از deploy. هر مرحله را به ترتیب کامل کنید، در پایان دکمه «قفل کردن Setup» را بزنید.</p>
+
+  <?php if ($msg === 'smtp_saved'): ?><div class="msg msg-ok">✅ تنظیمات SMTP ذخیره شد.</div><?php endif; ?>
+  <?php if ($msg === 'test_sent'): ?><div class="msg msg-ok">📨 ایمیل تست به <?= h($_GET['to'] ?? '') ?> ارسال شد. صندوق ورودی را چک کنید.</div><?php endif; ?>
+  <?php if ($msg === 'smoke_sent'): ?><div class="msg msg-info">📨 OTP برای smoke test (<?= h($_GET['purpose']) ?>) ارسال شد. کد را از ایمیل وارد کنید.</div><?php endif; ?>
+  <?php if ($msg === 'smoke_ok'): ?><div class="msg msg-ok">✅ Smoke test برای <?= h($_GET['purpose']) ?> موفق بود.</div><?php endif; ?>
+  <?php if ($msg === 'registration_on'): ?><div class="msg msg-ok">✅ ثبت‌نام عمومی فعال شد.</div><?php endif; ?>
+
+  <?php if ($err === 'invalid_email'): ?><div class="msg msg-err">⚠️ فرمت ایمیل نامعتبر است.</div><?php endif; ?>
+  <?php if ($err === 'test_failed'): ?><div class="msg msg-err">❌ ارسال ایمیل تست شکست خورد. جزئیات: <?= h($_GET['detail'] ?? '') ?></div><?php endif; ?>
+  <?php if ($err === 'smoke_send_failed'): ?><div class="msg msg-err">❌ ارسال smoke OTP شکست خورد (<?= h($_GET['purpose']) ?>): <?= h($_GET['detail'] ?? '') ?></div><?php endif; ?>
+  <?php if ($err === 'smoke_verify_failed'): ?><div class="msg msg-err">❌ تأیید smoke OTP شکست خورد (<?= h($_GET['purpose']) ?>): <?= h($_GET['reason'] ?? '') ?></div><?php endif; ?>
+
+  <!-- ─── Step 1: Pre-flight ─── -->
+  <div class="card">
+    <h2>۱. بررسی پیش‌نیازها <span class="badge <?= $allGreen ? 'badge-ok' : 'badge-pending' ?>"><?= $allGreen ? 'OK' : 'مشکل دارد' ?></span></h2>
+    <?php foreach ($checks as $c): ?>
+      <div class="check-row">
+        <span><?= h($c[0]) ?></span>
+        <span class="<?= $c[1] ? 'check-ok' : 'check-fail' ?>"><?= $c[1] ? '✅' : '❌' ?> <?= h($c[2]) ?></span>
+      </div>
+    <?php endforeach; ?>
+    <div style="margin-top:12px"><a href="?action=setup_wizard" class="btn btn-gray">🔄 بررسی مجدد</a></div>
+  </div>
+
+  <!-- ─── Step 2: SMTP Config ─── -->
+  <div class="card">
+    <h2>۲. پیکربندی SMTP <?php if ($smtpVals['smtp_password_set']): ?><span class="badge badge-ok">پسورد تنظیم شده</span><?php endif; ?></h2>
+    <form method="POST" action="?action=setup_save_smtp">
+      <input type="hidden" name="csrf_token" value="<?= h($csrf) ?>">
+      <div class="row">
+        <div class="field"><label>Host</label><input type="text" name="smtp_host" value="<?= h($smtpVals['smtp_host']) ?>" required></div>
+        <div class="field"><label>Port</label><input type="number" name="smtp_port" value="<?= h($smtpVals['smtp_port']) ?>" required></div>
+      </div>
+      <div class="row">
+        <div class="field"><label>Encryption</label>
+          <select name="smtp_encryption">
+            <option value="ssl" <?= $smtpVals['smtp_encryption']==='ssl'?'selected':'' ?>>SSL (port 465)</option>
+            <option value="tls" <?= $smtpVals['smtp_encryption']==='tls'?'selected':'' ?>>TLS (port 587)</option>
+            <option value="none" <?= $smtpVals['smtp_encryption']==='none'?'selected':'' ?>>None</option>
+          </select>
+        </div>
+        <div class="field"><label>Username</label><input type="text" name="smtp_username" value="<?= h($smtpVals['smtp_username']) ?>" required></div>
+      </div>
+      <div class="field">
+        <label>Password</label>
+        <input type="password" name="smtp_password" placeholder="<?= $smtpVals['smtp_password_set'] ? 'بدون تغییر — برای تغییر، مقدار جدید وارد کنید' : 'وارد کنید' ?>" autocomplete="new-password">
+        <div class="hint">برای حفظ پسورد فعلی این فیلد را خالی بگذارید</div>
+      </div>
+      <div class="row">
+        <div class="field"><label>From Email</label><input type="email" name="smtp_from_email" value="<?= h($smtpVals['smtp_from_email']) ?>" required></div>
+        <div class="field"><label>From Name</label><input type="text" name="smtp_from_name" value="<?= h($smtpVals['smtp_from_name']) ?>"></div>
+      </div>
+      <button class="btn btn-green">ذخیره تنظیمات SMTP</button>
+    </form>
+  </div>
+
+  <!-- ─── Step 3: Test SMTP ─── -->
+  <div class="card">
+    <h2>۳. تست ارسال SMTP <?php if ($testEmailOk): ?><span class="badge badge-ok">✓ موفق</span><?php endif; ?></h2>
+    <p style="color:#94a3b8;font-size:.85rem;margin:0 0 12px">یک ایمیل ساده به آدرس زیر ارسال می‌شود تا اتصال SMTP را بررسی کنیم.</p>
+    <form method="POST" action="?action=setup_test_email" class="inline-form">
+      <input type="hidden" name="csrf_token" value="<?= h($csrf) ?>">
+      <div class="field"><label>ایمیل تست</label><input type="email" name="test_email" required placeholder="your@email.com"></div>
+      <button class="btn">📧 ارسال ایمیل تست</button>
+    </form>
+  </div>
+
+  <!-- ─── Step 4: Smoke Tests (E2E for each purpose) ─── -->
+  <div class="card">
+    <h2>۴. Smoke Test کامل end-to-end</h2>
+    <p style="color:#94a3b8;font-size:.85rem;margin:0 0 14px">برای هر کدوم از سه نوع OTP، یک ایمیل واقعی ارسال می‌شه. کدی که دریافت می‌کنید رو وارد کنید تا verify بشه.</p>
+    <div class="smoke-grid">
+      <?php foreach (['register' => 'ثبت‌نام', 'password_reset' => 'بازیابی رمز', 'email_add' => 'افزودن ایمیل'] as $p => $label): ?>
+        <div class="smoke-item">
+          <h3><?= h($label) ?> <?php if (!empty($smokeDone[$p])): ?><span class="badge badge-ok">✓ تأیید شد</span><?php endif; ?></h3>
+          <?php if (!empty($smokeDone[$p])): ?>
+            <div style="color:#86efac;font-size:.85rem">این تست با موفقیت انجام شده است.</div>
+          <?php elseif (!empty($_SESSION['setup_smoke'][$p])): ?>
+            <div style="color:#fde68a;font-size:.85rem;margin-bottom:8px">📨 OTP به <code><?= h($_SESSION['setup_smoke'][$p]['email']) ?></code> ارسال شد. کد را وارد کنید:</div>
+            <form method="POST" action="?action=setup_smoke_verify" class="inline-form">
+              <input type="hidden" name="csrf_token" value="<?= h($csrf) ?>">
+              <input type="hidden" name="purpose" value="<?= h($p) ?>">
+              <div class="field"><input type="text" name="smoke_code" required inputmode="numeric" pattern="\d{4,8}" placeholder="کد ۶ رقمی" autocomplete="off"></div>
+              <button class="btn btn-green">تأیید کد</button>
+            </form>
+          <?php else: ?>
+            <form method="POST" action="?action=setup_smoke_send" class="inline-form">
+              <input type="hidden" name="csrf_token" value="<?= h($csrf) ?>">
+              <input type="hidden" name="purpose" value="<?= h($p) ?>">
+              <div class="field"><input type="email" name="smoke_email" required placeholder="ایمیل برای ارسال تست"></div>
+              <button class="btn">📨 ارسال OTP</button>
+            </form>
+          <?php endif; ?>
+        </div>
+      <?php endforeach; ?>
+    </div>
+  </div>
+
+  <!-- ─── Step 5: Enable Registration ─── -->
+  <div class="card">
+    <h2>۵. فعال‌سازی ثبت‌نام عمومی <?php if ($regEnabled): ?><span class="badge badge-ok">فعال</span><?php endif; ?></h2>
+    <?php if (!$regEnabled): ?>
+      <p style="color:#94a3b8;font-size:.85rem;margin:0 0 12px">پس از فعال‌سازی، کاربران جدید می‌توانند با ایمیل ثبت‌نام کنند.</p>
+      <form method="POST" action="?action=setup_enable_registration" style="margin:0">
+        <input type="hidden" name="csrf_token" value="<?= h($csrf) ?>">
+        <button class="btn btn-green">✅ فعال کردن ثبت‌نام</button>
+      </form>
+    <?php else: ?>
+      <p style="color:#86efac;font-size:.85rem;margin:0">ثبت‌نام عمومی فعال است. می‌توانید بعداً از پنل ادمین آن را غیرفعال کنید.</p>
+    <?php endif; ?>
+  </div>
+
+  <!-- ─── Step 6: Lock Setup ─── -->
+  <div class="card" style="border-color:#f59e0b">
+    <h2>۶. قفل کردن Setup Wizard</h2>
+    <p style="color:#94a3b8;font-size:.85rem;margin:0 0 14px">پس از قفل کردن، این صفحه دیگر قابل دسترس نخواهد بود (مگر اینکه با phpMyAdmin مقدار <code>setup_completed</code> را به <code>0</code> برگردانید).</p>
+    <?php
+    $allDone = $allGreen && $testEmailOk && count($smokeDone) === 3;
+    ?>
+    <?php if (!$allDone): ?>
+      <div class="msg msg-info">⚠️ لطفاً قبل از قفل کردن، همه‌ی مراحل بالا را کامل کنید (پیش‌نیازها سبز، تست SMTP موفق، هر سه smoke test تأیید شده).</div>
+    <?php endif; ?>
+    <form method="POST" action="?action=setup_lock" style="margin:0" onsubmit="return confirm('Setup را قفل کنیم؟ این صفحه دیگر در دسترس نخواهد بود.');">
+      <input type="hidden" name="csrf_token" value="<?= h($csrf) ?>">
+      <button class="btn btn-red" <?= $allDone ? '' : 'disabled' ?>>🔒 قفل کردن Setup</button>
+    </form>
+  </div>
+
+  <p style="text-align:center;color:#475569;font-size:.75rem;margin-top:24px">
+    XCloud Setup Wizard v1.0 — برای دسترسی مجدد بعد از قفل، در phpMyAdmin مقدار <code>setup_completed</code> در جدول <code>settings</code> را به <code>0</code> تغییر دهید.
+  </p>
+</div>
+</body>
+</html>
+<?php
+    exit;
+}
 
 // ── passkey_list ────────────────────────────────────────────────
 if($action==='passkey_list'){
@@ -4275,6 +4656,12 @@ if ('serviceWorker' in navigator) {
         echo renderEmailAddBanner($pdo);
         $regEnabled = getSetting($pdo, 'registration_enabled', '0') === '1';
         ?>
+        <?php if (getSetting($pdo, 'setup_completed', '0') !== '1'): ?>
+          <div style="background:#1e3a8a;border:1px solid #3b82f6;color:#dbeafe;padding:14px 18px;border-radius:10px;margin-bottom:14px;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px" dir="rtl">
+            <div>🛠️ <strong>Setup هنوز کامل نشده است.</strong> برای پیکربندی SMTP و تست end-to-end، Setup Wizard را اجرا کنید.</div>
+            <a href="?action=setup_wizard" style="background:#3b82f6;color:#fff;padding:8px 16px;border-radius:6px;text-decoration:none;font-weight:600;font-size:.85rem">باز کردن Setup Wizard</a>
+          </div>
+        <?php endif; ?>
         <div style="background:#1e293b;border:1px solid #334155;border-radius:10px;padding:16px 20px;margin-bottom:16px" dir="rtl">
           <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px">
             <div>

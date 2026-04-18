@@ -222,6 +222,80 @@ function hash_otp($pdo, $code) {
     return hash('sha256', $pepper . '|' . $code);
 }
 
+// ─── Rate limiting ────────────────────────────────────────────
+function check_otp_rate_limit($pdo, $email, $ip) {
+    $maxPerEmail = (int)getSetting($pdo, 'otp_max_per_email_per_hour', 5);
+    $maxPerIp    = (int)getSetting($pdo, 'otp_max_per_ip_per_hour', 10);
+    $cooldown    = (int)getSetting($pdo, 'otp_resend_cooldown_seconds', 60);
+
+    // Cooldown: last successful send to this email
+    $st = $pdo->prepare("SELECT created_at FROM email_send_log
+        WHERE email = ? AND status = 'sent' ORDER BY id DESC LIMIT 1");
+    $st->execute([$email]);
+    $last = $st->fetchColumn();
+    if ($last && (time() - strtotime($last)) < $cooldown) {
+        return ['ok' => false, 'reason' => 'cooldown',
+                'retry_after' => $cooldown - (time() - strtotime($last))];
+    }
+
+    // Per-email per-hour
+    $st = $pdo->prepare("SELECT COUNT(*) FROM email_send_log
+        WHERE email = ? AND status = 'sent' AND created_at > (NOW() - INTERVAL 1 HOUR)");
+    $st->execute([$email]);
+    if ((int)$st->fetchColumn() >= $maxPerEmail) {
+        return ['ok' => false, 'reason' => 'email_quota'];
+    }
+
+    // Per-IP per-hour
+    $st = $pdo->prepare("SELECT COUNT(*) FROM email_send_log
+        WHERE ip_address = ? AND status = 'sent' AND created_at > (NOW() - INTERVAL 1 HOUR)");
+    $st->execute([$ip]);
+    if ((int)$st->fetchColumn() >= $maxPerIp) {
+        return ['ok' => false, 'reason' => 'ip_quota'];
+    }
+
+    return ['ok' => true];
+}
+
+// ─── Input validation ────────────────────────────────────────
+function validate_email_address($email) {
+    if (mb_strlen($email) > 255) return false;
+    return (bool)filter_var($email, FILTER_VALIDATE_EMAIL);
+}
+
+function validate_username($username) {
+    return (bool)preg_match('/^[a-zA-Z][a-zA-Z0-9_-]{2,29}$/', $username);
+}
+
+function validate_password_strength($password) {
+    if (strlen($password) < 8 || strlen($password) > 128) return false;
+    if (!preg_match('/[a-zA-Z]/', $password)) return false;
+    if (!preg_match('/[0-9]/', $password)) return false;
+    return true;
+}
+
+// ─── Math captcha (single-use, session-based) ────────────────
+function math_captcha_generate() {
+    $a  = random_int(1, 9);
+    $b  = random_int(1, 9);
+    $op = random_int(0, 1) === 0 ? '+' : '-';
+    if ($op === '-' && $b > $a) { [$a, $b] = [$b, $a]; }
+    $answer = $op === '+' ? $a + $b : $a - $b;
+    $_SESSION['math_captcha'] = [
+        'answer'  => $answer,
+        'expires' => time() + 600,
+    ];
+    return ['question' => "$a $op $b = ?", 'a' => $a, 'b' => $b, 'op' => $op];
+}
+
+function math_captcha_verify($userAnswer) {
+    if (empty($_SESSION['math_captcha'])) return false;
+    $cap = $_SESSION['math_captcha'];
+    unset($_SESSION['math_captcha']); // single-use
+    if (time() > $cap['expires']) return false;
+    return (string)trim($userAnswer) === (string)$cap['answer'];
+}
+
 /**
  * Request a new OTP for a given email and purpose. Sends the email.
  *

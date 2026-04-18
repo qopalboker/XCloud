@@ -10,7 +10,7 @@ use PHPMailer\PHPMailer\SMTP;
 use PHPMailer\PHPMailer\Exception as PHPMailerException;
 
 // ============================================================
-// XCloud v3.1
+// XCloud v3.2
 // ✅ سطل زباله اصلی با پاکسازی خودکار
 // ✅ پیش‌نمایش فایل‌های txt با دکمه کپی
 // ✅ لایه‌بندی دسکتاپ دو ستونه
@@ -569,6 +569,20 @@ function logActivity($pdo,$username,$actionType,$target=null,$details=null){
     $s->execute([$username,$actionType,$target,$details,$ip]);
 }
 
+/**
+ * Returns true if the current user is allowed to use the email-add flow.
+ * Only users without a verified email can add one. Users with verified email
+ * cannot change it via this flow (out of scope).
+ */
+function userNeedsEmailAdd($pdo) {
+    if (empty($_SESSION['user'])) return false;
+    $st = $pdo->prepare("SELECT email, email_verified FROM users WHERE username = ?");
+    $st->execute([$_SESSION['user']]);
+    $row = $st->fetch();
+    if (!$row) return false;
+    return empty($row['email']) || (int)$row['email_verified'] !== 1;
+}
+
 function renderEmailAddBanner($pdo) {
     if (empty($_SESSION['user'])) return '';
     if (!empty($_SESSION['email_banner_dismissed'])) return '';
@@ -873,6 +887,7 @@ function setup_preflight_checks($pdo) {
 
 // ─── POST: Save SMTP config ──────────────────────────────────
 if ($action == 'setup_save_smtp') {
+    if (!isset($_SESSION['user']) || $_SESSION['role'] !== 'admin') { die('Forbidden'); }
     verifyCsrf();
     $fields = ['smtp_host', 'smtp_port', 'smtp_encryption', 'smtp_username',
                'smtp_from_email', 'smtp_from_name'];
@@ -889,6 +904,7 @@ if ($action == 'setup_save_smtp') {
 
 // ─── POST: Send test email ───────────────────────────────────
 if ($action == 'setup_test_email') {
+    if (!isset($_SESSION['user']) || $_SESSION['role'] !== 'admin') { die('Forbidden'); }
     verifyCsrf();
     $to = trim($_POST['test_email'] ?? '');
     if (!validate_email_address($to)) {
@@ -913,6 +929,7 @@ if ($action == 'setup_test_email') {
 
 // ─── POST: Smoke test - send OTP for a purpose ──────────────
 if ($action == 'setup_smoke_send') {
+    if (!isset($_SESSION['user']) || $_SESSION['role'] !== 'admin') { die('Forbidden'); }
     verifyCsrf();
     $purpose = $_POST['purpose'] ?? 'register';
     $email = trim(mb_strtolower($_POST['smoke_email'] ?? ''));
@@ -934,6 +951,7 @@ if ($action == 'setup_smoke_send') {
 
 // ─── POST: Smoke test - verify OTP that admin received ──────
 if ($action == 'setup_smoke_verify') {
+    if (!isset($_SESSION['user']) || $_SESSION['role'] !== 'admin') { die('Forbidden'); }
     verifyCsrf();
     $purpose = $_POST['purpose'] ?? 'register';
     $code = trim($_POST['smoke_code'] ?? '');
@@ -954,6 +972,7 @@ if ($action == 'setup_smoke_verify') {
 
 // ─── POST: Enable registration ───────────────────────────────
 if ($action == 'setup_enable_registration') {
+    if (!isset($_SESSION['user']) || $_SESSION['role'] !== 'admin') { die('Forbidden'); }
     verifyCsrf();
     setSetting($pdo, 'registration_enabled', '1');
     logActivity($pdo, $_SESSION['user'], 'setup_registration_enabled');
@@ -962,6 +981,7 @@ if ($action == 'setup_enable_registration') {
 
 // ─── POST: Lock the wizard ───────────────────────────────────
 if ($action == 'setup_lock') {
+    if (!isset($_SESSION['user']) || $_SESSION['role'] !== 'admin') { die('Forbidden'); }
     verifyCsrf();
     setSetting($pdo, 'setup_completed', '1');
     logActivity($pdo, $_SESSION['user'], 'setup_completed');
@@ -1616,7 +1636,7 @@ if($action=='file_info'){
     ?><!DOCTYPE html><html lang="fa" dir="rtl"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>بررسی فایل | XCloud</title>
     <?php
 // ================================================================
-// PWA HEAD SNIPPET — XCloud v3.1
+// PWA HEAD SNIPPET — XCloud v3.2
 // این کد رو توی هر <head> از index.php قرار بده
 // ================================================================
 ?>
@@ -2117,6 +2137,14 @@ if ($action == 'admin_toggle_registration') {
     exit;
 }
 
+if ($action == 'admin_unlock_setup') {
+    if (!isset($_SESSION['user']) || $_SESSION['role'] !== 'admin') { die('Forbidden'); }
+    verifyCsrf();
+    setSetting($pdo, 'setup_completed', '0');
+    logActivity($pdo, $_SESSION['user'], 'admin_setup_unlocked');
+    header("Location: ?action=setup_wizard"); exit;
+}
+
 // ================================================================
 // ADMIN DB BACKUP (downloadable .sql dump)
 // ================================================================
@@ -2130,8 +2158,15 @@ if ($action == 'admin_db_backup') {
         die('CSRF token invalid');
     }
 
+    // Try to extend execution time and memory; fall back gracefully if disabled
     @set_time_limit(300);
     @ini_set('memory_limit', '256M');
+    @ignore_user_abort(true);
+
+    // Disable output buffering to stream the file as it's generated
+    while (ob_get_level() > 0) {
+        @ob_end_clean();
+    }
 
     $dbName = null;
     try {
@@ -2847,12 +2882,26 @@ if ($action == 'forgot_password_resend') {
 if ($action == 'email_add_dismiss') {
     if (!isset($_SESSION['user'])) { header("Location: index.php"); exit; }
     $_SESSION['email_banner_dismissed'] = true;
-    header("Location: " . ($_SERVER['HTTP_REFERER'] ?? '?action=dashboard')); exit;
+
+    // Validate Referer is from same origin to prevent open redirect
+    $referer = $_SERVER['HTTP_REFERER'] ?? '';
+    $host = $_SERVER['HTTP_HOST'] ?? '';
+    $safeRedirect = '?action=dashboard';
+    if (!empty($referer) && !empty($host)) {
+        $refHost = parse_url($referer, PHP_URL_HOST);
+        if ($refHost !== false && $refHost === $host) {
+            $safeRedirect = $referer;
+        }
+    }
+    header("Location: " . $safeRedirect); exit;
 }
 
 // ─── GET: Email-add step 1 ───────────────────────────────────
 if ($action == 'email_add_step1') {
     if (!isset($_SESSION['user'])) { header("Location: index.php"); exit; }
+    if (!userNeedsEmailAdd($pdo)) {
+        header("Location: ?action=dashboard&msg=email_already_verified"); exit;
+    }
     $captcha = math_captcha_generate();
     $csrf = generateCsrfToken();
     $err = $_GET['error'] ?? '';
@@ -2907,6 +2956,9 @@ input{width:100%;background:#0f172a;border:1px solid #334155;color:#f1f5f9;paddi
 // ─── POST: Step 1 process ────────────────────────────────────
 if ($action == 'email_add_step1_process') {
     if (!isset($_SESSION['user'])) { header("Location: index.php"); exit; }
+    if (!userNeedsEmailAdd($pdo)) {
+        header("Location: ?action=dashboard&msg=email_already_verified"); exit;
+    }
     verifyCsrf();
     $email = trim(mb_strtolower($_POST['email'] ?? ''));
     $captchaAnswer = $_POST['captcha'] ?? '';
@@ -2922,6 +2974,8 @@ if ($action == 'email_add_step1_process') {
     $st = $pdo->prepare("SELECT id FROM users WHERE email = ? AND username != ?");
     $st->execute([$email, $_SESSION['user']]);
     if ($st->fetch()) {
+        // Mimic OTP-send delay to prevent timing-based email enumeration
+        usleep(random_int(800000, 1500000));
         header("Location: ?action=email_add_step1&error=email_taken"); exit;
     }
 
@@ -2947,6 +3001,9 @@ if ($action == 'email_add_step1_process') {
 // ─── GET: Step 2 form ────────────────────────────────────────
 if ($action == 'email_add_step2') {
     if (!isset($_SESSION['user'])) { header("Location: index.php"); exit; }
+    if (!userNeedsEmailAdd($pdo)) {
+        header("Location: ?action=dashboard&msg=email_already_verified"); exit;
+    }
     if (empty($_SESSION['pending_email_add'])) {
         header("Location: ?action=email_add_step1"); exit;
     }
@@ -3035,6 +3092,9 @@ input{width:100%;background:#0f172a;border:1px solid #334155;color:#f1f5f9;paddi
 // ─── POST: Step 2 process ────────────────────────────────────
 if ($action == 'email_add_step2_process') {
     if (!isset($_SESSION['user'])) { header("Location: index.php"); exit; }
+    if (!userNeedsEmailAdd($pdo)) {
+        header("Location: ?action=dashboard&msg=email_already_verified"); exit;
+    }
     verifyCsrf();
     if (empty($_SESSION['pending_email_add'])) {
         header("Location: ?action=email_add_step1"); exit;
@@ -3074,6 +3134,9 @@ if ($action == 'email_add_step2_process') {
 // ─── POST: Resend OTP ────────────────────────────────────────
 if ($action == 'email_add_resend') {
     if (!isset($_SESSION['user'])) { header("Location: index.php"); exit; }
+    if (!userNeedsEmailAdd($pdo)) {
+        header("Location: ?action=dashboard&msg=email_already_verified"); exit;
+    }
     verifyCsrf();
     if (empty($_SESSION['pending_email_add'])) {
         header("Location: ?action=email_add_step1"); exit;
@@ -3094,10 +3157,10 @@ if ($action == 'email_add_resend') {
 if($action=='index'){
     if(isset($_SESSION['user'])){header("Location: ?action=dashboard");exit;}
     $hasError=isset($_GET['error']);$csrf=generateCsrfToken();
-    ?><!DOCTYPE html><html lang="fa" dir="rtl"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>ورود | XCloud v3.1</title>
+    ?><!DOCTYPE html><html lang="fa" dir="rtl"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>ورود | XCloud v3.2</title>
     <?php
 // ================================================================
-// PWA HEAD SNIPPET — XCloud v3.1
+// PWA HEAD SNIPPET — XCloud v3.2
 // این کد رو توی هر <head> از index.php قرار بده
 // ================================================================
 ?>
@@ -3270,7 +3333,7 @@ elseif($action=='dashboard'){
     <title>XCloud — داشبورد</title>
     <?php
 // ================================================================
-// PWA HEAD SNIPPET — XCloud v3.1
+// PWA HEAD SNIPPET — XCloud v3.2
 // این کد رو توی هر <head> از index.php قرار بده
 // ================================================================
 ?>
@@ -3536,6 +3599,21 @@ if ('serviceWorker' in navigator) {
         <?php echo renderEmailAddBanner($pdo); ?>
         <?php if (($_GET['msg'] ?? '') === 'email_added') {
             echo '<div style="background:#dcfce7;color:#166534;padding:10px 14px;border-radius:8px;margin-bottom:12px" dir="rtl">✅ ایمیل با موفقیت به حساب شما اضافه شد.</div>';
+        } ?>
+        <?php if (($_GET['msg'] ?? '') === 'welcome') {
+            echo '<div style="background:#dcfce7;color:#166534;padding:12px 16px;border-radius:8px;margin-bottom:12px;display:flex;align-items:center;gap:10px" dir="rtl">'
+               . '<span style="font-size:1.4rem">🎉</span>'
+               . '<div><strong>به XCloud خوش آمدید!</strong> ثبت‌نام شما با موفقیت تکمیل شد. می‌توانید فایل‌های خود را آپلود کنید.</div>'
+               . '</div>';
+        } ?>
+        <?php if (($_GET['msg'] ?? '') === 'setup_locked') {
+            echo '<div style="background:#dcfce7;color:#166534;padding:10px 14px;border-radius:8px;margin-bottom:12px" dir="rtl">🔒 Setup با موفقیت قفل شد. سیستم آماده استفاده است.</div>';
+        }
+        if (($_GET['msg'] ?? '') === 'setup_already_done') {
+            echo '<div style="background:#dbeafe;color:#1e40af;padding:10px 14px;border-radius:8px;margin-bottom:12px" dir="rtl">ℹ️ Setup قبلاً انجام شده است. برای بازکردن مجدد، در phpMyAdmin مقدار <code>setup_completed</code> را به <code>0</code> تغییر دهید.</div>';
+        } ?>
+        <?php if (($_GET['msg'] ?? '') === 'email_already_verified') {
+            echo '<div style="background:#fef3c7;color:#92400e;padding:10px 14px;border-radius:8px;margin-bottom:12px" dir="rtl">ℹ️ شما قبلاً یک ایمیل تأیید شده دارید. برای تغییر ایمیل با ادمین تماس بگیرید.</div>';
         } ?>
         <?php if($role==='admin'&&count($allUsernames)>1):?>
         <div class="user-switcher">
@@ -4446,7 +4524,7 @@ elseif($action=='trash'){
     <title>XCloud — سطل زباله</title>
     <?php
 // ================================================================
-// PWA HEAD SNIPPET — XCloud v3.1
+// PWA HEAD SNIPPET — XCloud v3.2
 // این کد رو توی هر <head> از index.php قرار بده
 // ================================================================
 ?>
@@ -4629,7 +4707,7 @@ elseif($action=='users'){
     <title>XCloud — کاربران</title>
     <?php
 // ================================================================
-// PWA HEAD SNIPPET — XCloud v3.1
+// PWA HEAD SNIPPET — XCloud v3.2
 // این کد رو توی هر <head> از index.php قرار بده
 // ================================================================
 ?>
@@ -4750,6 +4828,16 @@ if ('serviceWorker' in navigator) {
             <div>🛠️ <strong>Setup هنوز کامل نشده است.</strong> برای پیکربندی SMTP و تست end-to-end، Setup Wizard را اجرا کنید.</div>
             <a href="?action=setup_wizard" style="background:#3b82f6;color:#fff;padding:8px 16px;border-radius:6px;text-decoration:none;font-weight:600;font-size:.85rem">باز کردن Setup Wizard</a>
           </div>
+        <?php endif; ?>
+        <?php if (getSetting($pdo, 'setup_completed', '0') === '1'): ?>
+          <details style="background:#1e293b;border:1px solid #334155;border-radius:8px;padding:10px 14px;margin-bottom:12px;color:#94a3b8;font-size:.8rem" dir="rtl">
+            <summary style="cursor:pointer;color:#cbd5e1">🛠️ Setup قفل شده است</summary>
+            <p style="margin:8px 0 0">برای بازکردن مجدد Setup Wizard:</p>
+            <form method="POST" action="?action=admin_unlock_setup" style="margin-top:8px" onsubmit="return confirm('Setup Wizard را باز کنیم؟ پیکربندی فعلی حفظ می‌شود.');">
+              <input type="hidden" name="csrf_token" value="<?php echo h($csrf); ?>">
+              <button type="submit" style="background:#7c3aed;color:#fff;border:none;padding:6px 14px;border-radius:6px;font-size:.8rem;cursor:pointer">باز کردن مجدد Setup</button>
+            </form>
+          </details>
         <?php endif; ?>
         <div style="background:#1e293b;border:1px solid #334155;border-radius:10px;padding:16px 20px;margin-bottom:16px" dir="rtl">
           <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px">
@@ -4892,7 +4980,7 @@ elseif($action=='activity_log'){
     <title>XCloud — لاگ</title>
     <?php
 // ================================================================
-// PWA HEAD SNIPPET — XCloud v3.1
+// PWA HEAD SNIPPET — XCloud v3.2
 // این کد رو توی هر <head> از index.php قرار بده
 // ================================================================
 ?>

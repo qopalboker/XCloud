@@ -1715,6 +1715,184 @@ if ($action == 'admin_toggle_registration') {
 }
 
 // ================================================================
+// PUBLIC REGISTRATION FLOW
+// ================================================================
+
+function registrationEnabled($pdo) {
+    return getSetting($pdo, 'registration_enabled') === '1';
+}
+
+// ─── GET: Step 1 form ────────────────────────────────────────
+if ($action == 'register_step1') {
+    if (!registrationEnabled($pdo)) {
+        die('ثبت‌نام در حال حاضر غیرفعال است.');
+    }
+    $captcha = math_captcha_generate();
+    $csrf = generateCsrfToken();
+    $err = $_GET['error'] ?? '';
+
+    $errMsg = [
+        'invalid_email'      => '⚠️ فرمت ایمیل نامعتبر است.',
+        'invalid_username'   => '⚠️ نام کاربری باید با حرف انگلیسی شروع شود و فقط شامل حروف، اعداد، _ و - باشد (۳ تا ۳۰ کاراکتر).',
+        'weak_password'      => '⚠️ رمز عبور باید حداقل ۸ کاراکتر و شامل حروف و اعداد باشد.',
+        'password_mismatch'  => '⚠️ تکرار رمز عبور با رمز اصلی مطابقت ندارد.',
+        'captcha_wrong'      => '⚠️ پاسخ کپچا اشتباه است.',
+        'username_taken'     => '⚠️ این نام کاربری قبلاً انتخاب شده است.',
+        'send_failed'        => '⚠️ ارسال ایمیل با مشکل مواجه شد. لطفاً بعداً تلاش کنید.',
+        'cooldown'           => '⏳ اخیراً درخواست داده‌اید. لطفاً چند ثانیه صبر کنید.',
+        'email_quota'        => '⛔ تعداد درخواست‌های شما برای این ایمیل از حد مجاز بیشتر شده.',
+        'ip_quota'           => '⛔ تعداد درخواست‌ها از این IP از حد مجاز بیشتر شده.',
+    ][$err] ?? '';
+?>
+<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ثبت‌نام در XCloud</title>
+<style>
+body{margin:0;font-family:Tahoma,system-ui,sans-serif;background:#0f172a;color:#e2e8f0;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:20px}
+.card{max-width:440px;width:100%;background:#1e293b;border:1px solid #334155;border-radius:14px;padding:32px;box-shadow:0 10px 40px rgba(0,0,0,.3)}
+h1{font-size:1.4rem;margin:0 0 8px;color:#f1f5f9;text-align:center}
+.subtitle{color:#94a3b8;font-size:.85rem;text-align:center;margin-bottom:24px}
+.field{margin-bottom:16px}
+label{display:block;color:#cbd5e1;font-size:.85rem;margin-bottom:6px;font-weight:600}
+input{width:100%;background:#0f172a;border:1px solid #334155;color:#f1f5f9;padding:11px 12px;border-radius:8px;font-size:.9rem;font-family:inherit;box-sizing:border-box}
+input:focus{outline:none;border-color:#3b82f6;background:#1e293b}
+.hint{color:#64748b;font-size:.75rem;margin-top:4px}
+.captcha{background:#0f172a;border:1px dashed #475569;padding:10px 14px;border-radius:8px;color:#fde68a;font-weight:700;text-align:center;margin-bottom:8px;font-size:1rem}
+.btn{width:100%;background:#3b82f6;color:#fff;border:none;padding:12px;border-radius:8px;font-weight:700;font-size:.95rem;cursor:pointer;font-family:inherit;margin-top:8px}
+.btn:hover{background:#2563eb}
+.err{background:#7f1d1d;color:#fee2e2;padding:10px 14px;border-radius:8px;margin-bottom:16px;font-size:.85rem;text-align:center}
+.links{text-align:center;margin-top:18px;font-size:.85rem;color:#94a3b8}
+.links a{color:#3b82f6;text-decoration:none;font-weight:600}
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>📝 ثبت‌نام در XCloud</h1>
+  <div class="subtitle">با تأیید ایمیل، حساب جدید بسازید</div>
+  <?php if ($errMsg): ?><div class="err"><?= $errMsg ?></div><?php endif; ?>
+  <form method="POST" action="?action=register_step1_process">
+    <input type="hidden" name="csrf_token" value="<?= h($csrf) ?>">
+    <div class="field">
+      <label for="email">ایمیل</label>
+      <input type="email" id="email" name="email" required autocomplete="email" value="<?= h($_GET['email'] ?? '') ?>">
+    </div>
+    <div class="field">
+      <label for="username">نام کاربری</label>
+      <input type="text" id="username" name="username" required autocomplete="username" value="<?= h($_GET['username'] ?? '') ?>">
+      <div class="hint">شروع با حرف انگلیسی، ۳ تا ۳۰ کاراکتر، شامل حروف/اعداد/_/-</div>
+    </div>
+    <div class="field">
+      <label for="password">رمز عبور</label>
+      <input type="password" id="password" name="password" required autocomplete="new-password" minlength="8">
+      <div class="hint">حداقل ۸ کاراکتر، شامل حروف و اعداد</div>
+    </div>
+    <div class="field">
+      <label for="password_confirm">تکرار رمز عبور</label>
+      <input type="password" id="password_confirm" name="password_confirm" required autocomplete="new-password" minlength="8">
+    </div>
+    <div class="field">
+      <label>پاسخ این محاسبه چیست؟</label>
+      <div class="captcha"><?= h($captcha['question']) ?></div>
+      <input type="text" name="captcha" required inputmode="numeric" autocomplete="off">
+    </div>
+    <button type="submit" class="btn">ارسال کد تأیید</button>
+  </form>
+  <div class="links">
+    قبلاً ثبت‌نام کرده‌اید؟ <a href="index.php">ورود</a>
+  </div>
+</div>
+</body>
+</html>
+<?php
+    exit;
+}
+
+// ─── POST: Step 1 process ────────────────────────────────────
+if ($action == 'register_step1_process') {
+    if (!registrationEnabled($pdo)) { header("Location: index.php"); exit; }
+    verifyCsrf();
+
+    $email           = trim(mb_strtolower($_POST['email'] ?? ''));
+    $username        = trim($_POST['username'] ?? '');
+    $password        = $_POST['password'] ?? '';
+    $passwordConfirm = $_POST['password_confirm'] ?? '';
+    $captchaAnswer   = $_POST['captcha'] ?? '';
+
+    // Captcha first (always invalidates regardless of outcome)
+    if (!math_captcha_verify($captchaAnswer)) {
+        header("Location: ?action=register_step1&error=captcha_wrong&email=" . urlencode($email) . "&username=" . urlencode($username)); exit;
+    }
+    if (!validate_email_address($email)) {
+        header("Location: ?action=register_step1&error=invalid_email&username=" . urlencode($username)); exit;
+    }
+    if (!validate_username($username)) {
+        header("Location: ?action=register_step1&error=invalid_username&email=" . urlencode($email)); exit;
+    }
+    if ($password !== $passwordConfirm) {
+        header("Location: ?action=register_step1&error=password_mismatch&email=" . urlencode($email) . "&username=" . urlencode($username)); exit;
+    }
+    if (!validate_password_strength($password)) {
+        header("Location: ?action=register_step1&error=weak_password&email=" . urlencode($email) . "&username=" . urlencode($username)); exit;
+    }
+
+    // Username availability
+    $st = $pdo->prepare("SELECT id FROM users WHERE username = ?");
+    $st->execute([$username]);
+    if ($st->fetch()) {
+        header("Location: ?action=register_step1&error=username_taken&email=" . urlencode($email)); exit;
+    }
+
+    // Email availability — anti-enumeration: if email exists, send a notification email
+    // and pretend to step 2 anyway so attackers can't tell if email is registered
+    $st = $pdo->prepare("SELECT id, username FROM users WHERE email = ?");
+    $st->execute([$email]);
+    $existing = $st->fetch();
+
+    if ($existing) {
+        $subject = 'اطلاعات حساب شما در XCloud';
+        $html = '<div dir="rtl" style="font-family:Tahoma,sans-serif">'
+              . '<p>سلام،</p>'
+              . '<p>یک تلاش برای ثبت‌نام با ایمیل شما در XCloud انجام شد. شما قبلاً یک حساب با نام کاربری <strong>'
+              . h($existing['username']) . '</strong> دارید.</p>'
+              . '<p>اگر این درخواست از طرف شما نبود، نگران نباشید — هیچ تغییری در حساب شما اعمال نشده است.</p>'
+              . '<p>برای ورود از <a href="https://xcloud.retrivo.ir">https://xcloud.retrivo.ir</a> استفاده کنید.</p>'
+              . '<p>اگر رمز عبور خود را فراموش کرده‌اید، از گزینه «بازیابی رمز عبور» استفاده کنید.</p>'
+              . '</div>';
+        @xcloud_send_email($pdo, $email, $subject, $html, null, 'register_collision');
+
+        $_SESSION['pending_registration'] = [
+            'email' => $email,
+            'username' => $username,
+            'password_hash' => password_hash($password, PASSWORD_DEFAULT),
+            'fake' => true,
+            'expires_at' => date('Y-m-d H:i:s', time() + 600),
+        ];
+        header("Location: ?action=register_step2"); exit;
+    }
+
+    // Request OTP
+    $payload = json_encode(['username' => $username]);
+    $result = request_email_otp($pdo, $email, 'register', $payload);
+    if (!$result['ok']) {
+        $err = $result['reason'] ?? 'send_failed';
+        header("Location: ?action=register_step1&error=" . urlencode($err) . "&email=" . urlencode($email) . "&username=" . urlencode($username)); exit;
+    }
+
+    $_SESSION['pending_registration'] = [
+        'email' => $email,
+        'username' => $username,
+        'password_hash' => password_hash($password, PASSWORD_DEFAULT),
+        'fake' => false,
+        'expires_at' => $result['expires_at'],
+    ];
+    logActivity($pdo, $username, 'register_otp_requested', $email);
+    header("Location: ?action=register_step2"); exit;
+}
+
+// ================================================================
 // LOGIN PAGE
 // ================================================================
 if($action=='index'){
@@ -1797,6 +1975,11 @@ if ('serviceWorker' in navigator) {
             ورود با Passkey / اثر انگشت
         </button>
         <div id="pkSt"></div>
+        <?php if (registrationEnabled($pdo)): ?>
+        <div style="text-align:center;margin-top:18px;font-size:.85rem;color:#94a3b8">
+          حساب ندارید؟ <a href="?action=register_step1" style="color:#3b82f6;text-decoration:none;font-weight:600">ثبت‌نام در XCloud</a>
+        </div>
+        <?php endif; ?>
     </div>
     <div class="version">
 

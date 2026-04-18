@@ -2118,6 +2118,95 @@ if ($action == 'admin_toggle_registration') {
 }
 
 // ================================================================
+// ADMIN DB BACKUP (downloadable .sql dump)
+// ================================================================
+
+if ($action == 'admin_db_backup') {
+    if (!isset($_SESSION['user']) || $_SESSION['role'] !== 'admin') {
+        die('Forbidden');
+    }
+
+    if (!isset($_GET['csrf']) || !hash_equals($_SESSION['csrf_token'] ?? '', $_GET['csrf'])) {
+        die('CSRF token invalid');
+    }
+
+    @set_time_limit(300);
+    @ini_set('memory_limit', '256M');
+
+    $dbName = null;
+    try {
+        $dbName = $pdo->query("SELECT DATABASE()")->fetchColumn();
+    } catch (\Exception $e) { /* ignore */ }
+
+    $filename = 'xcloud_backup_' . date('Y-m-d_His') . '.sql';
+
+    header('Content-Type: application/sql; charset=utf-8');
+    header('Content-Disposition: attachment; filename="' . $filename . '"');
+    header('Cache-Control: no-store');
+    header('Pragma: no-cache');
+
+    @ob_end_clean();
+    $out = fopen('php://output', 'w');
+
+    fwrite($out, "-- XCloud Database Backup\n");
+    fwrite($out, "-- Database: " . ($dbName ?? 'unknown') . "\n");
+    fwrite($out, "-- Generated: " . date('Y-m-d H:i:s') . "\n");
+    fwrite($out, "-- By admin: " . $_SESSION['user'] . "\n\n");
+    fwrite($out, "SET NAMES utf8mb4;\n");
+    fwrite($out, "SET FOREIGN_KEY_CHECKS=0;\n");
+    fwrite($out, "SET SQL_MODE='NO_AUTO_VALUE_ON_ZERO';\n\n");
+
+    $tables = $pdo->query("SHOW TABLES")->fetchAll(PDO::FETCH_COLUMN);
+
+    foreach ($tables as $table) {
+        fwrite($out, "\n-- ----------------------------------------\n");
+        fwrite($out, "-- Table: `$table`\n");
+        fwrite($out, "-- ----------------------------------------\n");
+
+        fwrite($out, "DROP TABLE IF EXISTS `$table`;\n");
+        $createRow = $pdo->query("SHOW CREATE TABLE `$table`")->fetch(PDO::FETCH_NUM);
+        fwrite($out, $createRow[1] . ";\n\n");
+
+        $count = (int)$pdo->query("SELECT COUNT(*) FROM `$table`")->fetchColumn();
+        if ($count === 0) continue;
+
+        $chunk = 500;
+        $offset = 0;
+
+        $cols = $pdo->query("SHOW COLUMNS FROM `$table`")->fetchAll(PDO::FETCH_COLUMN);
+        $colsList = '`' . implode('`,`', $cols) . '`';
+
+        while ($offset < $count) {
+            $rows = $pdo->query("SELECT * FROM `$table` LIMIT $offset, $chunk")->fetchAll(PDO::FETCH_ASSOC);
+            if (!$rows) break;
+
+            $values = [];
+            foreach ($rows as $row) {
+                $vals = [];
+                foreach ($cols as $c) {
+                    $v = $row[$c] ?? null;
+                    if ($v === null) $vals[] = 'NULL';
+                    elseif (is_numeric($v) && !preg_match('/^0\d+/', (string)$v)) $vals[] = $v;
+                    else $vals[] = $pdo->quote($v);
+                }
+                $values[] = '(' . implode(',', $vals) . ')';
+            }
+            fwrite($out, "INSERT INTO `$table` ($colsList) VALUES\n" . implode(",\n", $values) . ";\n");
+            $offset += $chunk;
+        }
+        fwrite($out, "\n");
+        flush();
+    }
+
+    fwrite($out, "\nSET FOREIGN_KEY_CHECKS=1;\n");
+    fwrite($out, "-- End of backup\n");
+    fclose($out);
+
+    logActivity($pdo, $_SESSION['user'], 'admin_db_backup_download', null, "tables: " . count($tables));
+    exit;
+}
+
+// ================================================================
 // PUBLIC REGISTRATION FLOW
 // ================================================================
 
@@ -4679,6 +4768,17 @@ if ('serviceWorker' in navigator) {
               </button>
             </form>
           </div>
+        </div>
+        <div style="background:#1e293b;border:1px solid #334155;border-radius:10px;padding:14px 20px;margin-bottom:16px;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px" dir="rtl">
+          <div>
+            <strong style="color:#f1f5f9">پشتیبان‌گیری دیتابیس</strong>
+            <p style="margin:4px 0 0;color:#94a3b8;font-size:.85rem">قبل از هر بار آپلود نسخه‌ی جدید کد، یک نسخه‌ی پشتیبان دانلود کنید.</p>
+          </div>
+          <a href="?action=admin_db_backup&csrf=<?php echo h($csrf); ?>"
+             style="background:#0ea5e9;color:#fff;padding:9px 18px;border-radius:6px;text-decoration:none;font-weight:600;font-size:.85rem"
+             onclick="return confirm('دانلود فایل پشتیبان (ممکن است چند ثانیه طول بکشد)؟');">
+            💾 دانلود پشتیبان (.sql)
+          </a>
         </div>
         <div class="card">
             <h3>➕ افزودن کاربر جدید</h3>

@@ -1700,6 +1700,20 @@ if($action=='update_settings'){
     header("Location: ?action=trash&msg=settings_saved");exit;
 }
 
+if ($action == 'admin_toggle_registration') {
+    if (!isset($_SESSION['user']) || $_SESSION['role'] !== 'admin') {
+        header("Location: ?action=dashboard"); exit;
+    }
+    verifyCsrf();
+    $current = getSetting($pdo, 'registration_enabled', '0');
+    $new = $current === '1' ? '0' : '1';
+    setSetting($pdo, 'registration_enabled', $new);
+    logActivity($pdo, $_SESSION['user'], 'admin_toggle_registration', null,
+                "Set to: " . ($new === '1' ? 'enabled' : 'disabled'));
+    header("Location: ?action=users&msg=registration_" . ($new === '1' ? 'enabled' : 'disabled'));
+    exit;
+}
+
 // ================================================================
 // LOGIN PAGE
 // ================================================================
@@ -3327,6 +3341,33 @@ if ('serviceWorker' in navigator) {
         <span style="font-weight:900;font-size:1rem;background:linear-gradient(135deg,#3b82f6,#8b5cf6);-webkit-background-clip:text;-webkit-text-fill-color:transparent;">مدیریت کاربران</span>
     </header>
     <div class="container">
+        <?php
+        if (($_GET['msg'] ?? '') === 'registration_enabled') {
+            echo '<div style="background:#dcfce7;color:#166534;padding:10px 16px;border-radius:8px;margin-bottom:12px" dir="rtl">✅ ثبت‌نام عمومی فعال شد.</div>';
+        }
+        if (($_GET['msg'] ?? '') === 'registration_disabled') {
+            echo '<div style="background:#fee2e2;color:#991b1b;padding:10px 16px;border-radius:8px;margin-bottom:12px" dir="rtl">⚠️ ثبت‌نام عمومی غیرفعال شد.</div>';
+        }
+        $regEnabled = getSetting($pdo, 'registration_enabled', '0') === '1';
+        ?>
+        <div style="background:#1e293b;border:1px solid #334155;border-radius:10px;padding:16px 20px;margin-bottom:16px" dir="rtl">
+          <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px">
+            <div>
+              <h3 style="margin:0 0 4px;color:#f1f5f9;font-size:1rem">ثبت‌نام عمومی</h3>
+              <p style="margin:0;color:#94a3b8;font-size:.85rem">
+                <?php echo $regEnabled
+                    ? 'کاربران جدید می‌توانند با ایمیل ثبت‌نام کنند.'
+                    : 'ثبت‌نام عمومی غیرفعال است. فقط ادمین می‌تواند کاربر بسازد.'; ?>
+              </p>
+            </div>
+            <form method="POST" action="?action=admin_toggle_registration" style="margin:0">
+              <input type="hidden" name="csrf_token" value="<?php echo h($csrf); ?>">
+              <button type="submit" style="background:<?php echo $regEnabled ? '#dc2626' : '#16a34a'; ?>;color:#fff;border:none;padding:10px 20px;border-radius:6px;font-weight:600;cursor:pointer">
+                <?php echo $regEnabled ? 'غیرفعال کردن' : 'فعال کردن'; ?>
+              </button>
+            </form>
+          </div>
+        </div>
         <div class="card">
             <h3>➕ افزودن کاربر جدید</h3>
             <form action="?action=add_user" method="POST">

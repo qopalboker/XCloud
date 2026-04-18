@@ -569,6 +569,28 @@ function logActivity($pdo,$username,$actionType,$target=null,$details=null){
     $s->execute([$username,$actionType,$target,$details,$ip]);
 }
 
+function renderEmailAddBanner($pdo) {
+    if (empty($_SESSION['user'])) return '';
+    if (!empty($_SESSION['email_banner_dismissed'])) return '';
+
+    $st = $pdo->prepare("SELECT email, email_verified FROM users WHERE username = ?");
+    $st->execute([$_SESSION['user']]);
+    $row = $st->fetch();
+    if (!$row) return '';
+    if (!empty($row['email']) && (int)$row['email_verified'] === 1) return '';
+
+    return '<div style="background:#fef3c7;border:1px solid #f59e0b;color:#78350f;'
+         . 'padding:12px 18px;border-radius:8px;margin:12px 0;display:flex;'
+         . 'align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap" dir="rtl">'
+         . '<div>📧 <strong>برای امنیت بیشتر و امکان بازیابی رمز عبور</strong>، یک ایمیل به حساب خود اضافه کنید.</div>'
+         . '<div style="display:flex;gap:8px">'
+         . '<a href="?action=email_add_step1" style="background:#f59e0b;color:#fff;padding:8px 16px;'
+         . 'border-radius:6px;text-decoration:none;font-weight:600;font-size:.85rem">افزودن ایمیل</a>'
+         . '<a href="?action=email_add_dismiss" style="color:#78350f;padding:8px 12px;'
+         . 'text-decoration:none;font-size:.85rem">بستن</a>'
+         . '</div></div>';
+}
+
 // ================================================================
 // PASSKEY (WebAuthn) HELPERS
 // ================================================================
@@ -2349,6 +2371,254 @@ if ($action == 'forgot_password_resend') {
 }
 
 // ================================================================
+// EMAIL-ADD FLOW (existing users without verified email)
+// ================================================================
+
+if ($action == 'email_add_dismiss') {
+    if (!isset($_SESSION['user'])) { header("Location: index.php"); exit; }
+    $_SESSION['email_banner_dismissed'] = true;
+    header("Location: " . ($_SERVER['HTTP_REFERER'] ?? '?action=dashboard')); exit;
+}
+
+// ─── GET: Email-add step 1 ───────────────────────────────────
+if ($action == 'email_add_step1') {
+    if (!isset($_SESSION['user'])) { header("Location: index.php"); exit; }
+    $captcha = math_captcha_generate();
+    $csrf = generateCsrfToken();
+    $err = $_GET['error'] ?? '';
+    $errMsg = [
+        'invalid_email' => '⚠️ فرمت ایمیل نامعتبر است.',
+        'captcha_wrong' => '⚠️ پاسخ کپچا اشتباه است.',
+        'email_taken'   => '⚠️ این ایمیل قبلاً به حساب دیگری متصل شده است.',
+        'send_failed'   => '⚠️ ارسال ایمیل با خطا مواجه شد.',
+        'cooldown'      => '⏳ لطفاً چند ثانیه صبر کنید.',
+        'email_quota'   => '⛔ حداکثر تعداد درخواست به این ایمیل امروز پر شده.',
+        'ip_quota'      => '⛔ حداکثر تعداد درخواست از این IP پر شده.',
+    ][$err] ?? '';
+?>
+<!DOCTYPE html><html lang="fa" dir="rtl"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>افزودن ایمیل — XCloud</title>
+<style>
+body{margin:0;font-family:Tahoma,sans-serif;background:#0f172a;color:#e2e8f0;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:20px}
+.card{max-width:440px;width:100%;background:#1e293b;border:1px solid #334155;border-radius:14px;padding:32px}
+h1{font-size:1.4rem;margin:0 0 8px;color:#f1f5f9;text-align:center}
+.subtitle{color:#94a3b8;font-size:.85rem;text-align:center;margin-bottom:24px}
+.field{margin-bottom:16px}
+label{display:block;color:#cbd5e1;font-size:.85rem;margin-bottom:6px;font-weight:600}
+input{width:100%;background:#0f172a;border:1px solid #334155;color:#f1f5f9;padding:11px 12px;border-radius:8px;font-family:inherit;box-sizing:border-box}
+.captcha{background:#0f172a;border:1px dashed #475569;padding:10px 14px;border-radius:8px;color:#fde68a;font-weight:700;text-align:center;margin-bottom:8px}
+.btn{width:100%;background:#3b82f6;color:#fff;border:none;padding:12px;border-radius:8px;font-weight:700;cursor:pointer;font-family:inherit}
+.err{background:#7f1d1d;color:#fee2e2;padding:10px 14px;border-radius:8px;margin-bottom:16px;font-size:.85rem;text-align:center}
+.links{text-align:center;margin-top:18px;font-size:.85rem;color:#94a3b8}
+.links a{color:#3b82f6;text-decoration:none;font-weight:600}
+</style></head><body>
+<div class="card">
+  <h1>📧 افزودن ایمیل</h1>
+  <div class="subtitle">با افزودن ایمیل می‌توانید رمز عبور خود را بازیابی کنید</div>
+  <?php if ($errMsg): ?><div class="err"><?= $errMsg ?></div><?php endif; ?>
+  <form method="POST" action="?action=email_add_step1_process">
+    <input type="hidden" name="csrf_token" value="<?= h($csrf) ?>">
+    <div class="field">
+      <label>ایمیل</label>
+      <input type="email" name="email" required autocomplete="email">
+    </div>
+    <div class="field">
+      <label>پاسخ این محاسبه چیست؟</label>
+      <div class="captcha"><?= h($captcha['question']) ?></div>
+      <input type="text" name="captcha" required inputmode="numeric" autocomplete="off">
+    </div>
+    <button class="btn">ارسال کد تأیید</button>
+  </form>
+  <div class="links"><a href="?action=dashboard">انصراف</a></div>
+</div></body></html>
+<?php
+    exit;
+}
+
+// ─── POST: Step 1 process ────────────────────────────────────
+if ($action == 'email_add_step1_process') {
+    if (!isset($_SESSION['user'])) { header("Location: index.php"); exit; }
+    verifyCsrf();
+    $email = trim(mb_strtolower($_POST['email'] ?? ''));
+    $captchaAnswer = $_POST['captcha'] ?? '';
+
+    if (!math_captcha_verify($captchaAnswer)) {
+        header("Location: ?action=email_add_step1&error=captcha_wrong"); exit;
+    }
+    if (!validate_email_address($email)) {
+        header("Location: ?action=email_add_step1&error=invalid_email"); exit;
+    }
+
+    // Check email is not already used by another user
+    $st = $pdo->prepare("SELECT id FROM users WHERE email = ? AND username != ?");
+    $st->execute([$email, $_SESSION['user']]);
+    if ($st->fetch()) {
+        header("Location: ?action=email_add_step1&error=email_taken"); exit;
+    }
+
+    // Get current user id
+    $st = $pdo->prepare("SELECT id FROM users WHERE username = ?");
+    $st->execute([$_SESSION['user']]);
+    $userId = (int)$st->fetchColumn();
+
+    $payload = json_encode(['user_id' => $userId, 'username' => $_SESSION['user']]);
+    $result = request_email_otp($pdo, $email, 'email_add', $payload);
+    if (!$result['ok']) {
+        header("Location: ?action=email_add_step1&error=" . urlencode($result['reason'] ?? 'send_failed')); exit;
+    }
+
+    $_SESSION['pending_email_add'] = [
+        'email' => $email, 'user_id' => $userId,
+        'expires_at' => $result['expires_at'],
+    ];
+    logActivity($pdo, $_SESSION['user'], 'email_add_otp_requested', $email);
+    header("Location: ?action=email_add_step2"); exit;
+}
+
+// ─── GET: Step 2 form ────────────────────────────────────────
+if ($action == 'email_add_step2') {
+    if (!isset($_SESSION['user'])) { header("Location: index.php"); exit; }
+    if (empty($_SESSION['pending_email_add'])) {
+        header("Location: ?action=email_add_step1"); exit;
+    }
+    $pending = $_SESSION['pending_email_add'];
+    $captcha = math_captcha_generate();
+    $csrf = generateCsrfToken();
+    $err = $_GET['error'] ?? '';
+    $msg = $_GET['msg'] ?? '';
+    $errMsg = [
+        'wrong_code'        => '⚠️ کد وارد شده اشتباه است.',
+        'expired'           => '⏰ کد منقضی شده.',
+        'too_many_attempts' => '⛔ تعداد تلاش‌های اشتباه از حد گذشت.',
+        'captcha_wrong'     => '⚠️ پاسخ کپچا اشتباه است.',
+        'send_failed'       => '⚠️ ارسال مجدد با خطا مواجه شد.',
+        'cooldown'          => '⏳ لطفاً صبر کنید.',
+        'not_found'         => '⛔ کد فعالی یافت نشد.',
+        'invalid_format'    => '⚠️ کد باید فقط شامل ارقام باشد.',
+    ][$err] ?? '';
+    $msgText = $msg === 'resent' ? '✅ کد جدید ارسال شد.' : '';
+    $expiresAtTs = strtotime($pending['expires_at']);
+?>
+<!DOCTYPE html><html lang="fa" dir="rtl"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>تأیید ایمیل — XCloud</title>
+<style>
+body{margin:0;font-family:Tahoma,sans-serif;background:#0f172a;color:#e2e8f0;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:20px}
+.card{max-width:440px;width:100%;background:#1e293b;border:1px solid #334155;border-radius:14px;padding:32px}
+h1{font-size:1.4rem;margin:0 0 8px;color:#f1f5f9;text-align:center}
+.subtitle{color:#94a3b8;font-size:.85rem;text-align:center;margin-bottom:8px}
+.email-display{background:#0f172a;border:1px solid #334155;color:#fde68a;padding:10px;border-radius:8px;text-align:center;font-weight:600;margin-bottom:18px;direction:ltr}
+.field{margin-bottom:16px}
+label{display:block;color:#cbd5e1;font-size:.85rem;margin-bottom:6px;font-weight:600}
+input{width:100%;background:#0f172a;border:1px solid #334155;color:#f1f5f9;padding:11px 12px;border-radius:8px;font-family:inherit;box-sizing:border-box}
+.otp-input{font-size:1.6rem;text-align:center;letter-spacing:.5em;direction:ltr;font-family:Consolas,monospace;font-weight:700}
+.captcha{background:#0f172a;border:1px dashed #475569;padding:10px 14px;border-radius:8px;color:#fde68a;font-weight:700;text-align:center;margin-bottom:8px}
+.btn{width:100%;background:#3b82f6;color:#fff;border:none;padding:12px;border-radius:8px;font-weight:700;cursor:pointer;font-family:inherit;margin-top:8px}
+.btn-secondary{background:#475569}
+.err{background:#7f1d1d;color:#fee2e2;padding:10px 14px;border-radius:8px;margin-bottom:16px;font-size:.85rem;text-align:center}
+.ok{background:#14532d;color:#bbf7d0;padding:10px 14px;border-radius:8px;margin-bottom:16px;font-size:.85rem;text-align:center}
+.timer{text-align:center;color:#94a3b8;font-size:.8rem;margin-top:8px}
+.links{text-align:center;margin-top:14px;font-size:.85rem}
+.links a{color:#3b82f6;text-decoration:none;font-weight:600}
+</style></head><body>
+<div class="card">
+  <h1>📨 تأیید ایمیل</h1>
+  <div class="subtitle">کد ارسال‌شده را وارد کنید</div>
+  <div class="email-display"><?= h($pending['email']) ?></div>
+  <?php if ($errMsg): ?><div class="err"><?= $errMsg ?></div><?php endif; ?>
+  <?php if ($msgText): ?><div class="ok"><?= $msgText ?></div><?php endif; ?>
+  <form method="POST" action="?action=email_add_step2_process">
+    <input type="hidden" name="csrf_token" value="<?= h($csrf) ?>">
+    <div class="field">
+      <label>کد تأیید</label>
+      <input type="text" name="otp_code" required inputmode="numeric" maxlength="8" pattern="\d{4,8}" class="otp-input" autocomplete="one-time-code">
+      <div class="timer" id="otpTimer"></div>
+    </div>
+    <div class="field">
+      <label>پاسخ این محاسبه چیست؟</label>
+      <div class="captcha"><?= h($captcha['question']) ?></div>
+      <input type="text" name="captcha" required inputmode="numeric" autocomplete="off">
+    </div>
+    <button class="btn">تأیید و افزودن ایمیل</button>
+  </form>
+  <form method="POST" action="?action=email_add_resend" style="margin-top:8px">
+    <input type="hidden" name="csrf_token" value="<?= h($csrf) ?>">
+    <button class="btn btn-secondary">ارسال مجدد کد</button>
+  </form>
+  <div class="links"><a href="?action=email_add_step1">تغییر ایمیل</a></div>
+</div>
+<script>
+(function(){
+  var expires = <?= (int)$expiresAtTs ?>;
+  var t = document.getElementById('otpTimer');
+  function tick(){
+    var s = expires - Math.floor(Date.now()/1000);
+    if (s <= 0){ t.textContent='کد منقضی شده.'; t.style.color='#fca5a5'; return; }
+    var m = Math.floor(s/60), r = s%60;
+    t.textContent = 'اعتبار کد: ' + m + ':' + (r<10?'0':'') + r;
+    setTimeout(tick, 1000);
+  } tick();
+})();
+</script>
+</body></html>
+<?php
+    exit;
+}
+
+// ─── POST: Step 2 process ────────────────────────────────────
+if ($action == 'email_add_step2_process') {
+    if (!isset($_SESSION['user'])) { header("Location: index.php"); exit; }
+    verifyCsrf();
+    if (empty($_SESSION['pending_email_add'])) {
+        header("Location: ?action=email_add_step1"); exit;
+    }
+    $pending = $_SESSION['pending_email_add'];
+
+    $code = trim($_POST['otp_code'] ?? '');
+    $captchaAnswer = $_POST['captcha'] ?? '';
+
+    if (!math_captcha_verify($captchaAnswer)) {
+        header("Location: ?action=email_add_step2&error=captcha_wrong"); exit;
+    }
+
+    $verify = verify_email_otp($pdo, $pending['email'], $code, 'email_add');
+    if (!$verify['ok']) {
+        header("Location: ?action=email_add_step2&error=" . urlencode($verify['reason'])); exit;
+    }
+
+    // Race-check: email might have been claimed during step 2
+    $st = $pdo->prepare("SELECT id FROM users WHERE email = ? AND id != ?");
+    $st->execute([$pending['email'], $pending['user_id']]);
+    if ($st->fetch()) {
+        unset($_SESSION['pending_email_add']);
+        header("Location: ?action=email_add_step1&error=email_taken"); exit;
+    }
+
+    $pdo->prepare("UPDATE users SET email = ?, email_verified = 1, email_verified_at = NOW() WHERE id = ?")
+        ->execute([$pending['email'], $pending['user_id']]);
+
+    unset($_SESSION['pending_email_add']);
+    unset($_SESSION['email_banner_dismissed']);
+
+    logActivity($pdo, $_SESSION['user'], 'email_add_completed', $pending['email']);
+    header("Location: ?action=dashboard&msg=email_added"); exit;
+}
+
+// ─── POST: Resend OTP ────────────────────────────────────────
+if ($action == 'email_add_resend') {
+    if (!isset($_SESSION['user'])) { header("Location: index.php"); exit; }
+    verifyCsrf();
+    if (empty($_SESSION['pending_email_add'])) {
+        header("Location: ?action=email_add_step1"); exit;
+    }
+    $pending = $_SESSION['pending_email_add'];
+    $payload = json_encode(['user_id' => $pending['user_id'], 'username' => $_SESSION['user']]);
+    $result = request_email_otp($pdo, $pending['email'], 'email_add', $payload);
+    if ($result['ok']) {
+        $_SESSION['pending_email_add']['expires_at'] = $result['expires_at'];
+        header("Location: ?action=email_add_step2&msg=resent"); exit;
+    }
+    header("Location: ?action=email_add_step2&error=" . urlencode($result['reason'] ?? 'send_failed')); exit;
+}
+
+// ================================================================
 // LOGIN PAGE
 // ================================================================
 if($action=='index'){
@@ -2793,6 +3063,10 @@ if ('serviceWorker' in navigator) {
     </header>
 
     <div class="main-container">
+        <?php echo renderEmailAddBanner($pdo); ?>
+        <?php if (($_GET['msg'] ?? '') === 'email_added') {
+            echo '<div style="background:#dcfce7;color:#166534;padding:10px 14px;border-radius:8px;margin-bottom:12px" dir="rtl">✅ ایمیل با موفقیت به حساب شما اضافه شد.</div>';
+        } ?>
         <?php if($role==='admin'&&count($allUsernames)>1):?>
         <div class="user-switcher">
             <?php foreach($allUsernames as $un):?>
@@ -3790,6 +4064,7 @@ if ('serviceWorker' in navigator) {
         <span style="font-weight:900;font-size:1rem;background:linear-gradient(135deg,#ef4444,#f59e0b);-webkit-background-clip:text;-webkit-text-fill-color:transparent;">🗑 سطل زباله</span>
     </header>
     <div class="container">
+        <?php echo renderEmailAddBanner($pdo); ?>
         <div class="info-bar">
             <div class="info-card"><div class="label">تعداد آیتم‌ها</div><div class="value"><?php echo count($trashItems);?></div></div>
             <div class="info-card"><div class="label">حجم کل</div><div class="value" style="font-size:.9rem"><?php echo formatBytes($trashSize);?></div></div>
@@ -3997,6 +4272,7 @@ if ('serviceWorker' in navigator) {
         if (($_GET['msg'] ?? '') === 'registration_disabled') {
             echo '<div style="background:#fee2e2;color:#991b1b;padding:10px 16px;border-radius:8px;margin-bottom:12px" dir="rtl">⚠️ ثبت‌نام عمومی غیرفعال شد.</div>';
         }
+        echo renderEmailAddBanner($pdo);
         $regEnabled = getSetting($pdo, 'registration_enabled', '0') === '1';
         ?>
         <div style="background:#1e293b;border:1px solid #334155;border-radius:10px;padding:16px 20px;margin-bottom:16px" dir="rtl">
@@ -4182,6 +4458,7 @@ if ('serviceWorker' in navigator) {
         <span style="font-weight:900;font-size:1rem;background:linear-gradient(135deg,#f59e0b,#ef4444);-webkit-background-clip:text;-webkit-text-fill-color:transparent;">لاگ فعالیت‌ها</span>
     </header>
     <div class="container">
+        <?php echo renderEmailAddBanner($pdo); ?>
         <form method="GET" class="filters">
             <input type="hidden" name="action" value="activity_log">
             <select name="filter_user"><option value="">همه کاربران</option><?php foreach($lus as $lu):?><option value="<?php echo h($lu);?>"<?php echo $fu===$lu?' selected':'';?>><?php echo h($lu);?></option><?php endforeach;?></select>

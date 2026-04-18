@@ -1,6 +1,14 @@
 <?php
 date_default_timezone_set('Asia/Tehran');
 
+require_once __DIR__ . '/lib/PHPMailer/Exception.php';
+require_once __DIR__ . '/lib/PHPMailer/PHPMailer.php';
+require_once __DIR__ . '/lib/PHPMailer/SMTP.php';
+
+use PHPMailer\PHPMailer\PHPMailer;
+use PHPMailer\PHPMailer\SMTP;
+use PHPMailer\PHPMailer\Exception as PHPMailerException;
+
 // ============================================================
 // XCloud v3.1
 // ✅ سطل زباله اصلی با پاکسازی خودکار
@@ -69,6 +77,62 @@ function getSetting($pdo,$key,$default=null){
 function setSetting($pdo,$key,$value){
     $s=$pdo->prepare("INSERT INTO settings (setting_key,setting_value) VALUES(?,?) ON DUPLICATE KEY UPDATE setting_value=?,updated_at=CURRENT_TIMESTAMP");
     $s->execute([$key,$value,$value]);
+}
+function xcloud_send_email($pdo, $to, $subject, $html_body, $text_body = null, $purpose = 'general') {
+    $host      = getSetting($pdo, 'smtp_host');
+    $port      = (int)getSetting($pdo, 'smtp_port', 465);
+    $enc       = getSetting($pdo, 'smtp_encryption', 'ssl');
+    $user      = getSetting($pdo, 'smtp_username');
+    $pass      = getSetting($pdo, 'smtp_password');
+    $fromEmail = getSetting($pdo, 'smtp_from_email');
+    $fromName  = getSetting($pdo, 'smtp_from_name', 'XCloud');
+    $timeout   = (int)getSetting($pdo, 'smtp_timeout', 15);
+    $debug     = (int)getSetting($pdo, 'smtp_debug', 0);
+    $ip        = $_SERVER['REMOTE_ADDR'] ?? 'unknown';
+
+    if (empty($host) || empty($user) || empty($pass) || empty($fromEmail)) {
+        $pdo->prepare("INSERT INTO email_send_log (email,ip_address,purpose,status,error_message) VALUES(?,?,?,'failed',?)")
+            ->execute([$to, $ip, $purpose, 'SMTP not configured (host/user/pass/from missing)']);
+        return ['ok' => false, 'error' => 'SMTP not configured'];
+    }
+
+    $mail = new PHPMailer(true);
+    try {
+        $mail->isSMTP();
+        $mail->Host = $host;
+        $mail->Port = $port;
+        $mail->SMTPAuth = true;
+        $mail->Username = $user;
+        $mail->Password = $pass;
+        $mail->Timeout = $timeout;
+
+        if ($enc === 'ssl')      $mail->SMTPSecure = PHPMailer::ENCRYPTION_SMTPS;
+        elseif ($enc === 'tls')  $mail->SMTPSecure = PHPMailer::ENCRYPTION_STARTTLS;
+        else                     $mail->SMTPSecure = false;
+
+        if ($debug) $mail->SMTPDebug = SMTP::DEBUG_SERVER;
+
+        $mail->CharSet  = 'UTF-8';
+        $mail->Encoding = 'base64';
+        $mail->setFrom($fromEmail, $fromName);
+        $mail->addAddress($to);
+        $mail->isHTML(true);
+        $mail->Subject = $subject;
+        $mail->Body    = $html_body;
+        $mail->AltBody = $text_body ?: trim(strip_tags($html_body));
+
+        $mail->send();
+
+        $pdo->prepare("INSERT INTO email_send_log (email,ip_address,purpose,status) VALUES(?,?,?,'sent')")
+            ->execute([$to, $ip, $purpose]);
+        return ['ok' => true];
+
+    } catch (\Exception $e) {
+        $err = $mail->ErrorInfo ?: $e->getMessage();
+        $pdo->prepare("INSERT INTO email_send_log (email,ip_address,purpose,status,error_message) VALUES(?,?,?,'failed',?)")
+            ->execute([$to, $ip, $purpose, mb_substr($err, 0, 1000)]);
+        return ['ok' => false, 'error' => $err];
+    }
 }
 function maybeRunTrashCleanup($pdo,$trash_base){
     $last=getSetting($pdo,'trash_last_cleanup','2000-01-01 00:00:00');

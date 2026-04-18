@@ -134,6 +134,76 @@ function xcloud_send_email($pdo, $to, $subject, $html_body, $text_body = null, $
         return ['ok' => false, 'error' => $err];
     }
 }
+/**
+ * Render the OTP email subject + HTML + plain text for a given purpose.
+ *
+ * @param string $purpose 'register' | 'password_reset' | 'email_add'
+ * @param string $code The plaintext OTP code to embed
+ * @param int $ttlMinutes Validity in minutes
+ * @return array [string $subject, string $html, string $text]
+ */
+function render_otp_email($purpose, $code, $ttlMinutes) {
+    switch ($purpose) {
+        case 'password_reset':
+            $subject = 'بازیابی رمز عبور — XCloud';
+            $heading = 'بازیابی رمز عبور';
+            $intro   = 'برای بازیابی رمز عبور حساب XCloud خود، از کد یکبارمصرف زیر استفاده کنید.';
+            break;
+        case 'email_add':
+            $subject = 'تأیید ایمیل — XCloud';
+            $heading = 'تأیید آدرس ایمیل';
+            $intro   = 'برای تأیید این ایمیل و افزودن آن به حساب XCloud خود، از کد یکبارمصرف زیر استفاده کنید.';
+            break;
+        case 'register':
+        default:
+            $subject = 'کد تأیید ثبت‌نام — XCloud';
+            $heading = 'به XCloud خوش آمدید';
+            $intro   = 'برای تکمیل ثبت‌نام در XCloud، از کد یکبارمصرف زیر استفاده کنید.';
+            break;
+    }
+
+    $html = '<!DOCTYPE html><html lang="fa" dir="rtl"><head><meta charset="UTF-8">'
+          . '<meta name="viewport" content="width=device-width,initial-scale=1">'
+          . '<title>' . h($subject) . '</title></head>'
+          . '<body style="margin:0;padding:0;background:#f1f5f9;font-family:Tahoma,Arial,sans-serif">'
+          . '<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="background:#f1f5f9;padding:30px 10px">'
+          . '<tr><td align="center">'
+          . '<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="max-width:560px;background:#ffffff;border-radius:14px;overflow:hidden;box-shadow:0 4px 20px rgba(0,0,0,.08)">'
+          . '<tr><td style="background:linear-gradient(135deg,#3b82f6,#1e40af);padding:32px 24px;text-align:center;color:#fff">'
+          . '<div style="font-size:2rem;font-weight:700;margin-bottom:6px">XCloud</div>'
+          . '<div style="font-size:.95rem;opacity:.9">' . h($heading) . '</div>'
+          . '</td></tr>'
+          . '<tr><td style="padding:32px 28px;color:#1e293b;font-size:.95rem;line-height:1.8" dir="rtl">'
+          . '<p style="margin:0 0 16px">سلام،</p>'
+          . '<p style="margin:0 0 24px">' . h($intro) . '</p>'
+          . '<div style="text-align:center;margin:28px 0">'
+          . '<div style="display:inline-block;background:#f1f5f9;border:2px dashed #3b82f6;'
+          . 'padding:20px 36px;border-radius:12px;font-size:2.2rem;font-weight:700;'
+          . 'color:#1e40af;letter-spacing:.4em;font-family:Consolas,monospace">'
+          . h($code) . '</div></div>'
+          . '<p style="margin:20px 0 8px;color:#64748b;font-size:.85rem;text-align:center">'
+          . 'این کد تا <strong>' . (int)$ttlMinutes . ' دقیقه</strong> اعتبار دارد.</p>'
+          . '<hr style="border:none;border-top:1px solid #e2e8f0;margin:28px 0">'
+          . '<p style="margin:0;color:#94a3b8;font-size:.8rem;line-height:1.6">'
+          . '⚠️ اگر این درخواست از طرف شما نبود، این ایمیل را نادیده بگیرید. '
+          . 'هیچ‌کدام از کارکنان XCloud هرگز از شما این کد را نخواهد خواست.'
+          . '</p></td></tr>'
+          . '<tr><td style="background:#f8fafc;padding:18px 24px;text-align:center;color:#94a3b8;font-size:.75rem">'
+          . 'این ایمیل به‌صورت خودکار ارسال شده است. لطفاً پاسخ ندهید.<br>'
+          . '© ' . date('Y') . ' XCloud — همه حقوق محفوظ است.'
+          . '</td></tr>'
+          . '</table></td></tr></table></body></html>';
+
+    $text = "XCloud — $heading\n\n"
+          . "سلام،\n\n"
+          . "$intro\n\n"
+          . "کد تأیید: $code\n\n"
+          . "این کد تا $ttlMinutes دقیقه اعتبار دارد.\n\n"
+          . "اگر این درخواست از طرف شما نبود، این ایمیل را نادیده بگیرید.\n\n"
+          . "© " . date('Y') . " XCloud";
+
+    return [$subject, $html, $text];
+}
 function maybeRunTrashCleanup($pdo,$trash_base){
     $last=getSetting($pdo,'trash_last_cleanup','2000-01-01 00:00:00');
     if(strtotime($last)>strtotime('-1 day'))return;

@@ -1892,6 +1892,197 @@ if ($action == 'register_step1_process') {
     header("Location: ?action=register_step2"); exit;
 }
 
+// ─── GET: Step 2 form ────────────────────────────────────────
+if ($action == 'register_step2') {
+    if (!registrationEnabled($pdo)) { header("Location: index.php"); exit; }
+    if (empty($_SESSION['pending_registration'])) {
+        header("Location: ?action=register_step1&error=session_expired"); exit;
+    }
+    $pending = $_SESSION['pending_registration'];
+    $captcha = math_captcha_generate();
+    $csrf = generateCsrfToken();
+    $err = $_GET['error'] ?? '';
+    $msg = $_GET['msg'] ?? '';
+
+    $errMsg = [
+        'wrong_code'        => '⚠️ کد وارد شده اشتباه است.',
+        'expired'           => '⏰ کد منقضی شده. لطفاً «ارسال مجدد کد» را بزنید.',
+        'too_many_attempts' => '⛔ تعداد تلاش‌های اشتباه از حد مجاز عبور کرد. لطفاً کد جدید درخواست کنید.',
+        'captcha_wrong'     => '⚠️ پاسخ کپچا اشتباه است.',
+        'send_failed'       => '⚠️ ارسال مجدد ایمیل با مشکل مواجه شد.',
+        'cooldown'          => '⏳ لطفاً قبل از درخواست مجدد چند ثانیه صبر کنید.',
+        'invalid_format'    => '⚠️ کد باید فقط شامل ارقام باشد.',
+        'not_found'         => '⛔ کد فعالی یافت نشد. لطفاً «ارسال مجدد کد» را بزنید.',
+    ][$err] ?? '';
+
+    $msgText = '';
+    if ($msg === 'resent') $msgText = '✅ کد جدید ارسال شد.';
+
+    $expiresAtTs = strtotime($pending['expires_at']);
+?>
+<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>تأیید ایمیل — XCloud</title>
+<style>
+body{margin:0;font-family:Tahoma,system-ui,sans-serif;background:#0f172a;color:#e2e8f0;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:20px}
+.card{max-width:440px;width:100%;background:#1e293b;border:1px solid #334155;border-radius:14px;padding:32px;box-shadow:0 10px 40px rgba(0,0,0,.3)}
+h1{font-size:1.4rem;margin:0 0 8px;color:#f1f5f9;text-align:center}
+.subtitle{color:#94a3b8;font-size:.85rem;text-align:center;margin-bottom:8px}
+.email-display{background:#0f172a;border:1px solid #334155;color:#fde68a;padding:10px;border-radius:8px;text-align:center;font-weight:600;margin-bottom:18px;font-size:.9rem;direction:ltr}
+.field{margin-bottom:16px}
+label{display:block;color:#cbd5e1;font-size:.85rem;margin-bottom:6px;font-weight:600}
+input{width:100%;background:#0f172a;border:1px solid #334155;color:#f1f5f9;padding:11px 12px;border-radius:8px;font-size:.9rem;font-family:inherit;box-sizing:border-box}
+input:focus{outline:none;border-color:#3b82f6}
+.otp-input{font-size:1.6rem;text-align:center;letter-spacing:.5em;direction:ltr;font-family:Consolas,monospace;font-weight:700}
+.captcha{background:#0f172a;border:1px dashed #475569;padding:10px 14px;border-radius:8px;color:#fde68a;font-weight:700;text-align:center;margin-bottom:8px;font-size:1rem}
+.btn{width:100%;background:#3b82f6;color:#fff;border:none;padding:12px;border-radius:8px;font-weight:700;font-size:.95rem;cursor:pointer;font-family:inherit;margin-top:8px}
+.btn:hover{background:#2563eb}
+.btn-secondary{background:#475569;margin-top:8px}
+.btn-secondary:hover{background:#334155}
+.btn:disabled{background:#334155;color:#64748b;cursor:not-allowed}
+.err{background:#7f1d1d;color:#fee2e2;padding:10px 14px;border-radius:8px;margin-bottom:16px;font-size:.85rem;text-align:center}
+.ok{background:#14532d;color:#bbf7d0;padding:10px 14px;border-radius:8px;margin-bottom:16px;font-size:.85rem;text-align:center}
+.timer{text-align:center;color:#94a3b8;font-size:.8rem;margin-top:8px}
+.links{text-align:center;margin-top:14px;font-size:.85rem;color:#94a3b8}
+.links a{color:#3b82f6;text-decoration:none;font-weight:600}
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>📨 تأیید ایمیل</h1>
+  <div class="subtitle">کد ۶ رقمی ارسال‌شده به ایمیل خود را وارد کنید</div>
+  <div class="email-display"><?= h($pending['email']) ?></div>
+  <?php if ($errMsg): ?><div class="err"><?= $errMsg ?></div><?php endif; ?>
+  <?php if ($msgText): ?><div class="ok"><?= $msgText ?></div><?php endif; ?>
+  <form method="POST" action="?action=register_step2_process">
+    <input type="hidden" name="csrf_token" value="<?= h($csrf) ?>">
+    <div class="field">
+      <label for="otp_code">کد تأیید</label>
+      <input type="text" id="otp_code" name="otp_code" required inputmode="numeric" autocomplete="one-time-code" maxlength="8" pattern="\d{4,8}" class="otp-input">
+      <div class="timer" id="otpTimer"></div>
+    </div>
+    <div class="field">
+      <label>پاسخ این محاسبه چیست؟</label>
+      <div class="captcha"><?= h($captcha['question']) ?></div>
+      <input type="text" name="captcha" required inputmode="numeric" autocomplete="off">
+    </div>
+    <button type="submit" class="btn">تأیید و تکمیل ثبت‌نام</button>
+  </form>
+  <form method="POST" action="?action=register_resend_otp" style="margin-top:8px">
+    <input type="hidden" name="csrf_token" value="<?= h($csrf) ?>">
+    <button type="submit" class="btn btn-secondary" id="resendBtn">ارسال مجدد کد</button>
+  </form>
+  <div class="links">
+    <a href="?action=register_step1">تغییر ایمیل</a>
+  </div>
+</div>
+<script>
+(function(){
+  var expires = <?= (int)$expiresAtTs ?>;
+  var timerEl = document.getElementById('otpTimer');
+  function tick(){
+    var s = expires - Math.floor(Date.now()/1000);
+    if (s <= 0){ timerEl.textContent = 'کد منقضی شده. لطفاً ارسال مجدد بزنید.'; timerEl.style.color='#fca5a5'; return; }
+    var m = Math.floor(s/60), r = s%60;
+    timerEl.textContent = 'اعتبار کد: ' + m + ':' + (r<10?'0':'') + r;
+    setTimeout(tick, 1000);
+  }
+  tick();
+})();
+</script>
+</body>
+</html>
+<?php
+    exit;
+}
+
+// ─── POST: Step 2 process ────────────────────────────────────
+if ($action == 'register_step2_process') {
+    if (!registrationEnabled($pdo)) { header("Location: index.php"); exit; }
+    verifyCsrf();
+    if (empty($_SESSION['pending_registration'])) {
+        header("Location: ?action=register_step1&error=session_expired"); exit;
+    }
+    $pending = $_SESSION['pending_registration'];
+
+    $code = trim($_POST['otp_code'] ?? '');
+    $captchaAnswer = $_POST['captcha'] ?? '';
+
+    if (!math_captcha_verify($captchaAnswer)) {
+        header("Location: ?action=register_step2&error=captcha_wrong"); exit;
+    }
+
+    // Anti-enumeration: fake pending always fails
+    if (!empty($pending['fake'])) {
+        usleep(random_int(200000, 500000));
+        header("Location: ?action=register_step2&error=wrong_code"); exit;
+    }
+
+    $verify = verify_email_otp($pdo, $pending['email'], $code, 'register');
+    if (!$verify['ok']) {
+        header("Location: ?action=register_step2&error=" . urlencode($verify['reason'])); exit;
+    }
+
+    // Race-check: username/email could have been claimed during step 2
+    $st = $pdo->prepare("SELECT id FROM users WHERE username = ? OR email = ?");
+    $st->execute([$pending['username'], $pending['email']]);
+    if ($st->fetch()) {
+        unset($_SESSION['pending_registration']);
+        header("Location: ?action=register_step1&error=username_taken"); exit;
+    }
+
+    // Create user with default permissions from settings
+    $cd   = (int)getSetting($pdo, 'default_user_can_download', 1);
+    $ccp  = (int)getSetting($pdo, 'default_user_can_change_password', 1);
+    $cdel = (int)getSetting($pdo, 'default_user_can_delete', 0);
+    $csh  = (int)getSetting($pdo, 'default_user_can_share', 0);
+
+    $st = $pdo->prepare("INSERT INTO users
+        (username, password, email, email_verified, email_verified_at, role,
+         can_download, can_change_password, can_delete, can_share)
+        VALUES (?, ?, ?, 1, NOW(), 'user', ?, ?, ?, ?)");
+    $st->execute([
+        $pending['username'], $pending['password_hash'], $pending['email'],
+        $cd, $ccp, $cdel, $csh
+    ]);
+
+    // Auto-login
+    session_regenerate_id(true);
+    $_SESSION['user'] = $pending['username'];
+    $_SESSION['role'] = 'user';
+    unset($_SESSION['pending_registration']);
+
+    logActivity($pdo, $pending['username'], 'register_completed', $pending['email']);
+    header("Location: ?action=dashboard&msg=welcome"); exit;
+}
+
+// ─── POST: Resend OTP ────────────────────────────────────────
+if ($action == 'register_resend_otp') {
+    if (!registrationEnabled($pdo)) { header("Location: index.php"); exit; }
+    verifyCsrf();
+    if (empty($_SESSION['pending_registration'])) {
+        header("Location: ?action=register_step1"); exit;
+    }
+    $pending = $_SESSION['pending_registration'];
+
+    if (!empty($pending['fake'])) {
+        // Pretend success without doing anything (anti-enumeration)
+        header("Location: ?action=register_step2&msg=resent"); exit;
+    }
+
+    $payload = json_encode(['username' => $pending['username']]);
+    $result = request_email_otp($pdo, $pending['email'], 'register', $payload);
+
+    if ($result['ok']) {
+        $_SESSION['pending_registration']['expires_at'] = $result['expires_at'];
+        header("Location: ?action=register_step2&msg=resent"); exit;
+    }
+    header("Location: ?action=register_step2&error=" . urlencode($result['reason'] ?? 'send_failed')); exit;
+}
+
 // ================================================================
 // LOGIN PAGE
 // ================================================================
@@ -2057,7 +2248,8 @@ elseif($action=='dashboard'){
         'password_changed'=>['✅','رمز تغییر کرد'],'password_error'=>['❌','خطا در تغییر رمز'],
         'no_permission'=>['🔒','دسترسی ندارید'],'rename_error'=>['❌','خطا در تغییر نام'],
         'shared'=>['✅','فایل با موفقیت اشتراک‌گذاری شد'],'unshared'=>['✅','اشتراک‌گذاری حذف شد'],
-        'access_updated'=>['✅','دسترسی‌ها بروزرسانی شد'],'removed'=>['✅','دسترسی حذف شد']];
+        'access_updated'=>['✅','دسترسی‌ها بروزرسانی شد'],'removed'=>['✅','دسترسی حذف شد'],
+        'welcome'=>['🎉','خوش آمدید! ثبت‌نام شما با موفقیت تکمیل شد']];
     $msg=$_GET['msg']??'';
     ?><!DOCTYPE html><html lang="fa" dir="rtl"><head>
     <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,user-scalable=no">

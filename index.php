@@ -2084,6 +2084,271 @@ if ($action == 'register_resend_otp') {
 }
 
 // ================================================================
+// PASSWORD RESET FLOW
+// ================================================================
+
+// ─── GET: Forgot password step 1 ─────────────────────────────
+if ($action == 'forgot_password_step1') {
+    $captcha = math_captcha_generate();
+    $csrf = generateCsrfToken();
+    $err = $_GET['error'] ?? '';
+    $errMsg = [
+        'invalid_email'  => '⚠️ فرمت ایمیل نامعتبر است.',
+        'captcha_wrong'  => '⚠️ پاسخ کپچا اشتباه است.',
+    ][$err] ?? '';
+?>
+<!DOCTYPE html><html lang="fa" dir="rtl"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>بازیابی رمز عبور — XCloud</title>
+<style>
+body{margin:0;font-family:Tahoma,sans-serif;background:#0f172a;color:#e2e8f0;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:20px}
+.card{max-width:440px;width:100%;background:#1e293b;border:1px solid #334155;border-radius:14px;padding:32px}
+h1{font-size:1.4rem;margin:0 0 8px;color:#f1f5f9;text-align:center}
+.subtitle{color:#94a3b8;font-size:.85rem;text-align:center;margin-bottom:24px}
+.field{margin-bottom:16px}
+label{display:block;color:#cbd5e1;font-size:.85rem;margin-bottom:6px;font-weight:600}
+input{width:100%;background:#0f172a;border:1px solid #334155;color:#f1f5f9;padding:11px 12px;border-radius:8px;font-size:.9rem;font-family:inherit;box-sizing:border-box}
+.captcha{background:#0f172a;border:1px dashed #475569;padding:10px 14px;border-radius:8px;color:#fde68a;font-weight:700;text-align:center;margin-bottom:8px}
+.btn{width:100%;background:#3b82f6;color:#fff;border:none;padding:12px;border-radius:8px;font-weight:700;cursor:pointer;font-family:inherit}
+.err{background:#7f1d1d;color:#fee2e2;padding:10px 14px;border-radius:8px;margin-bottom:16px;font-size:.85rem;text-align:center}
+.links{text-align:center;margin-top:18px;font-size:.85rem;color:#94a3b8}
+.links a{color:#3b82f6;text-decoration:none;font-weight:600}
+</style></head><body>
+<div class="card">
+  <h1>🔑 بازیابی رمز عبور</h1>
+  <div class="subtitle">ایمیل خود را وارد کنید تا کد بازیابی برایتان ارسال شود</div>
+  <?php if ($errMsg): ?><div class="err"><?= $errMsg ?></div><?php endif; ?>
+  <form method="POST" action="?action=forgot_password_step1_process">
+    <input type="hidden" name="csrf_token" value="<?= h($csrf) ?>">
+    <div class="field">
+      <label>ایمیل</label>
+      <input type="email" name="email" required autocomplete="email">
+    </div>
+    <div class="field">
+      <label>پاسخ این محاسبه چیست؟</label>
+      <div class="captcha"><?= h($captcha['question']) ?></div>
+      <input type="text" name="captcha" required inputmode="numeric" autocomplete="off">
+    </div>
+    <button class="btn">ارسال کد بازیابی</button>
+  </form>
+  <div class="links"><a href="index.php">بازگشت به ورود</a></div>
+</div></body></html>
+<?php
+    exit;
+}
+
+// ─── POST: Step 1 process ────────────────────────────────────
+if ($action == 'forgot_password_step1_process') {
+    verifyCsrf();
+    $email = trim(mb_strtolower($_POST['email'] ?? ''));
+    $captchaAnswer = $_POST['captcha'] ?? '';
+
+    if (!math_captcha_verify($captchaAnswer)) {
+        header("Location: ?action=forgot_password_step1&error=captcha_wrong"); exit;
+    }
+    if (!validate_email_address($email)) {
+        header("Location: ?action=forgot_password_step1&error=invalid_email"); exit;
+    }
+
+    $st = $pdo->prepare("SELECT id, username FROM users WHERE email = ? AND email_verified = 1");
+    $st->execute([$email]);
+    $user = $st->fetch();
+
+    if ($user) {
+        $payload = json_encode(['user_id' => $user['id'], 'username' => $user['username']]);
+        $result = request_email_otp($pdo, $email, 'password_reset', $payload);
+        if ($result['ok']) {
+            $_SESSION['pending_password_reset'] = [
+                'email' => $email,
+                'user_id' => $user['id'],
+                'username' => $user['username'],
+                'expires_at' => $result['expires_at'],
+            ];
+            logActivity($pdo, $user['username'], 'password_reset_requested', $email);
+        } else {
+            // Even on rate limit, set a fake pending so step 2 page still appears
+            $_SESSION['pending_password_reset'] = [
+                'email' => $email, 'fake' => true,
+                'expires_at' => date('Y-m-d H:i:s', time() + 600),
+            ];
+        }
+    } else {
+        // Anti-enumeration: store fake pending
+        $_SESSION['pending_password_reset'] = [
+            'email' => $email, 'fake' => true,
+            'expires_at' => date('Y-m-d H:i:s', time() + 600),
+        ];
+        usleep(random_int(300000, 700000));
+    }
+
+    header("Location: ?action=forgot_password_step2&msg=sent"); exit;
+}
+
+// ─── GET: Step 2 form ────────────────────────────────────────
+if ($action == 'forgot_password_step2') {
+    if (empty($_SESSION['pending_password_reset'])) {
+        header("Location: ?action=forgot_password_step1"); exit;
+    }
+    $pending = $_SESSION['pending_password_reset'];
+    $captcha = math_captcha_generate();
+    $csrf = generateCsrfToken();
+    $err = $_GET['error'] ?? '';
+    $msg = $_GET['msg'] ?? '';
+
+    $errMsg = [
+        'wrong_code'        => '⚠️ کد وارد شده اشتباه است.',
+        'expired'           => '⏰ کد منقضی شده.',
+        'too_many_attempts' => '⛔ تعداد تلاش‌های اشتباه از حد گذشت.',
+        'captcha_wrong'     => '⚠️ پاسخ کپچا اشتباه است.',
+        'password_mismatch' => '⚠️ تکرار رمز با رمز اصلی مطابقت ندارد.',
+        'weak_password'     => '⚠️ رمز عبور باید حداقل ۸ کاراکتر و شامل حروف و اعداد باشد.',
+        'send_failed'       => '⚠️ ارسال مجدد با خطا مواجه شد.',
+        'cooldown'          => '⏳ لطفاً قبل از درخواست مجدد صبر کنید.',
+        'not_found'         => '⛔ کد فعالی یافت نشد.',
+        'invalid_format'    => '⚠️ کد باید فقط شامل ارقام باشد.',
+    ][$err] ?? '';
+
+    $msgText = '';
+    if ($msg === 'sent')   $msgText = '✅ اگر این ایمیل در سیستم ثبت شده باشد، کد بازیابی ارسال شده است.';
+    if ($msg === 'resent') $msgText = '✅ کد جدید ارسال شد.';
+
+    $expiresAtTs = strtotime($pending['expires_at']);
+?>
+<!DOCTYPE html><html lang="fa" dir="rtl"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>بازیابی رمز — XCloud</title>
+<style>
+body{margin:0;font-family:Tahoma,sans-serif;background:#0f172a;color:#e2e8f0;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:20px}
+.card{max-width:440px;width:100%;background:#1e293b;border:1px solid #334155;border-radius:14px;padding:32px}
+h1{font-size:1.4rem;margin:0 0 8px;color:#f1f5f9;text-align:center}
+.subtitle{color:#94a3b8;font-size:.85rem;text-align:center;margin-bottom:8px}
+.email-display{background:#0f172a;border:1px solid #334155;color:#fde68a;padding:10px;border-radius:8px;text-align:center;font-weight:600;margin-bottom:18px;font-size:.9rem;direction:ltr}
+.field{margin-bottom:16px}
+label{display:block;color:#cbd5e1;font-size:.85rem;margin-bottom:6px;font-weight:600}
+input{width:100%;background:#0f172a;border:1px solid #334155;color:#f1f5f9;padding:11px 12px;border-radius:8px;font-family:inherit;box-sizing:border-box}
+.otp-input{font-size:1.6rem;text-align:center;letter-spacing:.5em;direction:ltr;font-family:Consolas,monospace;font-weight:700}
+.captcha{background:#0f172a;border:1px dashed #475569;padding:10px 14px;border-radius:8px;color:#fde68a;font-weight:700;text-align:center;margin-bottom:8px}
+.btn{width:100%;background:#3b82f6;color:#fff;border:none;padding:12px;border-radius:8px;font-weight:700;cursor:pointer;font-family:inherit;margin-top:8px}
+.btn-secondary{background:#475569}
+.err{background:#7f1d1d;color:#fee2e2;padding:10px 14px;border-radius:8px;margin-bottom:16px;font-size:.85rem;text-align:center}
+.ok{background:#14532d;color:#bbf7d0;padding:10px 14px;border-radius:8px;margin-bottom:16px;font-size:.85rem;text-align:center}
+.timer{text-align:center;color:#94a3b8;font-size:.8rem;margin-top:8px}
+.hint{color:#64748b;font-size:.75rem;margin-top:4px}
+</style></head><body>
+<div class="card">
+  <h1>🔑 بازیابی رمز عبور</h1>
+  <div class="subtitle">کد ارسال‌شده و رمز جدید را وارد کنید</div>
+  <div class="email-display"><?= h($pending['email']) ?></div>
+  <?php if ($errMsg): ?><div class="err"><?= $errMsg ?></div><?php endif; ?>
+  <?php if ($msgText): ?><div class="ok"><?= $msgText ?></div><?php endif; ?>
+  <form method="POST" action="?action=forgot_password_step2_process">
+    <input type="hidden" name="csrf_token" value="<?= h($csrf) ?>">
+    <div class="field">
+      <label>کد تأیید</label>
+      <input type="text" name="otp_code" required inputmode="numeric" maxlength="8" pattern="\d{4,8}" class="otp-input" autocomplete="one-time-code">
+      <div class="timer" id="otpTimer"></div>
+    </div>
+    <div class="field">
+      <label>رمز عبور جدید</label>
+      <input type="password" name="new_password" required autocomplete="new-password" minlength="8">
+      <div class="hint">حداقل ۸ کاراکتر، شامل حروف و اعداد</div>
+    </div>
+    <div class="field">
+      <label>تکرار رمز عبور جدید</label>
+      <input type="password" name="password_confirm" required autocomplete="new-password" minlength="8">
+    </div>
+    <div class="field">
+      <label>پاسخ این محاسبه چیست؟</label>
+      <div class="captcha"><?= h($captcha['question']) ?></div>
+      <input type="text" name="captcha" required inputmode="numeric" autocomplete="off">
+    </div>
+    <button class="btn">تغییر رمز عبور</button>
+  </form>
+  <form method="POST" action="?action=forgot_password_resend" style="margin-top:8px">
+    <input type="hidden" name="csrf_token" value="<?= h($csrf) ?>">
+    <button class="btn btn-secondary">ارسال مجدد کد</button>
+  </form>
+</div>
+<script>
+(function(){
+  var expires = <?= (int)$expiresAtTs ?>;
+  var t = document.getElementById('otpTimer');
+  function tick(){
+    var s = expires - Math.floor(Date.now()/1000);
+    if (s <= 0){ t.textContent = 'کد منقضی شده.'; t.style.color='#fca5a5'; return; }
+    var m = Math.floor(s/60), r = s%60;
+    t.textContent = 'اعتبار کد: ' + m + ':' + (r<10?'0':'') + r;
+    setTimeout(tick, 1000);
+  } tick();
+})();
+</script>
+</body></html>
+<?php
+    exit;
+}
+
+// ─── POST: Step 2 process ────────────────────────────────────
+if ($action == 'forgot_password_step2_process') {
+    verifyCsrf();
+    if (empty($_SESSION['pending_password_reset'])) {
+        header("Location: ?action=forgot_password_step1"); exit;
+    }
+    $pending = $_SESSION['pending_password_reset'];
+
+    $code = trim($_POST['otp_code'] ?? '');
+    $newPass = $_POST['new_password'] ?? '';
+    $newPassConfirm = $_POST['password_confirm'] ?? '';
+    $captchaAnswer = $_POST['captcha'] ?? '';
+
+    if (!math_captcha_verify($captchaAnswer)) {
+        header("Location: ?action=forgot_password_step2&error=captcha_wrong"); exit;
+    }
+    if ($newPass !== $newPassConfirm) {
+        header("Location: ?action=forgot_password_step2&error=password_mismatch"); exit;
+    }
+    if (!validate_password_strength($newPass)) {
+        header("Location: ?action=forgot_password_step2&error=weak_password"); exit;
+    }
+
+    if (!empty($pending['fake'])) {
+        usleep(random_int(200000, 500000));
+        header("Location: ?action=forgot_password_step2&error=wrong_code"); exit;
+    }
+
+    $verify = verify_email_otp($pdo, $pending['email'], $code, 'password_reset');
+    if (!$verify['ok']) {
+        header("Location: ?action=forgot_password_step2&error=" . urlencode($verify['reason'])); exit;
+    }
+
+    $hash = password_hash($newPass, PASSWORD_DEFAULT);
+    $pdo->prepare("UPDATE users SET password = ? WHERE id = ?")
+        ->execute([$hash, $pending['user_id']]);
+
+    logActivity($pdo, $pending['username'], 'password_reset_completed', $pending['email']);
+    unset($_SESSION['pending_password_reset']);
+
+    header("Location: index.php?msg=password_reset_success"); exit;
+}
+
+// ─── POST: Resend OTP ────────────────────────────────────────
+if ($action == 'forgot_password_resend') {
+    verifyCsrf();
+    if (empty($_SESSION['pending_password_reset'])) {
+        header("Location: ?action=forgot_password_step1"); exit;
+    }
+    $pending = $_SESSION['pending_password_reset'];
+
+    if (!empty($pending['fake'])) {
+        header("Location: ?action=forgot_password_step2&msg=resent"); exit;
+    }
+
+    $payload = json_encode(['user_id' => $pending['user_id'], 'username' => $pending['username']]);
+    $result = request_email_otp($pdo, $pending['email'], 'password_reset', $payload);
+
+    if ($result['ok']) {
+        $_SESSION['pending_password_reset']['expires_at'] = $result['expires_at'];
+        header("Location: ?action=forgot_password_step2&msg=resent"); exit;
+    }
+    header("Location: ?action=forgot_password_step2&error=" . urlencode($result['reason'] ?? 'send_failed')); exit;
+}
+
+// ================================================================
 // LOGIN PAGE
 // ================================================================
 if($action=='index'){
@@ -2153,11 +2418,20 @@ if ('serviceWorker' in navigator) {
     <div id="loginCard">
         <div class="logo-wrap"><img src="/icons/web-app-manifest-512x512.png" alt="XCloud" style="width:56px;height:56px;object-fit:contain;border-radius:10px;"></div>
         <h1>XCloud</h1><p class="subtitle">وارد حساب کاربری خود شوید</p>
+        <?php
+        if (($_GET['msg'] ?? '') === 'password_reset_success') {
+            echo '<div style="background:#dcfce7;color:#166534;padding:10px 14px;border-radius:8px;margin-bottom:14px" dir="rtl">✅ رمز عبور شما با موفقیت تغییر کرد. اکنون با رمز جدید وارد شوید.</div>';
+        }
+        ?>
         <?php if($hasError):?><div class="error-box">نام کاربری یا رمز عبور اشتباه است!</div><?php endif;?>
         <form action="?action=login_process" method="POST">
             <input type="hidden" name="csrf_token" value="<?php echo $csrf;?>">
             <div class="field"><label>نام کاربری یا ایمیل</label><input type="text" name="username" placeholder="نام کاربری یا ایمیل" required autocomplete="username"></div>
-            <div class="field"><label>رمز عبور</label><input type="password" name="password" placeholder="••••••••" required autocomplete="current-password"></div>
+            <div class="field"><label>رمز عبور</label><input type="password" name="password" placeholder="••••••••" required autocomplete="current-password">
+                <div style="text-align:left;margin-top:6px">
+                  <a href="?action=forgot_password_step1" style="color:#3b82f6;text-decoration:none;font-size:.8rem">بازیابی رمز عبور</a>
+                </div>
+            </div>
             <button type="submit" class="submit-btn">ورود به سیستم</button>
         </form>
         <div class="or-sep">یا</div>

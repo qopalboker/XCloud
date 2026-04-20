@@ -2952,40 +2952,56 @@ if ($action == 'email_add_step1') {
         'ip_quota'      => '⛔ حداکثر تعداد درخواست از این IP پر شده.',
     ][$err] ?? '';
 ?>
-<!DOCTYPE html><html lang="fa" dir="rtl"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>افزودن ایمیل — XCloud</title>
+<!DOCTYPE html><html lang="fa" dir="rtl"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>افزودن ایمیل — XCloud</title>
+<?= renderHeadAssets() ?>
 <style>
-body{margin:0;font-family:Tahoma,sans-serif;background:#0f172a;color:#e2e8f0;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:20px}
-.card{max-width:440px;width:100%;background:#1e293b;border:1px solid #334155;border-radius:14px;padding:32px}
-h1{font-size:1.4rem;margin:0 0 8px;color:#f1f5f9;text-align:center}
-.subtitle{color:#94a3b8;font-size:.85rem;text-align:center;margin-bottom:24px}
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'Dana','JetBrains Mono',sans-serif;background:#0a0e1a;color:#e2e8f0;min-height:100vh}
+.app-header{position:sticky;top:0;z-index:1000;background:rgba(10,14,26,.88);backdrop-filter:blur(16px);padding:12px 20px;display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid #1e293b}
+.app-header .back-link{color:#cbd5e1;text-decoration:none;font-weight:600;font-size:.9rem}
+.app-header .back-link:hover{color:#fff}
+.container{max-width:520px;margin:0 auto;padding:24px 16px}
+.form-card{background:#111827;border-radius:16px;padding:24px;border:1px solid #1e293b;margin-bottom:20px}
+.file-icon-big{font-size:3rem;text-align:center;margin-bottom:8px}
+.file-title{font-size:1.25rem;font-weight:800;color:#f1f5f9;text-align:center}
 .field{margin-bottom:16px}
-label{display:block;color:#cbd5e1;font-size:.85rem;margin-bottom:6px;font-weight:600}
-input{width:100%;background:#0f172a;border:1px solid #334155;color:#f1f5f9;padding:11px 12px;border-radius:8px;font-family:inherit;box-sizing:border-box}
-.captcha{background:#0f172a;border:1px dashed #475569;padding:10px 14px;border-radius:8px;color:#fde68a;font-weight:700;text-align:center;margin-bottom:8px}
-.btn{width:100%;background:#3b82f6;color:#fff;border:none;padding:12px;border-radius:8px;font-weight:700;cursor:pointer;font-family:inherit}
-.err{background:#7f1d1d;color:#fee2e2;padding:10px 14px;border-radius:8px;margin-bottom:16px;font-size:.85rem;text-align:center}
-.links{text-align:center;margin-top:18px;font-size:.85rem;color:#94a3b8}
-.links a{color:#3b82f6;text-decoration:none;font-weight:600}
+.field label{display:block;color:#cbd5e1;font-size:.85rem;margin-bottom:6px;font-weight:600}
+.field input{width:100%;background:#0a0e1a;border:1px solid #1e293b;color:#f1f5f9;padding:11px 12px;border-radius:8px;font-family:inherit;box-sizing:border-box}
+.field input:focus{outline:none;border-color:#3b82f6}
+.captcha-box{background:#0a0e1a;border:1px solid #1e293b;padding:8px;border-radius:8px;margin-bottom:8px;text-align:center}
+.captcha-box img{display:inline-block}
+.btn-primary{width:100%;background:linear-gradient(135deg,#3b82f6,#8b5cf6);color:#fff;border:none;padding:12px;border-radius:8px;font-weight:700;cursor:pointer;font-family:inherit;font-size:.95rem}
+.btn-primary:hover{filter:brightness(1.1)}
+.err-banner{background:#7f1d1d;color:#fee2e2;padding:10px 14px;border-radius:8px;margin-bottom:16px;font-size:.85rem;text-align:center}
+.links-row{text-align:center;margin-top:14px;font-size:.85rem;color:#94a3b8}
+.links-row a{color:#3b82f6;text-decoration:none;font-weight:600}
 </style></head><body>
-<div class="card">
-  <h1>📧 افزودن ایمیل</h1>
-  <div class="subtitle">با افزودن ایمیل می‌توانید رمز عبور خود را بازیابی کنید</div>
-  <?php if ($errMsg): ?><div class="err"><?= $errMsg ?></div><?php endif; ?>
-  <form method="POST" action="?action=email_add_step1_process">
-    <input type="hidden" name="csrf_token" value="<?= h($csrf) ?>">
-    <div class="field">
-      <label>ایمیل</label>
-      <input type="email" name="email" required autocomplete="email">
-    </div>
-    <div class="field">
-      <label>پاسخ این محاسبه چیست؟</label>
-      <div class="captcha-box" style="background:#0f172a;border:1px solid #334155;padding:8px;border-radius:8px;margin-bottom:8px;text-align:center"><img src="?action=captcha_image&amp;v=<?= time() ?>" alt="کپچا" width="160" height="50" style="display:inline-block"></div>
-      <input type="text" name="captcha" required inputmode="numeric" autocomplete="off">
-    </div>
-    <button class="btn">ارسال کد تأیید</button>
-  </form>
-  <div class="links"><a href="?action=dashboard">انصراف</a></div>
-</div></body></html>
+<?= renderInAppHeader('افزودن ایمیل') ?>
+<div class="container">
+  <div class="form-card">
+    <div class="file-icon-big">📧</div>
+    <div class="file-title">افزودن ایمیل به حساب</div>
+    <p style="color:#94a3b8;font-size:.85rem;text-align:center;margin:8px 0 24px">با افزودن ایمیل می‌توانید رمز عبور خود را بازیابی کنید</p>
+    <?php if ($errMsg): ?><div class="err-banner"><?= $errMsg ?></div><?php endif; ?>
+    <form method="POST" action="?action=email_add_step1_process">
+      <input type="hidden" name="csrf_token" value="<?= h($csrf) ?>">
+      <div class="field">
+        <label>ایمیل</label>
+        <input type="email" name="email" required autocomplete="email">
+      </div>
+      <div class="field">
+        <label>پاسخ این محاسبه چیست؟</label>
+        <div class="captcha-box"><img src="?action=captcha_image&amp;v=<?= time() ?>" alt="کپچا" width="160" height="50"></div>
+        <input type="text" name="captcha" required inputmode="numeric" autocomplete="off">
+      </div>
+      <button class="btn-primary">ارسال کد تأیید</button>
+    </form>
+    <div class="links-row"><a href="?action=dashboard">انصراف</a></div>
+  </div>
+</div>
+</body></html>
 <?php
     exit;
 }
@@ -3062,51 +3078,67 @@ if ($action == 'email_add_step2') {
     $msgText = $msg === 'resent' ? '✅ کد جدید ارسال شد.' : '';
     $expiresAtTs = strtotime($pending['expires_at']);
 ?>
-<!DOCTYPE html><html lang="fa" dir="rtl"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>تأیید ایمیل — XCloud</title>
+<!DOCTYPE html><html lang="fa" dir="rtl"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>تأیید ایمیل — XCloud</title>
+<?= renderHeadAssets() ?>
 <style>
-body{margin:0;font-family:Tahoma,sans-serif;background:#0f172a;color:#e2e8f0;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:20px}
-.card{max-width:440px;width:100%;background:#1e293b;border:1px solid #334155;border-radius:14px;padding:32px}
-h1{font-size:1.4rem;margin:0 0 8px;color:#f1f5f9;text-align:center}
-.subtitle{color:#94a3b8;font-size:.85rem;text-align:center;margin-bottom:8px}
-.email-display{background:#0f172a;border:1px solid #334155;color:#fde68a;padding:10px;border-radius:8px;text-align:center;font-weight:600;margin-bottom:18px;direction:ltr}
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'Dana','JetBrains Mono',sans-serif;background:#0a0e1a;color:#e2e8f0;min-height:100vh}
+.app-header{position:sticky;top:0;z-index:1000;background:rgba(10,14,26,.88);backdrop-filter:blur(16px);padding:12px 20px;display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid #1e293b}
+.app-header .back-link{color:#cbd5e1;text-decoration:none;font-weight:600;font-size:.9rem}
+.app-header .back-link:hover{color:#fff}
+.container{max-width:520px;margin:0 auto;padding:24px 16px}
+.form-card{background:#111827;border-radius:16px;padding:24px;border:1px solid #1e293b;margin-bottom:20px}
+.file-icon-big{font-size:3rem;text-align:center;margin-bottom:8px}
+.file-title{font-size:1.25rem;font-weight:800;color:#f1f5f9;text-align:center}
+.email-display{background:#0a0e1a;border:1px solid #1e293b;color:#fde68a;padding:10px;border-radius:8px;text-align:center;font-weight:600;margin:16px 0 20px;direction:ltr}
 .field{margin-bottom:16px}
-label{display:block;color:#cbd5e1;font-size:.85rem;margin-bottom:6px;font-weight:600}
-input{width:100%;background:#0f172a;border:1px solid #334155;color:#f1f5f9;padding:11px 12px;border-radius:8px;font-family:inherit;box-sizing:border-box}
-.otp-input{font-size:1.6rem;text-align:center;letter-spacing:.5em;direction:ltr;font-family:Consolas,monospace;font-weight:700}
-.captcha{background:#0f172a;border:1px dashed #475569;padding:10px 14px;border-radius:8px;color:#fde68a;font-weight:700;text-align:center;margin-bottom:8px}
-.btn{width:100%;background:#3b82f6;color:#fff;border:none;padding:12px;border-radius:8px;font-weight:700;cursor:pointer;font-family:inherit;margin-top:8px}
-.btn-secondary{background:#475569}
-.err{background:#7f1d1d;color:#fee2e2;padding:10px 14px;border-radius:8px;margin-bottom:16px;font-size:.85rem;text-align:center}
-.ok{background:#14532d;color:#bbf7d0;padding:10px 14px;border-radius:8px;margin-bottom:16px;font-size:.85rem;text-align:center}
+.field label{display:block;color:#cbd5e1;font-size:.85rem;margin-bottom:6px;font-weight:600}
+.field input{width:100%;background:#0a0e1a;border:1px solid #1e293b;color:#f1f5f9;padding:11px 12px;border-radius:8px;font-family:inherit;box-sizing:border-box}
+.field input:focus{outline:none;border-color:#3b82f6}
+.otp-input{font-size:1.6rem!important;text-align:center;letter-spacing:.5em;direction:ltr;font-family:'JetBrains Mono',Consolas,monospace;font-weight:700}
+.captcha-box{background:#0a0e1a;border:1px solid #1e293b;padding:8px;border-radius:8px;margin-bottom:8px;text-align:center}
+.captcha-box img{display:inline-block}
+.btn-primary{width:100%;background:linear-gradient(135deg,#3b82f6,#8b5cf6);color:#fff;border:none;padding:12px;border-radius:8px;font-weight:700;cursor:pointer;font-family:inherit;font-size:.95rem;margin-top:8px}
+.btn-primary:hover{filter:brightness(1.1)}
+.btn-secondary{width:100%;background:#1e293b;color:#cbd5e1;border:1px solid #334155;padding:12px;border-radius:8px;font-weight:700;cursor:pointer;font-family:inherit;font-size:.9rem}
+.btn-secondary:hover{background:#263349}
+.err-banner{background:#7f1d1d;color:#fee2e2;padding:10px 14px;border-radius:8px;margin-bottom:16px;font-size:.85rem;text-align:center}
+.ok-banner{background:#14532d;color:#bbf7d0;padding:10px 14px;border-radius:8px;margin-bottom:16px;font-size:.85rem;text-align:center}
 .timer{text-align:center;color:#94a3b8;font-size:.8rem;margin-top:8px}
-.links{text-align:center;margin-top:14px;font-size:.85rem}
-.links a{color:#3b82f6;text-decoration:none;font-weight:600}
+.links-row{text-align:center;margin-top:14px;font-size:.85rem;color:#94a3b8}
+.links-row a{color:#3b82f6;text-decoration:none;font-weight:600}
 </style></head><body>
-<div class="card">
-  <h1>📨 تأیید ایمیل</h1>
-  <div class="subtitle">کد ارسال‌شده را وارد کنید</div>
-  <div class="email-display"><?= h($pending['email']) ?></div>
-  <?php if ($errMsg): ?><div class="err"><?= $errMsg ?></div><?php endif; ?>
-  <?php if ($msgText): ?><div class="ok"><?= $msgText ?></div><?php endif; ?>
-  <form method="POST" action="?action=email_add_step2_process">
-    <input type="hidden" name="csrf_token" value="<?= h($csrf) ?>">
-    <div class="field">
-      <label>کد تأیید</label>
-      <input type="text" name="otp_code" required inputmode="numeric" maxlength="8" pattern="\d{4,8}" class="otp-input" autocomplete="one-time-code">
-      <div class="timer" id="otpTimer"></div>
-    </div>
-    <div class="field">
-      <label>پاسخ این محاسبه چیست؟</label>
-      <div class="captcha-box" style="background:#0f172a;border:1px solid #334155;padding:8px;border-radius:8px;margin-bottom:8px;text-align:center"><img src="?action=captcha_image&amp;v=<?= time() ?>" alt="کپچا" width="160" height="50" style="display:inline-block"></div>
-      <input type="text" name="captcha" required inputmode="numeric" autocomplete="off">
-    </div>
-    <button class="btn">تأیید و افزودن ایمیل</button>
-  </form>
-  <form method="POST" action="?action=email_add_resend" style="margin-top:8px">
-    <input type="hidden" name="csrf_token" value="<?= h($csrf) ?>">
-    <button class="btn btn-secondary">ارسال مجدد کد</button>
-  </form>
-  <div class="links"><a href="?action=email_add_step1">تغییر ایمیل</a></div>
+<?= renderInAppHeader('تأیید ایمیل') ?>
+<div class="container">
+  <div class="form-card">
+    <div class="file-icon-big">📨</div>
+    <div class="file-title">تأیید ایمیل</div>
+    <p style="color:#94a3b8;font-size:.85rem;text-align:center;margin-top:8px">کد ارسال‌شده را وارد کنید</p>
+    <div class="email-display"><?= h($pending['email']) ?></div>
+    <?php if ($errMsg): ?><div class="err-banner"><?= $errMsg ?></div><?php endif; ?>
+    <?php if ($msgText): ?><div class="ok-banner"><?= $msgText ?></div><?php endif; ?>
+    <form method="POST" action="?action=email_add_step2_process">
+      <input type="hidden" name="csrf_token" value="<?= h($csrf) ?>">
+      <div class="field">
+        <label>کد تأیید</label>
+        <input type="text" name="otp_code" required inputmode="numeric" maxlength="8" pattern="\d{4,8}" class="otp-input" autocomplete="one-time-code">
+        <div class="timer" id="otpTimer"></div>
+      </div>
+      <div class="field">
+        <label>پاسخ این محاسبه چیست؟</label>
+        <div class="captcha-box"><img src="?action=captcha_image&amp;v=<?= time() ?>" alt="کپچا" width="160" height="50"></div>
+        <input type="text" name="captcha" required inputmode="numeric" autocomplete="off">
+      </div>
+      <button class="btn-primary">تأیید و افزودن ایمیل</button>
+    </form>
+    <form method="POST" action="?action=email_add_resend" style="margin-top:10px">
+      <input type="hidden" name="csrf_token" value="<?= h($csrf) ?>">
+      <button class="btn-secondary">ارسال مجدد کد</button>
+    </form>
+    <div class="links-row"><a href="?action=email_add_step1">تغییر ایمیل</a></div>
+  </div>
 </div>
 <script>
 (function(){

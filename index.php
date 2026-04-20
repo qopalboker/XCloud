@@ -129,6 +129,11 @@ function xcloud_send_email($pdo, $to, $subject, $html_body, $text_body = null, $
 
     } catch (\Exception $e) {
         $err = $mail->ErrorInfo ?: $e->getMessage();
+        if (stripos($err, 'connection timed out') !== false || stripos($err, 'code: 110') !== false) {
+            $err .= "\n\n💡 این خطا معمولاً به این معنی است که فایروال خروجی هاست شما، پورت SMTP را بسته است. "
+                  . "از پشتیبان هاست بخواهید پورت‌های ۴۶۵ و ۵۸۷ به مقصد '$host' را باز کنند، "
+                  . "یا از یک سرویس Email Relay مانند Mailgun/SendGrid/Brevo استفاده کنید.";
+        }
         $pdo->prepare("INSERT INTO email_send_log (email,ip_address,purpose,status,error_message) VALUES(?,?,?,'failed',?)")
             ->execute([$to, $ip, $purpose, mb_substr($err, 0, 1000)]);
         return ['ok' => false, 'error' => $err];
@@ -997,6 +1002,58 @@ if ($action == 'setup_save_smtp') {
     header("Location: ?action=setup_wizard&msg=smtp_saved"); exit;
 }
 
+// ─── GET: SMTP network diagnostics ───────────────────────────
+if ($action == 'setup_smtp_diagnose') {
+    if (!isset($_SESSION['user']) || $_SESSION['role'] !== 'admin') { die('Forbidden'); }
+    header('Content-Type: application/json; charset=utf-8');
+
+    $host = getSetting($pdo, 'smtp_host');
+    $port = (int)getSetting($pdo, 'smtp_port', 465);
+    $result = ['host' => $host, 'port' => $port, 'tests' => []];
+
+    $ip = gethostbyname($host);
+    $result['tests'][] = [
+        'name'   => 'DNS resolution',
+        'ok'     => ($ip !== $host && filter_var($ip, FILTER_VALIDATE_IP)),
+        'detail' => $ip !== $host ? "Resolved to $ip" : 'FAILED — host not resolvable',
+    ];
+
+    $errno = 0; $errstr = '';
+    $start = microtime(true);
+    $sock = @stream_socket_client("tcp://$host:$port", $errno, $errstr, 3);
+    $elapsed = round((microtime(true) - $start) * 1000);
+    if ($sock) {
+        $result['tests'][] = [
+            'name'   => "TCP connect to $host:$port",
+            'ok'     => true,
+            'detail' => "Connected in {$elapsed}ms",
+        ];
+        fclose($sock);
+    } else {
+        $result['tests'][] = [
+            'name'   => "TCP connect to $host:$port",
+            'ok'     => false,
+            'detail' => "FAILED ({$elapsed}ms) — errno=$errno, $errstr — likely outbound firewall blocks port $port",
+        ];
+    }
+
+    foreach ([465, 587, 25, 2525] as $altPort) {
+        if ($altPort === $port) continue;
+        $sock = @stream_socket_client("tcp://$host:$altPort", $errno, $errstr, 2);
+        if ($sock) {
+            $result['tests'][] = [
+                'name'   => "Alternative port $altPort",
+                'ok'     => true,
+                'detail' => 'Reachable — try this port instead',
+            ];
+            fclose($sock);
+        }
+    }
+
+    echo json_encode($result, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE);
+    exit;
+}
+
 // ─── POST: Send test email ───────────────────────────────────
 if ($action == 'setup_test_email') {
     if (!isset($_SESSION['user']) || $_SESSION['role'] !== 'admin') { die('Forbidden'); }
@@ -1212,6 +1269,21 @@ input,select{width:100%;background:#0f172a;border:1px solid #334155;color:#f1f5f
   <div class="card">
     <h2>۳. تست ارسال SMTP <?php if ($testEmailOk): ?><span class="badge badge-ok">✓ موفق</span><?php endif; ?></h2>
     <p style="color:#94a3b8;font-size:.85rem;margin:0 0 12px">یک ایمیل ساده به آدرس زیر ارسال می‌شود تا اتصال SMTP را بررسی کنیم.</p>
+    <div style="margin-bottom:14px">
+      <button type="button" onclick="diagnose()" class="btn" style="background:#475569">🔍 بررسی اتصال SMTP</button>
+      <pre id="diagResult" style="background:#0a0e1a;padding:12px;border-radius:8px;display:none;direction:ltr;text-align:left;font-family:monospace;font-size:.8rem;color:#94a3b8;white-space:pre-wrap;margin-top:10px"></pre>
+      <script>
+      async function diagnose(){
+        var pre = document.getElementById('diagResult');
+        pre.style.display='block';
+        pre.textContent='در حال بررسی...';
+        try {
+          var r = await fetch('?action=setup_smtp_diagnose');
+          pre.textContent = await r.text();
+        } catch(e) { pre.textContent = 'خطا: ' + e.message; }
+      }
+      </script>
+    </div>
     <form method="POST" action="?action=setup_test_email" class="inline-form">
       <input type="hidden" name="csrf_token" value="<?= h($csrf) ?>">
       <div class="field"><label>ایمیل تست</label><input type="email" name="test_email" required placeholder="your@email.com"></div>

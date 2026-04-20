@@ -281,11 +281,13 @@ function math_captcha_generate() {
     $op = random_int(0, 1) === 0 ? '+' : '-';
     if ($op === '-' && $b > $a) { [$a, $b] = [$b, $a]; }
     $answer = $op === '+' ? $a + $b : $a - $b;
+    $question = "$a $op $b = ?";
     $_SESSION['math_captcha'] = [
-        'answer'  => $answer,
-        'expires' => time() + 600,
+        'answer'   => $answer,
+        'question' => $question,
+        'expires'  => time() + 600,
     ];
-    return ['question' => "$a $op $b = ?", 'a' => $a, 'b' => $b, 'op' => $op];
+    return ['question' => $question, 'a' => $a, 'b' => $b, 'op' => $op];
 }
 
 function math_captcha_verify($userAnswer) {
@@ -790,6 +792,50 @@ if ($action === 'sw' || preg_match('#/sw\.js(\?|$)#', $_SERVER['REQUEST_URI'] ??
     exit;
 }
 
+// ─── Render captcha as PNG image (anti-bot) ──────────────────
+if ($action === 'captcha_image') {
+    if (!extension_loaded('gd')) {
+        header('Content-Type: image/png');
+        echo base64_decode('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=');
+        exit;
+    }
+    if (empty($_SESSION['math_captcha'])) {
+        math_captcha_generate();
+    }
+    $q = $_SESSION['math_captcha']['question'] ?? '? + ? = ?';
+
+    header('Content-Type: image/png');
+    header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
+    header('Pragma: no-cache');
+
+    $w = 160; $h = 50;
+    $im = imagecreatetruecolor($w, $h);
+    $bg    = imagecolorallocate($im, 10, 14, 26);
+    $fg    = imagecolorallocate($im, 253, 230, 104);
+    $noise = imagecolorallocate($im, 71, 85, 105);
+    imagefilledrectangle($im, 0, 0, $w, $h, $bg);
+
+    for ($i = 0; $i < 6; $i++) {
+        imageline($im, random_int(0,$w), random_int(0,$h), random_int(0,$w), random_int(0,$h), $noise);
+    }
+    for ($i = 0; $i < 80; $i++) {
+        imagesetpixel($im, random_int(0,$w-1), random_int(0,$h-1), $noise);
+    }
+
+    $chars = str_split($q);
+    $x = 12;
+    $fontSize = 5;
+    foreach ($chars as $c) {
+        $y = 16 + random_int(-3, 3);
+        imagestring($im, $fontSize, $x, $y, $c, $fg);
+        $x += 13 + random_int(-2, 2);
+    }
+
+    imagepng($im);
+    imagedestroy($im);
+    exit;
+}
+
 $upload_base='uploads/';
 $trash_base='trash/';
 $public_base='uploads/public/';
@@ -847,6 +893,7 @@ function setup_preflight_checks($pdo) {
     foreach (['pdo_mysql', 'openssl', 'mbstring', 'fileinfo'] as $ext) {
         $checks[] = ["PHP extension: $ext", extension_loaded($ext), extension_loaded($ext) ? 'loaded' : 'MISSING'];
     }
+    $checks[] = ['PHP extension: gd (for captcha)', extension_loaded('gd'), extension_loaded('gd') ? 'loaded' : 'MISSING — captcha will fall back to text'];
 
     // PHPMailer files
     $files = ['PHPMailer.php', 'SMTP.php', 'Exception.php'];
@@ -2326,7 +2373,7 @@ input:focus{outline:none;border-color:#3b82f6;background:#1e293b}
     </div>
     <div class="field">
       <label>پاسخ این محاسبه چیست؟</label>
-      <div class="captcha"><?= h($captcha['question']) ?></div>
+      <div class="captcha-box" style="background:#0f172a;border:1px solid #334155;padding:8px;border-radius:8px;margin-bottom:8px;text-align:center"><img src="?action=captcha_image&amp;v=<?= time() ?>" alt="کپچا" width="160" height="50" style="display:inline-block"></div>
       <input type="text" name="captcha" required inputmode="numeric" autocomplete="off">
     </div>
     <button type="submit" class="btn">ارسال کد تأیید</button>
@@ -2497,7 +2544,7 @@ input:focus{outline:none;border-color:#3b82f6}
     </div>
     <div class="field">
       <label>پاسخ این محاسبه چیست؟</label>
-      <div class="captcha"><?= h($captcha['question']) ?></div>
+      <div class="captcha-box" style="background:#0f172a;border:1px solid #334155;padding:8px;border-radius:8px;margin-bottom:8px;text-align:center"><img src="?action=captcha_image&amp;v=<?= time() ?>" alt="کپچا" width="160" height="50" style="display:inline-block"></div>
       <input type="text" name="captcha" required inputmode="numeric" autocomplete="off">
     </div>
     <button type="submit" class="btn">تأیید و تکمیل ثبت‌نام</button>
@@ -2655,7 +2702,7 @@ input{width:100%;background:#0f172a;border:1px solid #334155;color:#f1f5f9;paddi
     </div>
     <div class="field">
       <label>پاسخ این محاسبه چیست؟</label>
-      <div class="captcha"><?= h($captcha['question']) ?></div>
+      <div class="captcha-box" style="background:#0f172a;border:1px solid #334155;padding:8px;border-radius:8px;margin-bottom:8px;text-align:center"><img src="?action=captcha_image&amp;v=<?= time() ?>" alt="کپچا" width="160" height="50" style="display:inline-block"></div>
       <input type="text" name="captcha" required inputmode="numeric" autocomplete="off">
     </div>
     <button class="btn">ارسال کد بازیابی</button>
@@ -2786,7 +2833,7 @@ input{width:100%;background:#0f172a;border:1px solid #334155;color:#f1f5f9;paddi
     </div>
     <div class="field">
       <label>پاسخ این محاسبه چیست؟</label>
-      <div class="captcha"><?= h($captcha['question']) ?></div>
+      <div class="captcha-box" style="background:#0f172a;border:1px solid #334155;padding:8px;border-radius:8px;margin-bottom:8px;text-align:center"><img src="?action=captcha_image&amp;v=<?= time() ?>" alt="کپچا" width="160" height="50" style="display:inline-block"></div>
       <input type="text" name="captcha" required inputmode="numeric" autocomplete="off">
     </div>
     <button class="btn">تغییر رمز عبور</button>
@@ -2935,7 +2982,7 @@ input{width:100%;background:#0f172a;border:1px solid #334155;color:#f1f5f9;paddi
     </div>
     <div class="field">
       <label>پاسخ این محاسبه چیست؟</label>
-      <div class="captcha"><?= h($captcha['question']) ?></div>
+      <div class="captcha-box" style="background:#0f172a;border:1px solid #334155;padding:8px;border-radius:8px;margin-bottom:8px;text-align:center"><img src="?action=captcha_image&amp;v=<?= time() ?>" alt="کپچا" width="160" height="50" style="display:inline-block"></div>
       <input type="text" name="captcha" required inputmode="numeric" autocomplete="off">
     </div>
     <button class="btn">ارسال کد تأیید</button>
@@ -3053,7 +3100,7 @@ input{width:100%;background:#0f172a;border:1px solid #334155;color:#f1f5f9;paddi
     </div>
     <div class="field">
       <label>پاسخ این محاسبه چیست؟</label>
-      <div class="captcha"><?= h($captcha['question']) ?></div>
+      <div class="captcha-box" style="background:#0f172a;border:1px solid #334155;padding:8px;border-radius:8px;margin-bottom:8px;text-align:center"><img src="?action=captcha_image&amp;v=<?= time() ?>" alt="کپچا" width="160" height="50" style="display:inline-block"></div>
       <input type="text" name="captcha" required inputmode="numeric" autocomplete="off">
     </div>
     <button class="btn">تأیید و افزودن ایمیل</button>

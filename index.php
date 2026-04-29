@@ -3817,7 +3817,7 @@ elseif($action=='dashboard'){
                         <?php if($isTxt&&$txtPreview!==''):?>
                         <div class="txt-preview">
                             <code class="txt-content"><?php echo h($txtPreview);?></code>
-                            <button class="txt-copy-btn" onclick="copyTxt(this,<?php echo json_encode($txtPreview);?>)">📋 کپی پیش‌نمایش</button>
+                            <button class="txt-copy-btn" onclick="copyTxt(this,<?php echo h(json_encode($txtPreview, JSON_UNESCAPED_UNICODE));?>)">📋 کپی پیش‌نمایش</button>
                         </div>
                         <?php endif;?>
 

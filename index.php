@@ -887,6 +887,32 @@ function getUserUploadPath($username){
     $p=$upload_base.$safe.'/';if(!is_dir($p))mkdir($p,0755,true);return $p;
 }
 
+function normalizeFilesArray($f){
+    if(!is_array($f)||!isset($f["name"]))return [];
+    $out=[];
+    if(is_array($f["name"])){
+        $n=count($f["name"]);
+        for($i=0;$i<$n;$i++){
+            if($f["name"][$i]==='')continue;
+            $out[]=["name"=>$f["name"][$i],"type"=>$f["type"][$i]??'',"tmp_name"=>$f["tmp_name"][$i]??'',"error"=>$f["error"][$i]??UPLOAD_ERR_NO_FILE,"size"=>$f["size"][$i]??0];
+        }
+    }else{
+        if($f["name"]!=='')$out[]=$f;
+    }
+    return $out;
+}
+
+function buildUploadStatusQuery($ok,$fail,$tooLarge,$quota){
+    if($ok===0&&$fail===0)return "msg=upload_error";
+    if($ok>0&&$fail===0)return "msg=success&uploaded=".$ok;
+    if($ok===0&&$fail>0){
+        if($quota>0)return "msg=quota_exceeded";
+        if($tooLarge>0)return "msg=too_large";
+        return "msg=upload_error";
+    }
+    return "msg=partial_success&uploaded=".$ok."&failed=".$fail;
+}
+
 // Old files migration for admin
 if(isset($_SESSION['user'])&&$_SESSION['role']==='admin'){
     $adminPath=getUserUploadPath('admin');
@@ -1530,16 +1556,23 @@ if($action=='logout'){if(isset($_SESSION['user']))logActivity($pdo,$_SESSION['us
 if($action=='upload_process'){
     if(!isset($_SESSION['user']))die("خطای امنیتی!");verifyCsrf();
     $up=getUserUploadPath($_SESSION['user']);
-    if(!isset($_FILES["fileToUpload"])||$_FILES["fileToUpload"]["error"]!==UPLOAD_ERR_OK){header("Location: ?action=dashboard&msg=upload_error");exit;}
-    $on=basename($_FILES["fileToUpload"]["name"]);$ext=strtolower(pathinfo($on,PATHINFO_EXTENSION));
-    if($_FILES["fileToUpload"]["size"]>$MAX_FILE_SIZE){header("Location: ?action=dashboard&msg=too_large");exit;}
-    if((getDirSize($up)+$_FILES["fileToUpload"]["size"])>$MAX_STORAGE_PER_USER){header("Location: ?action=dashboard&msg=quota_exceeded");exit;}
-    $tf=$up.$on;$c=1;$nwe=pathinfo($on,PATHINFO_FILENAME);
-    while(file_exists($tf)){$tf=$up.$nwe.'_'.$c.'.'.$ext;$c++;}
-    if(move_uploaded_file($_FILES["fileToUpload"]["tmp_name"],$tf)){
-        logActivity($pdo,$_SESSION['user'],'upload',basename($tf),"حجم: ".formatBytes($_FILES["fileToUpload"]["size"])." | نوع: $ext");
-        header("Location: ?action=dashboard&msg=success");
-    }else{header("Location: ?action=dashboard&msg=upload_error");}exit;
+    $files=normalizeFilesArray($_FILES["fileToUpload"]??null);
+    if(empty($files)){header("Location: ?action=dashboard&msg=upload_error");exit;}
+    $ok=0;$fail=0;$tooLarge=0;$quota=0;
+    $usedBytes=getDirSize($up);
+    foreach($files as $f){
+        if($f["error"]!==UPLOAD_ERR_OK){$fail++;continue;}
+        if($f["size"]>$MAX_FILE_SIZE){$tooLarge++;$fail++;continue;}
+        if(($usedBytes+$f["size"])>$MAX_STORAGE_PER_USER){$quota++;$fail++;continue;}
+        $on=basename($f["name"]);$ext=strtolower(pathinfo($on,PATHINFO_EXTENSION));
+        $tf=$up.$on;$c=1;$nwe=pathinfo($on,PATHINFO_FILENAME);
+        while(file_exists($tf)){$tf=$up.$nwe.'_'.$c.'.'.$ext;$c++;}
+        if(move_uploaded_file($f["tmp_name"],$tf)){
+            logActivity($pdo,$_SESSION['user'],'upload',basename($tf),"حجم: ".formatBytes($f["size"])." | نوع: $ext");
+            $usedBytes+=$f["size"];$ok++;
+        }else{$fail++;}
+    }
+    header("Location: ?action=dashboard&".buildUploadStatusQuery($ok,$fail,$tooLarge,$quota));exit;
 }
 
 if($action=='admin_upload_process'){
@@ -1548,16 +1581,23 @@ if($action=='admin_upload_process'){
     $cu=$pdo->prepare("SELECT username FROM users WHERE username=?");$cu->execute([$tu]);
     if(empty($tu)||!$cu->fetch()){header("Location: ?action=dashboard&msg=upload_error");exit;}
     $up=getUserUploadPath($tu);
-    if(!isset($_FILES["fileToUpload"])||$_FILES["fileToUpload"]["error"]!==UPLOAD_ERR_OK){header("Location: ?action=dashboard&msg=upload_error&view_user=".urlencode($tu));exit;}
-    $on=basename($_FILES["fileToUpload"]["name"]);$ext=strtolower(pathinfo($on,PATHINFO_EXTENSION));
-    if($_FILES["fileToUpload"]["size"]>$MAX_FILE_SIZE){header("Location: ?action=dashboard&msg=too_large&view_user=".urlencode($tu));exit;}
-    if((getDirSize($up)+$_FILES["fileToUpload"]["size"])>$MAX_STORAGE_PER_USER){header("Location: ?action=dashboard&msg=quota_exceeded&view_user=".urlencode($tu));exit;}
-    $tf=$up.$on;$c=1;$nwe=pathinfo($on,PATHINFO_FILENAME);
-    while(file_exists($tf)){$tf=$up.$nwe.'_'.$c.'.'.$ext;$c++;}
-    if(move_uploaded_file($_FILES["fileToUpload"]["tmp_name"],$tf)){
-        logActivity($pdo,$_SESSION['user'],'upload',basename($tf),"برای $tu | حجم: ".formatBytes($_FILES["fileToUpload"]["size"]));
-        header("Location: ?action=dashboard&msg=success&view_user=".urlencode($tu));
-    }else{header("Location: ?action=dashboard&msg=upload_error&view_user=".urlencode($tu));}exit;
+    $files=normalizeFilesArray($_FILES["fileToUpload"]??null);
+    if(empty($files)){header("Location: ?action=dashboard&msg=upload_error&view_user=".urlencode($tu));exit;}
+    $ok=0;$fail=0;$tooLarge=0;$quota=0;
+    $usedBytes=getDirSize($up);
+    foreach($files as $f){
+        if($f["error"]!==UPLOAD_ERR_OK){$fail++;continue;}
+        if($f["size"]>$MAX_FILE_SIZE){$tooLarge++;$fail++;continue;}
+        if(($usedBytes+$f["size"])>$MAX_STORAGE_PER_USER){$quota++;$fail++;continue;}
+        $on=basename($f["name"]);$ext=strtolower(pathinfo($on,PATHINFO_EXTENSION));
+        $tf=$up.$on;$c=1;$nwe=pathinfo($on,PATHINFO_FILENAME);
+        while(file_exists($tf)){$tf=$up.$nwe.'_'.$c.'.'.$ext;$c++;}
+        if(move_uploaded_file($f["tmp_name"],$tf)){
+            logActivity($pdo,$_SESSION['user'],'upload',basename($tf),"برای $tu | حجم: ".formatBytes($f["size"]));
+            $usedBytes+=$f["size"];$ok++;
+        }else{$fail++;}
+    }
+    header("Location: ?action=dashboard&view_user=".urlencode($tu)."&".buildUploadStatusQuery($ok,$fail,$tooLarge,$quota));exit;
 }
 
 if($action=='upload_text_process'){
@@ -1588,28 +1628,32 @@ if($action=='admin_upload_text_process'){
 if($action=='public_upload_process'){
     if(!isset($_SESSION['user'])||$_SESSION['role']!=='admin')die("دسترسی غیرمجاز!");verifyCsrf();
     global $public_base;
-    if(!isset($_FILES["fileToUpload"])||$_FILES["fileToUpload"]["error"]!==UPLOAD_ERR_OK){header("Location: ?action=dashboard&tab=public&msg=upload_error");exit;}
-    $on=basename($_FILES["fileToUpload"]["name"]);$ext=strtolower(pathinfo($on,PATHINFO_EXTENSION));
-    if($_FILES["fileToUpload"]["size"]>$MAX_FILE_SIZE){header("Location: ?action=dashboard&tab=public&msg=too_large");exit;}
-    $tf=$public_base.$on;$c=1;$nwe=pathinfo($on,PATHINFO_FILENAME);
-    while(file_exists($tf)){$tf=$public_base.$nwe.'_'.$c.'.'.$ext;$c++;}
-    $finalName=basename($tf);
-    if(move_uploaded_file($_FILES["fileToUpload"]["tmp_name"],$tf)){
-        $st=$pdo->prepare("INSERT INTO public_files (filename,uploaded_by,file_size) VALUES(?,?,?)");
-        $st->execute([$finalName,$_SESSION['user'],$_FILES["fileToUpload"]["size"]]);
-        $fileId=$pdo->lastInsertId();
-        // Grant access to selected users
-        $selectedUsers=$_POST['access_users']??[];
-        if(is_array($selectedUsers)){
+    $files=normalizeFilesArray($_FILES["fileToUpload"]??null);
+    if(empty($files)){header("Location: ?action=dashboard&tab=public&msg=upload_error");exit;}
+    $selectedUsers=$_POST['access_users']??[];
+    if(!is_array($selectedUsers))$selectedUsers=[];
+    $ok=0;$fail=0;$tooLarge=0;
+    foreach($files as $f){
+        if($f["error"]!==UPLOAD_ERR_OK){$fail++;continue;}
+        if($f["size"]>$MAX_FILE_SIZE){$tooLarge++;$fail++;continue;}
+        $on=basename($f["name"]);$ext=strtolower(pathinfo($on,PATHINFO_EXTENSION));
+        $tf=$public_base.$on;$c=1;$nwe=pathinfo($on,PATHINFO_FILENAME);
+        while(file_exists($tf)){$tf=$public_base.$nwe.'_'.$c.'.'.$ext;$c++;}
+        $finalName=basename($tf);
+        if(move_uploaded_file($f["tmp_name"],$tf)){
+            $st=$pdo->prepare("INSERT INTO public_files (filename,uploaded_by,file_size) VALUES(?,?,?)");
+            $st->execute([$finalName,$_SESSION['user'],$f["size"]]);
+            $fileId=$pdo->lastInsertId();
             foreach($selectedUsers as $su){
                 $su=trim($su);if(empty($su))continue;
                 $ins=$pdo->prepare("INSERT IGNORE INTO public_file_access (file_id,username) VALUES(?,?)");
                 $ins->execute([$fileId,$su]);
             }
-        }
-        logActivity($pdo,$_SESSION['user'],'public_upload',$finalName,"حجم: ".formatBytes($_FILES["fileToUpload"]["size"]));
-        header("Location: ?action=dashboard&tab=public&msg=success");
-    }else{header("Location: ?action=dashboard&tab=public&msg=upload_error");}exit;
+            logActivity($pdo,$_SESSION['user'],'public_upload',$finalName,"حجم: ".formatBytes($f["size"]));
+            $ok++;
+        }else{$fail++;}
+    }
+    header("Location: ?action=dashboard&tab=public&".buildUploadStatusQuery($ok,$fail,$tooLarge,0));exit;
 }
 
 // ── Update public file access ──
@@ -3420,6 +3464,7 @@ elseif($action=='dashboard'){
         'no_permission'=>['🔒','دسترسی ندارید'],'rename_error'=>['❌','خطا در تغییر نام'],
         'shared'=>['✅','فایل با موفقیت اشتراک‌گذاری شد'],'unshared'=>['✅','اشتراک‌گذاری حذف شد'],
         'access_updated'=>['✅','دسترسی‌ها بروزرسانی شد'],'removed'=>['✅','دسترسی حذف شد'],
+        'partial_success'=>['⚠️','بخشی از فایل‌ها آپلود شد'],
         'welcome'=>['🎉','خوش آمدید! ثبت‌نام شما با موفقیت تکمیل شد']];
     $msg=$_GET['msg']??'';
     ?><!DOCTYPE html><html lang="fa" dir="rtl"><head>
@@ -3700,9 +3745,9 @@ elseif($action=='dashboard'){
                         <input type="hidden" name="csrf_token" value="<?php echo $csrf;?>">
                         <div class="drop-zone" id="dropZone">
                             <div class="drop-icon">☁️</div>
-                            <p class="drop-text" id="fileLabel">رها کنید یا <strong>انتخاب کنید</strong></p>
-                            <p class="format-note">همه فرمت‌ها — حداکثر 1G</p>
-                            <input type="file" name="fileToUpload" id="fileInput" required>
+                            <p class="drop-text" id="fileLabel">رها کنید یا <strong>انتخاب کنید</strong> (چند فایل)</p>
+                            <p class="format-note">همه فرمت‌ها — حداکثر 1G برای هر فایل</p>
+                            <input type="file" name="fileToUpload[]" id="fileInput" multiple required>
                         </div>
                         <button type="submit" class="action-btn primary" id="uploadBtn">ارسال به فضای ابری</button>
                     </form>
@@ -3720,9 +3765,9 @@ elseif($action=='dashboard'){
                         <input type="hidden" name="target_user" value="<?php echo h($viewUser);?>">
                         <div class="drop-zone" id="dropZone">
                             <div class="drop-icon">☁️</div>
-                            <p class="drop-text" id="fileLabel">رها کنید یا <strong>انتخاب کنید</strong></p>
-                            <p class="format-note">همه فرمت‌ها — حداکثر 1G</p>
-                            <input type="file" name="fileToUpload" id="fileInput" required>
+                            <p class="drop-text" id="fileLabel">رها کنید یا <strong>انتخاب کنید</strong> (چند فایل)</p>
+                            <p class="format-note">همه فرمت‌ها — حداکثر 1G برای هر فایل</p>
+                            <input type="file" name="fileToUpload[]" id="fileInput" multiple required>
                         </div>
                         <button type="submit" class="action-btn primary" id="uploadBtn">ارسال برای <?php echo h($viewUser);?></button>
                     </form>
@@ -3746,9 +3791,9 @@ elseif($action=='dashboard'){
                         <input type="hidden" name="csrf_token" value="<?php echo $csrf;?>">
                         <div class="drop-zone" id="dropZone">
                             <div class="drop-icon">🌐</div>
-                            <p class="drop-text" id="fileLabel">رها کنید یا <strong>انتخاب کنید</strong></p>
-                            <p class="format-note">همه فرمت‌ها — حداکثر 1G</p>
-                            <input type="file" name="fileToUpload" id="fileInput" required>
+                            <p class="drop-text" id="fileLabel">رها کنید یا <strong>انتخاب کنید</strong> (چند فایل)</p>
+                            <p class="format-note">همه فرمت‌ها — حداکثر 1G برای هر فایل</p>
+                            <input type="file" name="fileToUpload[]" id="fileInput" multiple required>
                         </div>
                         <div style="margin-top:12px">
                             <div class="section-title" style="font-size:.74rem">انتخاب کاربران مجاز:</div>
@@ -4099,7 +4144,13 @@ elseif($action=='dashboard'){
     <script>
     (function(){
         const msgs=<?php echo json_encode($msgs);?>;const msg='<?php echo h($msg);?>';
-        if(msg&&msgs[msg]){const t=document.getElementById('toast');t.innerHTML='<span>'+msgs[msg][0]+'</span><span>'+msgs[msg][1]+'</span>';
+        if(msg&&msgs[msg]){const t=document.getElementById('toast');
+            const qp=new URLSearchParams(window.location.search);
+            const uploaded=parseInt(qp.get('uploaded')||'0',10);const failed=parseInt(qp.get('failed')||'0',10);
+            let label=msgs[msg][1];
+            if(msg==='success'&&uploaded>1)label=uploaded+' فایل آپلود شد';
+            else if(msg==='partial_success')label=uploaded+' فایل آپلود شد، '+failed+' ناموفق';
+            t.innerHTML='<span>'+msgs[msg][0]+'</span><span>'+label+'</span>';
             setTimeout(()=>t.classList.add('show'),80);setTimeout(()=>t.classList.remove('show'),3200);
             var _cleanUrl=window.location.pathname+'?action=dashboard&tab=<?php echo urlencode($activeTab);?>';
             <?php if($viewUser!==$_SESSION['user']):?>_cleanUrl+='&view_user=<?php echo urlencode($viewUser);?>';<?php endif;?>
@@ -4108,12 +4159,20 @@ elseif($action=='dashboard'){
 
     const dz=document.getElementById('dropZone'),fi=document.getElementById('fileInput'),fl=document.getElementById('fileLabel');
     if(dz){
+        const showSelected=files=>{
+            if(!files||!files.length)return;
+            const first=files[0].name;
+            fl.innerHTML=files.length>1
+                ?'<strong>'+files.length+' فایل انتخاب شد</strong><br><span style="font-size:.78rem;opacity:.75">'+first+(files.length>1?' و '+(files.length-1)+' فایل دیگر':'')+'</span>'
+                :'<strong>'+first+'</strong>';
+        };
         ['dragenter','dragover'].forEach(e=>dz.addEventListener(e,ev=>{ev.preventDefault();dz.classList.add('dragging')}));
         ['dragleave','drop'].forEach(e=>dz.addEventListener(e,ev=>{ev.preventDefault();dz.classList.remove('dragging')}));
-        dz.addEventListener('drop',e=>{if(e.dataTransfer.files.length){fi.files=e.dataTransfer.files;fl.innerHTML='<strong>'+e.dataTransfer.files[0].name+'</strong>';}});
-        fi.addEventListener('change',()=>{if(fi.files.length)fl.innerHTML='<strong>'+fi.files[0].name+'</strong>';});
+        dz.addEventListener('drop',e=>{if(e.dataTransfer.files.length){fi.files=e.dataTransfer.files;showSelected(fi.files);}});
+        fi.addEventListener('change',()=>showSelected(fi.files));
         document.getElementById('uploadFileForm').addEventListener('submit',function(){
-            const btn=document.getElementById('uploadBtn');btn.disabled=true;btn.style.opacity='.65';btn.textContent='در حال آپلود...';});
+            const btn=document.getElementById('uploadBtn');const n=fi.files?fi.files.length:0;
+            btn.disabled=true;btn.style.opacity='.65';btn.textContent=n>1?('در حال آپلود '+n+' فایل...'):'در حال آپلود...';});
     }
     function openRename(n){document.getElementById('renameOldName').value=n;document.getElementById('renameNewName').value=n;document.getElementById('renameModal').classList.add('active');setTimeout(()=>document.getElementById('renameNewName').focus(),100);}
     function closeRename(){document.getElementById('renameModal').classList.remove('active');}

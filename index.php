@@ -570,10 +570,291 @@ $pdo->exec("CREATE TABLE IF NOT EXISTS email_send_log (
 foreach(['ALTER TABLE users ADD COLUMN can_share TINYINT(1) NOT NULL DEFAULT 0'] as $q){try{$pdo->exec($q);}catch(Exception $e){}}
 $pdo->exec("UPDATE users SET can_share=1 WHERE role='admin'");
 
+// Short-link sharing tables
+$pdo->exec("CREATE TABLE IF NOT EXISTS share_links (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    token VARCHAR(16) NOT NULL UNIQUE,
+    owner VARCHAR(64) NOT NULL,
+    file_name VARCHAR(255) NOT NULL,
+    password_hash VARCHAR(255) DEFAULT NULL,
+    is_one_time TINYINT(1) NOT NULL DEFAULT 0,
+    view_count INT UNSIGNED NOT NULL DEFAULT 0,
+    consumed_at TIMESTAMP NULL DEFAULT NULL,
+    consumed_by_ip VARCHAR(45) DEFAULT NULL,
+    consumed_user_agent VARCHAR(255) DEFAULT NULL,
+    revoked_at TIMESTAMP NULL DEFAULT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_owner (owner),
+    INDEX idx_token (token),
+    INDEX idx_consumed (consumed_at)
+)");
+$pdo->exec("CREATE TABLE IF NOT EXISTS share_link_attempts (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    token VARCHAR(16) NOT NULL,
+    ip_address VARCHAR(45) NOT NULL,
+    succeeded TINYINT(1) NOT NULL DEFAULT 0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_token_ip_time (token, ip_address, created_at)
+)");
+
 function logActivity($pdo,$username,$actionType,$target=null,$details=null){
     $ip=$_SERVER['REMOTE_ADDR']??'unknown';
     $s=$pdo->prepare("INSERT INTO activity_log (username,action_type,target,details,ip_address) VALUES(?,?,?,?,?)");
     $s->execute([$username,$actionType,$target,$details,$ip]);
+}
+
+function getClientIp(){return $_SERVER['REMOTE_ADDR']??'0.0.0.0';}
+
+function generateShareToken(PDO $pdo, int $maxRetries = 5): string {
+    $alphabet = '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ';
+    for ($i = 0; $i < $maxRetries; $i++) {
+        $token = '';
+        $bytes = random_bytes(8);
+        for ($j = 0; $j < 8; $j++) {
+            $token .= $alphabet[ord($bytes[$j]) % 62];
+        }
+        $stmt = $pdo->prepare("SELECT 1 FROM share_links WHERE token = ? LIMIT 1");
+        $stmt->execute([$token]);
+        if (!$stmt->fetchColumn()) return $token;
+    }
+    throw new RuntimeException('Failed to generate unique share token');
+}
+
+function isShareLinkRateLimited(PDO $pdo, string $token, string $ip): bool {
+    $stmt = $pdo->prepare(
+        "SELECT COUNT(*) FROM share_link_attempts
+         WHERE token = ? AND ip_address = ? AND succeeded = 0
+         AND created_at > DATE_SUB(NOW(), INTERVAL 15 MINUTE)"
+    );
+    $stmt->execute([$token, $ip]);
+    return (int)$stmt->fetchColumn() >= 5;
+}
+
+function logShareAttempt(PDO $pdo, string $token, string $ip, bool $succeeded): void {
+    $stmt = $pdo->prepare("INSERT INTO share_link_attempts (token, ip_address, succeeded) VALUES (?, ?, ?)");
+    $stmt->execute([$token, $ip, $succeeded ? 1 : 0]);
+}
+
+function cleanupExpiredOneTimeShares(PDO $pdo): void {
+    try {
+        $stmt = $pdo->prepare(
+            "SELECT id, owner, file_name FROM share_links
+             WHERE is_one_time = 1
+               AND consumed_at IS NOT NULL
+               AND consumed_at < DATE_SUB(NOW(), INTERVAL 10 MINUTE)
+               AND revoked_at IS NULL
+             LIMIT 50"
+        );
+        $stmt->execute();
+        $rows = $stmt->fetchAll(PDO::FETCH_ASSOC);
+        foreach ($rows as $row) {
+            $filePath = getUserUploadPath($row['owner']) . $row['file_name'];
+            if (file_exists($filePath) && is_file($filePath)) {
+                @unlink($filePath);
+            }
+            $upd = $pdo->prepare("UPDATE share_links SET revoked_at = NOW() WHERE id = ? AND revoked_at IS NULL");
+            $upd->execute([$row['id']]);
+            logActivity($pdo, $row['owner'], 'share_link_consumed', $row['file_name'], 'File auto-deleted after one-time view');
+        }
+    } catch (Exception $e) { /* non-fatal */ }
+}
+
+function buildShareUrl(string $token): string {
+    $scheme = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https' : 'http';
+    $host = $_SERVER['HTTP_HOST'] ?? 'localhost';
+    $base = dirname($_SERVER['SCRIPT_NAME'] ?? '/index.php');
+    if ($base === '\\' || $base === '.') $base = '';
+    return $scheme . '://' . $host . rtrim($base, '/') . '/?action=share_view&t=' . urlencode($token);
+}
+
+function renderSharePageStyles(): string {
+    return "
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: 'Dana', -apple-system, system-ui, Tahoma, sans-serif; background: #0a0e1a; color: #e2e8f0; min-height: 100vh; padding: 20px; line-height: 1.6; }
+        .wrap { max-width: 720px; margin: 40px auto; }
+        .card { background: #111827; border: 1px solid #1e293b; border-radius: 16px; padding: 28px; box-shadow: 0 10px 40px rgba(0,0,0,.3); }
+        .file-icon { font-size: 4rem; text-align: center; margin-bottom: 16px; }
+        .file-name { font-size: 1.1rem; font-weight: 600; text-align: center; margin-bottom: 8px; word-break: break-all; color: #f1f5f9; }
+        .file-meta { text-align: center; color: #94a3b8; font-size: 0.9rem; margin-bottom: 24px; }
+        .preview-box { background: #0a0e1a; border-radius: 12px; padding: 16px; margin-bottom: 20px; max-height: 480px; overflow: auto; border: 1px solid #1e293b; }
+        .preview-box img { max-width: 100%; height: auto; display: block; margin: 0 auto; border-radius: 8px; }
+        .preview-box video, .preview-box audio { width: 100%; display: block; border-radius: 8px; }
+        .preview-box pre { white-space: pre-wrap; word-break: break-word; font-family: 'JetBrains Mono', 'Courier New', monospace; font-size: 0.88rem; color: #cbd5e1; line-height: 1.6; direction: ltr; text-align: left; }
+        .download-btn { display: block; width: 100%; padding: 14px; background: #3b82f6; color: #fff; text-align: center; border-radius: 12px; text-decoration: none; font-weight: 600; font-size: 1rem; transition: background .15s; border: none; cursor: pointer; font-family: inherit; }
+        .download-btn:hover { background: #2563eb; }
+        .copy-btn { background: #1e293b; color: #cbd5e1; border: 1px solid #334155; padding: 6px 12px; border-radius: 6px; cursor: pointer; font-family: inherit; margin-bottom: 16px; font-size: 0.82rem; }
+        .copy-btn:hover { background: #334155; }
+        .one-time-warn { background: #422006; color: #fbbf24; padding: 10px 14px; border-radius: 8px; margin-bottom: 16px; font-size: 0.9rem; text-align: center; border: 1px solid rgba(251,191,36,.2); }
+        .footer { text-align: center; margin-top: 24px; color: #64748b; font-size: 0.8rem; }
+        .pw-icon { font-size: 3rem; text-align: center; margin-bottom: 16px; }
+        .pw-title { font-size: 1.1rem; font-weight: 600; text-align: center; margin-bottom: 20px; color: #f1f5f9; }
+        .pw-input { width: 100%; padding: 12px 14px; background: #0a0e1a; color: #e2e8f0; border: 1px solid #334155; border-radius: 10px; font-family: inherit; font-size: 0.95rem; margin-bottom: 14px; }
+        .pw-input:focus { outline: none; border-color: #3b82f6; }
+        .pw-error { background: rgba(239,68,68,.08); color: #fca5a5; padding: 10px 14px; border-radius: 8px; margin-bottom: 14px; font-size: 0.88rem; text-align: center; border: 1px solid rgba(239,68,68,.2); }
+        .err-icon { font-size: 4rem; text-align: center; margin-bottom: 16px; color: #ef4444; }
+        .err-msg { text-align: center; font-size: 1rem; color: #fca5a5; }
+    ";
+}
+
+function renderSharePublicPage(array $share): void {
+    $filePath = getUserUploadPath($share['owner']) . $share['file_name'];
+    $ext = strtolower(pathinfo($share['file_name'], PATHINFO_EXTENSION));
+    $size = formatSizeUnits($filePath);
+    $isText = in_array($ext, ['txt', 'md', 'log', 'csv', 'json', 'xml'], true);
+    $isImg = isImage($share['file_name']);
+    $isVid = isVideo($share['file_name']);
+    $isAud = isAudio($share['file_name']);
+    $downloadUrl = '?action=share_download&t=' . urlencode($share['token']);
+
+    http_response_code(200);
+    header('Content-Type: text/html; charset=utf-8');
+    header('Cache-Control: no-store, no-cache, must-revalidate');
+
+    $textPreview = null; $totalLines = 0;
+    if ($isText && file_exists($filePath)) {
+        $fp = @fopen($filePath, 'r');
+        if ($fp) {
+            $lines = [];
+            for ($i = 0; $i < 20 && !feof($fp); $i++) {
+                $line = fgets($fp);
+                if ($line === false) break;
+                $lines[] = rtrim($line, "\r\n");
+            }
+            fclose($fp);
+            $textPreview = implode("\n", $lines);
+            $fp2 = @fopen($filePath, 'r');
+            if ($fp2) {
+                while (!feof($fp2)) { if (fgets($fp2) !== false) $totalLines++; }
+                fclose($fp2);
+            }
+        }
+    }
+    $styles = renderSharePageStyles();
+    ?>
+    <!DOCTYPE html>
+    <html lang="fa" dir="rtl">
+    <head>
+      <meta charset="UTF-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1.0">
+      <title>دریافت فایل | XCloud</title>
+      <style><?php echo $styles; ?></style>
+    </head>
+    <body>
+      <div class="wrap">
+        <div class="card">
+          <?php if ($share['is_one_time']): ?>
+            <div class="one-time-warn">⚠️ این لینک یک‌بار مصرف است — پس از بستن این صفحه، فایل به‌طور کامل حذف می‌شود.</div>
+          <?php endif; ?>
+
+          <div class="file-icon"><?php echo getFileIcon($share['file_name']); ?></div>
+          <div class="file-name"><?php echo h($share['file_name']); ?></div>
+          <div class="file-meta">حجم: <?php echo $size; ?></div>
+
+          <?php if ($isImg): ?>
+            <div class="preview-box">
+              <img src="?action=share_download&t=<?php echo urlencode($share['token']); ?>&inline=1" alt="<?php echo h($share['file_name']); ?>">
+            </div>
+          <?php elseif ($isVid): ?>
+            <div class="preview-box">
+              <video controls preload="metadata" src="?action=share_download&t=<?php echo urlencode($share['token']); ?>&inline=1"></video>
+            </div>
+          <?php elseif ($isAud): ?>
+            <div class="preview-box">
+              <audio controls preload="metadata" src="?action=share_download&t=<?php echo urlencode($share['token']); ?>&inline=1"></audio>
+            </div>
+          <?php elseif ($isText && $textPreview !== null): ?>
+            <div class="preview-box">
+              <pre id="textPreview"><?php echo h($textPreview); ?></pre>
+            </div>
+            <button class="copy-btn" onclick="copyTextPreview()">📋 کپی متن</button>
+            <?php if ($totalLines > 20): ?>
+              <p class="file-meta" style="margin-top:8px;">نمایش ۲۰ خط اول از <?php echo (int)$totalLines; ?> خط — برای مشاهده کامل، فایل را دانلود کنید.</p>
+            <?php endif; ?>
+          <?php endif; ?>
+
+          <a href="<?php echo h($downloadUrl); ?>" class="download-btn">⬇ دانلود فایل</a>
+        </div>
+        <div class="footer">XCloud — اشتراک امن فایل</div>
+      </div>
+      <script>
+        function copyTextPreview() {
+          var el = document.getElementById('textPreview');
+          if (!el) return;
+          var t = el.textContent;
+          if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(t).then(function(){ alert('متن کپی شد'); });
+          } else {
+            var ta = document.createElement('textarea'); ta.value = t; document.body.appendChild(ta);
+            ta.select(); try { document.execCommand('copy'); alert('متن کپی شد'); } catch(e){}
+            document.body.removeChild(ta);
+          }
+        }
+      </script>
+    </body>
+    </html>
+    <?php
+}
+
+function renderSharePasswordPage(array $share, bool $hasError): void {
+    http_response_code(200);
+    header('Content-Type: text/html; charset=utf-8');
+    header('Cache-Control: no-store, no-cache, must-revalidate');
+    $styles = renderSharePageStyles();
+    ?>
+    <!DOCTYPE html>
+    <html lang="fa" dir="rtl">
+    <head>
+      <meta charset="UTF-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1.0">
+      <title>رمز عبور | XCloud</title>
+      <style><?php echo $styles; ?></style>
+    </head>
+    <body>
+      <div class="wrap" style="max-width:440px;">
+        <div class="card">
+          <div class="pw-icon">🔒</div>
+          <div class="pw-title">این فایل با رمز محافظت شده است</div>
+          <?php if ($hasError): ?>
+            <div class="pw-error">رمز اشتباه است. دوباره تلاش کنید.</div>
+          <?php endif; ?>
+          <form method="POST" action="?action=share_password" autocomplete="off">
+            <input type="hidden" name="t" value="<?php echo h($share['token']); ?>">
+            <input type="password" name="password" class="pw-input" placeholder="رمز عبور" required autofocus>
+            <button type="submit" class="download-btn">تأیید</button>
+          </form>
+        </div>
+        <div class="footer">XCloud — اشتراک امن فایل</div>
+      </div>
+    </body>
+    </html>
+    <?php
+}
+
+function renderShareErrorPage(string $message, int $statusCode = 410): void {
+    http_response_code($statusCode);
+    header('Content-Type: text/html; charset=utf-8');
+    header('Cache-Control: no-store, no-cache, must-revalidate');
+    $styles = renderSharePageStyles();
+    ?>
+    <!DOCTYPE html>
+    <html lang="fa" dir="rtl">
+    <head>
+      <meta charset="UTF-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1.0">
+      <title>خطا | XCloud</title>
+      <style><?php echo $styles; ?></style>
+    </head>
+    <body>
+      <div class="wrap" style="max-width:440px;">
+        <div class="card">
+          <div class="err-icon">❌</div>
+          <div class="err-msg"><?php echo h($message); ?></div>
+        </div>
+        <div class="footer">XCloud — اشتراک امن فایل</div>
+      </div>
+    </body>
+    </html>
+    <?php
 }
 
 /**
@@ -1689,6 +1970,206 @@ if($action=='delete_public_file'){
         logActivity($pdo,$_SESSION['user'],'delete_public',$pf['filename']);
     }
     header("Location: ?action=dashboard&tab=public&msg=deleted");exit;
+}
+
+// ── Short-link sharing: PUBLIC (no auth) page view ──
+if($action==='share_view'){
+    cleanupExpiredOneTimeShares($pdo);
+    $token=$_GET['t']??'';
+    $stmt=$pdo->prepare("SELECT * FROM share_links WHERE token = ? LIMIT 1");
+    $stmt->execute([$token]);
+    $share=$stmt->fetch(PDO::FETCH_ASSOC);
+
+    if(!$share||$share['revoked_at']){
+        renderShareErrorPage('این لینک معتبر نیست یا منقضی شده.', 410); exit;
+    }
+    if($share['is_one_time']&&$share['consumed_at']){
+        $isSameIp=($share['consumed_by_ip']===getClientIp());
+        $withinGrace=(strtotime($share['consumed_at'])>time()-600);
+        if(!($isSameIp&&$withinGrace)){
+            renderShareErrorPage('این فایل قبلاً مشاهده شده و دیگر در دسترس نیست.', 410); exit;
+        }
+    }
+
+    $passwordOk=false;
+    if($share['password_hash']){
+        if(!empty($_SESSION['share_pw_ok_'.$share['token']])) $passwordOk=true;
+    }else{
+        $passwordOk=true;
+    }
+    if(!$passwordOk){
+        renderSharePasswordPage($share, isset($_GET['err']));
+        exit;
+    }
+
+    $filePath=getUserUploadPath($share['owner']).$share['file_name'];
+    if(!file_exists($filePath)||!is_file($filePath)){
+        renderShareErrorPage('فایل مورد نظر روی سرور یافت نشد.', 404); exit;
+    }
+
+    if($share['is_one_time']&&!$share['consumed_at']){
+        $upd=$pdo->prepare(
+            "UPDATE share_links
+             SET consumed_at = NOW(), consumed_by_ip = ?, consumed_user_agent = ?, view_count = view_count + 1
+             WHERE id = ? AND consumed_at IS NULL"
+        );
+        $upd->execute([getClientIp(), substr($_SERVER['HTTP_USER_AGENT']??'', 0, 255), $share['id']]);
+        $stmt->execute([$token]); $share=$stmt->fetch(PDO::FETCH_ASSOC);
+    }else{
+        $upd=$pdo->prepare("UPDATE share_links SET view_count = view_count + 1 WHERE id = ?");
+        $upd->execute([$share['id']]);
+    }
+
+    logActivity($pdo, $share['owner'], 'share_link_view', $share['file_name'], 'token='.$token.' ip='.getClientIp());
+    renderSharePublicPage($share);
+    exit;
+}
+
+// ── Short-link sharing: PUBLIC password verification ──
+if($action==='share_password'){
+    if($_SERVER['REQUEST_METHOD']!=='POST'){http_response_code(405); die('Method not allowed');}
+    $token=$_POST['t']??'';
+    $password=$_POST['password']??'';
+
+    $stmt=$pdo->prepare("SELECT * FROM share_links WHERE token = ? AND revoked_at IS NULL LIMIT 1");
+    $stmt->execute([$token]);
+    $share=$stmt->fetch(PDO::FETCH_ASSOC);
+    if(!$share||!$share['password_hash']){
+        header('Location: ?action=share_view&t='.urlencode($token)); exit;
+    }
+
+    $ip=getClientIp();
+    if(isShareLinkRateLimited($pdo, $token, $ip)){
+        renderShareErrorPage('تلاش‌های بیش از حد. لطفاً ۱۵ دقیقه دیگر تلاش کنید.', 429); exit;
+    }
+
+    if(password_verify($password, $share['password_hash'])){
+        logShareAttempt($pdo, $token, $ip, true);
+        $_SESSION['share_pw_ok_'.$token]=true;
+        header('Location: ?action=share_view&t='.urlencode($token)); exit;
+    }else{
+        logShareAttempt($pdo, $token, $ip, false);
+        logActivity($pdo, $share['owner'], 'share_link_password_fail', $share['file_name'], 'token='.$token.' ip='.$ip);
+        header('Location: ?action=share_view&t='.urlencode($token).'&err=1'); exit;
+    }
+}
+
+// ── Short-link sharing: PUBLIC download ──
+if($action==='share_download'){
+    cleanupExpiredOneTimeShares($pdo);
+    $token=$_GET['t']??'';
+    $stmt=$pdo->prepare("SELECT * FROM share_links WHERE token = ? AND revoked_at IS NULL LIMIT 1");
+    $stmt->execute([$token]);
+    $share=$stmt->fetch(PDO::FETCH_ASSOC);
+    if(!$share){http_response_code(410); die('Link not available');}
+
+    if($share['password_hash']&&empty($_SESSION['share_pw_ok_'.$token])){
+        header('Location: ?action=share_view&t='.urlencode($token)); exit;
+    }
+
+    if($share['is_one_time']){
+        $isSameIp=($share['consumed_by_ip']===getClientIp());
+        $withinGrace=$share['consumed_at']&&(strtotime($share['consumed_at'])>time()-600);
+        if(!$share['consumed_at']||!$isSameIp||!$withinGrace){
+            header('Location: ?action=share_view&t='.urlencode($token)); exit;
+        }
+    }
+
+    $filePath=getUserUploadPath($share['owner']).$share['file_name'];
+    if(!file_exists($filePath)||!is_file($filePath)){
+        http_response_code(404); die('File not found');
+    }
+
+    logActivity($pdo, $share['owner'], 'share_link_download', $share['file_name'], 'token='.$token.' ip='.getClientIp());
+
+    $mime=getFileMimeType($filePath);
+    $inlineOk=!empty($_GET['inline'])&&(strpos($mime,'image/')===0||strpos($mime,'video/')===0||strpos($mime,'audio/')===0);
+    $disposition=$inlineOk?'inline':'attachment';
+
+    header('Content-Type: '.$mime);
+    header('Content-Disposition: '.$disposition.'; filename="'.rawurlencode($share['file_name']).'"');
+    header('Content-Length: '.filesize($filePath));
+    header('Cache-Control: no-store, no-cache, must-revalidate');
+    readfile($filePath);
+    exit;
+}
+
+// ── Short-link sharing: AUTH create link ──
+if($action==='share_create'){
+    if(!isset($_SESSION['user'])){header('Location: index.php'); exit;}
+    if($_SERVER['REQUEST_METHOD']!=='POST'){http_response_code(405); die('Method not allowed');}
+    cleanupExpiredOneTimeShares($pdo);
+    verifyCsrf();
+
+    $userRow=$pdo->prepare("SELECT can_share, role FROM users WHERE username = ?");
+    $userRow->execute([$_SESSION['user']]);
+    $u=$userRow->fetch(PDO::FETCH_ASSOC);
+    $isAjax=!empty($_POST['ajax']);
+    $forbid=function($key) use ($isAjax){
+        if($isAjax){header('Content-Type: application/json'); echo json_encode(['ok'=>false,'error'=>$key]); exit;}
+        header('Location: ?action=dashboard&msg='.$key); exit;
+    };
+    if(!$u||(!$u['can_share']&&$u['role']!=='admin')){$forbid('share_forbidden');}
+
+    $fileName=basename($_POST['file_name']??'');
+    $owner=$_POST['owner']??$_SESSION['user'];
+    if($owner!==$_SESSION['user']&&$u['role']!=='admin'){$forbid('share_forbidden');}
+
+    $filePath=getUserUploadPath($owner).$fileName;
+    if($fileName===''||!file_exists($filePath)||!is_file($filePath)){$forbid('not_found');}
+
+    $password=trim($_POST['password']??'');
+    $isOneTime=!empty($_POST['one_time'])?1:0;
+
+    $passwordHash=null;
+    if($password!==''){
+        if(mb_strlen($password)<4){$forbid('share_pw_short');}
+        $passwordHash=password_hash($password, PASSWORD_BCRYPT);
+    }
+
+    $token=generateShareToken($pdo);
+    $stmt=$pdo->prepare(
+        "INSERT INTO share_links (token, owner, file_name, password_hash, is_one_time)
+         VALUES (?, ?, ?, ?, ?)"
+    );
+    $stmt->execute([$token, $owner, $fileName, $passwordHash, $isOneTime]);
+
+    logActivity($pdo, $_SESSION['user'], 'share_link_create', $fileName,
+        "owner={$owner} one_time={$isOneTime} password=".($passwordHash?'yes':'no'));
+
+    if($isAjax){
+        header('Content-Type: application/json');
+        echo json_encode(['ok'=>true,'token'=>$token,'url'=>buildShareUrl($token)]);
+        exit;
+    }
+    header('Location: ?action=my_shares&msg=share_created'); exit;
+}
+
+// ── Short-link sharing: AUTH revoke ──
+if($action==='share_revoke'){
+    if(!isset($_SESSION['user'])){header('Location: index.php'); exit;}
+    cleanupExpiredOneTimeShares($pdo);
+    $csrfTok=$_GET['csrf_token']??$_POST['csrf_token']??$_GET['csrf']??$_POST['csrf']??'';
+    if(empty($csrfTok)||!hash_equals($_SESSION['csrf_token']??'', $csrfTok)){renderCsrfError();}
+
+    $token=$_GET['t']??$_POST['t']??'';
+    $stmt=$pdo->prepare("SELECT * FROM share_links WHERE token = ? AND revoked_at IS NULL");
+    $stmt->execute([$token]);
+    $share=$stmt->fetch(PDO::FETCH_ASSOC);
+    if(!$share){header('Location: ?action=my_shares&msg=share_not_found'); exit;}
+
+    $userRow=$pdo->prepare("SELECT role FROM users WHERE username = ?");
+    $userRow->execute([$_SESSION['user']]);
+    $role=$userRow->fetchColumn();
+    if($share['owner']!==$_SESSION['user']&&$role!=='admin'){
+        header('Location: ?action=my_shares&msg=share_forbidden'); exit;
+    }
+
+    $upd=$pdo->prepare("UPDATE share_links SET revoked_at = NOW() WHERE id = ?");
+    $upd->execute([$share['id']]);
+    logActivity($pdo, $_SESSION['user'], 'share_link_revoke', $share['file_name'], 'token='.$token);
+
+    header('Location: ?action=my_shares&msg=share_revoked'); exit;
 }
 
 // ── Share file (admin or user with can_share) ──
@@ -3426,6 +3907,7 @@ if($action=='index'){
 // ================================================================
 elseif($action=='dashboard'){
     if(!isset($_SESSION['user'])){header("Location: index.php");exit;}
+    cleanupExpiredOneTimeShares($pdo);
     $role=$_SESSION['role'];$csrf=generateCsrfToken();$search=trim($_GET['search']??'');
     $activeTab=$_GET['tab']??'private';if(!in_array($activeTab,['private','public']))$activeTab='private';
     $viewUser=($role==='admin'&&isset($_GET['view_user']))?trim($_GET['view_user']):$_SESSION['user'];
@@ -3463,6 +3945,10 @@ elseif($action=='dashboard'){
         'password_changed'=>['✅','رمز تغییر کرد'],'password_error'=>['❌','خطا در تغییر رمز'],
         'no_permission'=>['🔒','دسترسی ندارید'],'rename_error'=>['❌','خطا در تغییر نام'],
         'shared'=>['✅','فایل با موفقیت اشتراک‌گذاری شد'],'unshared'=>['✅','اشتراک‌گذاری حذف شد'],
+        'share_created'=>['✅','لینک اشتراک با موفقیت ساخته شد'],'share_revoked'=>['🚫','لینک اشتراک لغو شد'],
+        'share_forbidden'=>['🔒','شما اجازه اشتراک‌گذاری این فایل را ندارید'],
+        'share_pw_short'=>['⚠️','رمز عبور باید حداقل ۴ کاراکتر باشد'],
+        'share_not_found'=>['❌','لینک اشتراک یافت نشد'],
         'access_updated'=>['✅','دسترسی‌ها بروزرسانی شد'],'removed'=>['✅','دسترسی حذف شد'],
         'partial_success'=>['⚠️','بخشی از فایل‌ها آپلود شد'],
         'welcome'=>['🎉','خوش آمدید! ثبت‌نام شما با موفقیت تکمیل شد']];
@@ -3668,6 +4154,9 @@ elseif($action=='dashboard'){
                 <?php if($canChangePass):?>
                 <button class="nav-btn nb-pass" onclick="openPasswordModal()" title="تغییر رمز"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg><span class="btn-text">رمز</span></button>
                 <?php else:?><span class="nav-btn nb-pass locked" title="بدون دسترسی"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg></span><?php endif;?>
+                <?php if($canShare||$role==='admin'):?>
+                <a href="?action=my_shares" class="nav-btn nb-share" title="اشتراک‌های من"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg><span class="btn-text">اشتراک‌ها</span></a>
+                <?php endif;?>
                 <?php if($role=='admin'):?>
                 <a href="?action=trash" class="nav-btn nb-trash" title="سطل زباله"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>
                     <?php if($trashCount>0):?><span class="trash-badge"><?php echo min($trashCount,99);?></span><?php endif;?>
@@ -3851,6 +4340,7 @@ elseif($action=='dashboard'){
                             <button class="three-dot-btn" onclick="toggleDotMenu(this)" title="بیشتر">&#8942;</button>
                             <div class="dot-menu">
                                 <button class="dot-menu-item" onclick="openShareModal('<?php echo h(addslashes($file));?>','<?php echo h(addslashes($viewUser));?>')">📤 اشتراک‌گذاری</button>
+                                <button class="dot-menu-item" onclick="openShortLinkModal('<?php echo h(addslashes($file));?>','<?php echo h(addslashes($viewUser));?>')">🔗 لینک عمومی</button>
                             </div>
                             <?php endif;?>
                         </div>
@@ -4070,6 +4560,94 @@ elseif($action=='dashboard'){
             </form>
         </div>
     </div>
+
+    <!-- Short Link (Public Share) Modal -->
+    <div class="modal-overlay" id="shortLinkModal">
+        <div class="modal-box" style="max-width:440px">
+            <h3>🔗 ساخت لینک عمومی</h3>
+            <p id="shortLinkFileName" style="font-size:.76rem;color:var(--text-dim);margin-bottom:12px"></p>
+            <form id="shortLinkForm" method="POST" action="?action=share_create">
+                <input type="hidden" name="csrf_token" value="<?php echo $csrf;?>">
+                <input type="hidden" name="ajax" value="1">
+                <input type="hidden" name="file_name" id="shortLinkFileInput">
+                <input type="hidden" name="owner" id="shortLinkOwnerInput">
+                <div class="section-title" style="font-size:.74rem;margin-bottom:6px">رمز عبور (اختیاری):</div>
+                <input type="text" name="password" id="shortLinkPasswordInput" placeholder="حداقل ۴ کاراکتر — خالی بگذارید برای بدون رمز" autocomplete="off" style="width:100%;padding:10px 12px;background:var(--bg-darker,#0a0e1a);color:var(--text,#e2e8f0);border:1px solid var(--border,#334155);border-radius:8px;font-family:inherit;font-size:.86rem;margin-bottom:12px">
+                <label style="display:flex;align-items:center;gap:8px;font-size:.82rem;color:var(--text-dim,#94a3b8);cursor:pointer;margin-bottom:14px">
+                    <input type="checkbox" name="one_time" id="shortLinkOneTimeInput" value="1" style="accent-color:var(--primary,#3b82f6);width:16px;height:16px">
+                    <span>یک‌بار مصرف (پس از مشاهده، فایل و لینک حذف می‌شوند)</span>
+                </label>
+                <div class="modal-actions">
+                    <button type="button" class="cancel" onclick="closeShortLinkModal()">انصراف</button>
+                    <button type="submit" class="confirm">ساخت لینک</button>
+                </div>
+            </form>
+            <div id="shortLinkResult" style="display:none">
+                <p style="font-size:.85rem;margin-bottom:10px">✅ لینک شما ساخته شد:</p>
+                <div style="display:flex;gap:6px;align-items:center;margin-bottom:12px">
+                    <input type="text" id="shortLinkUrlOutput" readonly style="flex:1;padding:8px 10px;background:var(--bg-darker,#0a0e1a);color:var(--text,#e2e8f0);border:1px solid var(--border,#334155);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:.78rem;direction:ltr;text-align:left">
+                    <button type="button" class="confirm" onclick="copyShortLinkUrl(this)" style="white-space:nowrap">📋 کپی</button>
+                </div>
+                <div class="modal-actions">
+                    <button type="button" class="cancel" onclick="closeShortLinkModal()">بستن</button>
+                    <a href="?action=my_shares" class="confirm" style="text-decoration:none;text-align:center">مدیریت اشتراک‌ها</a>
+                </div>
+            </div>
+        </div>
+    </div>
+    <script>
+    function openShortLinkModal(filename, owner){
+        document.getElementById('shortLinkFileInput').value = filename;
+        document.getElementById('shortLinkOwnerInput').value = owner;
+        document.getElementById('shortLinkFileName').textContent = 'فایل: ' + filename;
+        document.getElementById('shortLinkForm').style.display = '';
+        document.getElementById('shortLinkResult').style.display = 'none';
+        document.getElementById('shortLinkPasswordInput').value = '';
+        document.getElementById('shortLinkOneTimeInput').checked = false;
+        document.getElementById('shortLinkUrlOutput').value = '';
+        document.getElementById('shortLinkModal').classList.add('active');
+    }
+    function closeShortLinkModal(){ document.getElementById('shortLinkModal').classList.remove('active'); }
+    function copyShortLinkUrl(btn){
+        var inp = document.getElementById('shortLinkUrlOutput');
+        inp.select(); inp.setSelectionRange(0, 99999);
+        var done = function(){ var orig = btn.innerHTML; btn.innerHTML = '✓ کپی شد'; setTimeout(function(){ btn.innerHTML = orig; }, 1400); };
+        if(navigator.clipboard && navigator.clipboard.writeText){
+            navigator.clipboard.writeText(inp.value).then(done);
+        }else{
+            try{ document.execCommand('copy'); done(); }catch(e){}
+        }
+    }
+    document.addEventListener('DOMContentLoaded', function(){
+        var ov = document.getElementById('shortLinkModal');
+        if(ov){ ov.addEventListener('click', function(e){ if(e.target===this) closeShortLinkModal(); }); }
+        var f = document.getElementById('shortLinkForm');
+        if(f){
+            f.addEventListener('submit', async function(e){
+                e.preventDefault();
+                var fd = new FormData(this);
+                try {
+                    var res = await fetch('?action=share_create', { method: 'POST', body: fd, credentials: 'same-origin' });
+                    var data = await res.json();
+                    if(data.ok){
+                        document.getElementById('shortLinkUrlOutput').value = data.url;
+                        document.getElementById('shortLinkForm').style.display = 'none';
+                        document.getElementById('shortLinkResult').style.display = '';
+                    }else{
+                        var errMap = {
+                            'share_forbidden':'شما اجازه اشتراک‌گذاری این فایل را ندارید.',
+                            'share_pw_short':'رمز عبور باید حداقل ۴ کاراکتر باشد.',
+                            'not_found':'فایل یافت نشد.'
+                        };
+                        alert(errMap[data.error] || ('خطا: ' + (data.error || 'نامشخص')));
+                    }
+                } catch(err) {
+                    alert('خطا در ارتباط با سرور');
+                }
+            });
+        }
+    });
+    </script>
 
     <!-- Share Modal -->
     <div class="modal-overlay" id="shareModal">
@@ -5027,6 +5605,168 @@ elseif($action=='activity_log'){
         </div>
         <?php endif;?>
     </div></body></html><?php
+}
+elseif($action=='my_shares'){
+    if(!isset($_SESSION['user'])){header("Location: index.php");exit;}
+    cleanupExpiredOneTimeShares($pdo);
+
+    $userRow=$pdo->prepare("SELECT role, can_share FROM users WHERE username = ?");
+    $userRow->execute([$_SESSION['user']]);
+    $u=$userRow->fetch(PDO::FETCH_ASSOC);
+    $isAdmin=($u['role']??'')==='admin';
+    $filterOwner=trim($_GET['owner']??'');
+
+    if($isAdmin){
+        if($filterOwner!==''){
+            $stmt=$pdo->prepare("SELECT * FROM share_links WHERE owner = ? ORDER BY created_at DESC LIMIT 200");
+            $stmt->execute([$filterOwner]);
+        }else{
+            $stmt=$pdo->query("SELECT * FROM share_links ORDER BY created_at DESC LIMIT 200");
+        }
+    }else{
+        $stmt=$pdo->prepare("SELECT * FROM share_links WHERE owner = ? ORDER BY created_at DESC LIMIT 200");
+        $stmt->execute([$_SESSION['user']]);
+    }
+    $rows=$stmt->fetchAll(PDO::FETCH_ASSOC);
+    $csrf=generateCsrfToken();
+    $msg=$_GET['msg']??'';
+    $msgMap=[
+        'share_created'=>['✅','لینک اشتراک با موفقیت ساخته شد.'],
+        'share_revoked'=>['🚫','لینک اشتراک لغو شد.'],
+        'share_forbidden'=>['🔒','شما اجازه اشتراک‌گذاری این فایل را ندارید.'],
+        'share_pw_short'=>['⚠️','رمز عبور باید حداقل ۴ کاراکتر باشد.'],
+        'share_not_found'=>['❌','لینک اشتراک یافت نشد.'],
+    ];
+    ?><!DOCTYPE html><html lang="fa" dir="rtl"><head>
+    <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+    <title>XCloud — اشتراک‌های من</title>
+<?= renderHeadAssets() ?>
+    <style>
+    *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+    body{font-family:'Dana',-apple-system,system-ui,Tahoma,sans-serif;background:#0a0e1a;color:#e2e8f0;min-height:100vh;padding:18px;line-height:1.6}
+    .wrap{max-width:1080px;margin:0 auto}
+    h1{font-size:1.15rem;margin-bottom:14px;color:#f1f5f9;display:flex;align-items:center;gap:8px}
+    .back{display:inline-block;color:#3b82f6;text-decoration:none;font-size:.85rem;margin-bottom:14px}
+    .back:hover{color:#60a5fa}
+    .toolbar{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px}
+    .toolbar form{display:flex;gap:6px}
+    .toolbar input{padding:8px 10px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:8px;font-family:inherit;font-size:.85rem;min-width:200px}
+    .toolbar button,.toolbar a.clear-btn{padding:8px 14px;background:#1e293b;color:#cbd5e1;border:1px solid #334155;border-radius:8px;font-family:inherit;font-size:.85rem;cursor:pointer;text-decoration:none}
+    .toolbar button:hover,.toolbar a.clear-btn:hover{background:#334155}
+    .banner{padding:12px 16px;border-radius:10px;margin-bottom:14px;display:flex;align-items:center;gap:10px;font-size:.9rem;background:rgba(59,130,246,.08);color:#93c5fd;border:1px solid rgba(59,130,246,.2)}
+    .table-wrap{background:#111827;border:1px solid #1e293b;border-radius:14px;overflow:auto}
+    table{width:100%;border-collapse:collapse;font-size:.84rem;min-width:780px}
+    th,td{padding:10px 12px;text-align:right;border-bottom:1px solid #1e293b;vertical-align:middle}
+    th{background:#0f172a;color:#94a3b8;font-weight:600;font-size:.78rem;position:sticky;top:0}
+    tbody tr:hover{background:rgba(255,255,255,.02)}
+    td.actions{white-space:nowrap}
+    .badge{display:inline-block;padding:3px 10px;border-radius:999px;font-size:.72rem;font-weight:600;border:1px solid transparent}
+    .badge-green{background:rgba(34,197,94,.1);color:#86efac;border-color:rgba(34,197,94,.2)}
+    .badge-amber{background:rgba(245,158,11,.1);color:#fbbf24;border-color:rgba(245,158,11,.2)}
+    .badge-gray{background:rgba(148,163,184,.1);color:#94a3b8;border-color:rgba(148,163,184,.2)}
+    .badge-red{background:rgba(239,68,68,.1);color:#fca5a5;border-color:rgba(239,68,68,.2)}
+    .btn{padding:6px 10px;border-radius:6px;font-size:.74rem;text-decoration:none;border:1px solid transparent;cursor:pointer;font-family:inherit;display:inline-block;margin:0 1px}
+    .btn-copy{background:#1e293b;color:#cbd5e1;border-color:#334155}
+    .btn-copy:hover{background:#334155}
+    .btn-open{background:#3b82f6;color:#fff}
+    .btn-open:hover{background:#2563eb}
+    .btn-revoke{background:rgba(239,68,68,.1);color:#fca5a5;border-color:rgba(239,68,68,.25)}
+    .btn-revoke:hover{background:rgba(239,68,68,.2)}
+    .empty{padding:48px 20px;text-align:center;color:#64748b}
+    .file-cell{display:flex;align-items:center;gap:8px}
+    .file-cell .ic{font-size:1.2rem}
+    .file-cell .nm{word-break:break-all}
+    .lock-y{color:#fbbf24}.lock-n{color:#475569}
+    @media (max-width:640px){.toolbar input{min-width:140px}}
+    </style>
+    </head><body>
+    <div class="wrap">
+        <a href="?action=dashboard" class="back">← بازگشت به داشبورد</a>
+        <h1>🔗 اشتراک‌های من</h1>
+        <?php if($msg && isset($msgMap[$msg])): ?>
+            <div class="banner"><span><?php echo $msgMap[$msg][0]; ?></span><span><?php echo h($msgMap[$msg][1]); ?></span></div>
+        <?php endif; ?>
+        <?php if($isAdmin): ?>
+        <div class="toolbar">
+            <form method="GET">
+                <input type="hidden" name="action" value="my_shares">
+                <input type="text" name="owner" placeholder="فیلتر بر اساس نام کاربر" value="<?php echo h($filterOwner); ?>">
+                <button type="submit">فیلتر</button>
+                <?php if($filterOwner!==''): ?><a class="clear-btn" href="?action=my_shares">پاک</a><?php endif; ?>
+            </form>
+        </div>
+        <?php endif; ?>
+
+        <div class="table-wrap">
+        <table>
+            <thead>
+                <tr>
+                    <?php if($isAdmin): ?><th>صاحب</th><?php endif; ?>
+                    <th>فایل</th>
+                    <th>وضعیت</th>
+                    <th>رمز</th>
+                    <th>بازدید</th>
+                    <th>ساخته شده</th>
+                    <th>عملیات</th>
+                </tr>
+            </thead>
+            <tbody>
+            <?php if(empty($rows)): ?>
+                <tr><td class="empty" colspan="<?php echo $isAdmin?7:6; ?>">هنوز هیچ لینک اشتراکی ساخته نشده است.</td></tr>
+            <?php else: foreach($rows as $r):
+                $url=buildShareUrl($r['token']);
+                if($r['revoked_at']){
+                    $stClass='badge-red'; $stLabel='لغو شده';
+                }elseif($r['is_one_time'] && $r['consumed_at']){
+                    $stClass='badge-gray'; $stLabel='مشاهده شده — منقضی';
+                }elseif($r['is_one_time']){
+                    $stClass='badge-amber'; $stLabel='فعال — یک‌بار مصرف';
+                }else{
+                    $stClass='badge-green'; $stLabel='فعال — نامحدود';
+                }
+                $canRevoke=!$r['revoked_at'];
+            ?>
+                <tr>
+                    <?php if($isAdmin): ?><td><?php echo h($r['owner']); ?></td><?php endif; ?>
+                    <td>
+                        <div class="file-cell">
+                            <span class="ic"><?php echo getFileIcon($r['file_name']); ?></span>
+                            <span class="nm" title="<?php echo h($r['file_name']); ?>"><?php echo h($r['file_name']); ?></span>
+                        </div>
+                    </td>
+                    <td><span class="badge <?php echo $stClass; ?>"><?php echo $stLabel; ?></span></td>
+                    <td><?php echo $r['password_hash']?'<span class="lock-y" title="محافظت شده با رمز">🔒</span>':'<span class="lock-n">—</span>'; ?></td>
+                    <td><?php echo (int)$r['view_count']; ?></td>
+                    <td><?php echo h(to_jalali($r['created_at'])); ?></td>
+                    <td class="actions">
+                        <button class="btn btn-copy" type="button" onclick="copyShareUrl(this,'<?php echo h(addslashes($url)); ?>')">📋 کپی</button>
+                        <a class="btn btn-open" href="<?php echo h($url); ?>" target="_blank" rel="noopener">باز کردن</a>
+                        <?php if($canRevoke): ?>
+                            <a class="btn btn-revoke" href="?action=share_revoke&t=<?php echo urlencode($r['token']); ?>&csrf_token=<?php echo h($csrf); ?>" onclick="return confirm('این لینک را لغو می‌کنید؟');">لغو</a>
+                        <?php endif; ?>
+                    </td>
+                </tr>
+            <?php endforeach; endif; ?>
+            </tbody>
+        </table>
+        </div>
+    </div>
+    <script>
+    function copyShareUrl(btn, url){
+        if(navigator.clipboard && navigator.clipboard.writeText){
+            navigator.clipboard.writeText(url).then(function(){ flashCopied(btn); });
+        }else{
+            var ta=document.createElement('textarea'); ta.value=url; document.body.appendChild(ta);
+            ta.select(); try{ document.execCommand('copy'); flashCopied(btn);}catch(e){}
+            document.body.removeChild(ta);
+        }
+    }
+    function flashCopied(btn){
+        var orig=btn.innerHTML; btn.innerHTML='✓ کپی شد';
+        setTimeout(function(){ btn.innerHTML=orig; }, 1400);
+    }
+    </script>
+    </body></html><?php
 }
 else{header("Location: index.php");exit;}
 ?>

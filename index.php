@@ -520,9 +520,11 @@ $pdo->exec("CREATE TABLE IF NOT EXISTS public_files (
     filename VARCHAR(500) NOT NULL,
     uploaded_by VARCHAR(50) NOT NULL,
     file_size BIGINT DEFAULT 0,
+    caption TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     INDEX idx_uploaded_by (uploaded_by)
 )");
+try{$pdo->exec("ALTER TABLE public_files ADD COLUMN caption TEXT");}catch(Exception $e){}
 $pdo->exec("CREATE TABLE IF NOT EXISTS public_file_access (
     id INT AUTO_INCREMENT PRIMARY KEY,
     file_id INT NOT NULL,
@@ -2099,6 +2101,42 @@ if($action=='delete_public_file'){
     header("Location: ?action=dashboard&tab=public&msg=deleted");exit;
 }
 
+// ── Rename public file (admin only) ──
+if($action=='rename_public_file'){
+    if(!isset($_SESSION['user'])||$_SESSION['role']!=='admin')die("دسترسی غیرمجاز!");verifyCsrf();
+    global $public_base;
+    $fid=(int)($_POST['file_id']??0);
+    $nn=basename(trim($_POST['new_name']??''));
+    if($fid<=0||$nn===''){header("Location: ?action=dashboard&tab=public&msg=rename_error");exit;}
+    $st=$pdo->prepare("SELECT * FROM public_files WHERE id=?");$st->execute([$fid]);$pf=$st->fetch();
+    if(!$pf){header("Location: ?action=dashboard&tab=public&msg=not_found");exit;}
+    $op=$public_base.$pf['filename'];$np=$public_base.$nn;
+    if(!file_exists($op)){header("Location: ?action=dashboard&tab=public&msg=not_found");exit;}
+    if($pf['filename']===$nn){header("Location: ?action=dashboard&tab=public&msg=renamed");exit;}
+    if(file_exists($np)){header("Location: ?action=dashboard&tab=public&msg=rename_error");exit;}
+    if(rename($op,$np)){
+        $pdo->prepare("UPDATE public_files SET filename=? WHERE id=?")->execute([$nn,$fid]);
+        logActivity($pdo,$_SESSION['user'],'rename_public',$pf['filename']." → ".$nn);
+        header("Location: ?action=dashboard&tab=public&msg=renamed");exit;
+    }
+    header("Location: ?action=dashboard&tab=public&msg=rename_error");exit;
+}
+
+// ── Set caption on public file (admin only) ──
+if($action=='set_public_caption'){
+    if(!isset($_SESSION['user'])||$_SESSION['role']!=='admin')die("دسترسی غیرمجاز!");verifyCsrf();
+    $fid=(int)($_POST['file_id']??0);
+    $caption=trim((string)($_POST['caption']??''));
+    if($fid<=0){header("Location: ?action=dashboard&tab=public&msg=not_found");exit;}
+    $st=$pdo->prepare("SELECT filename FROM public_files WHERE id=?");$st->execute([$fid]);$pf=$st->fetch();
+    if(!$pf){header("Location: ?action=dashboard&tab=public&msg=not_found");exit;}
+    if(!isCaptionable($pf['filename'])){header("Location: ?action=dashboard&tab=public&msg=caption_unsupported");exit;}
+    if(mb_strlen($caption)>1000)$caption=mb_substr($caption,0,1000);
+    $pdo->prepare("UPDATE public_files SET caption=? WHERE id=?")->execute([$caption===''?null:$caption,$fid]);
+    logActivity($pdo,$_SESSION['user'],'caption_public',$pf['filename'],"len=".mb_strlen($caption));
+    header("Location: ?action=dashboard&tab=public&msg=caption_saved");exit;
+}
+
 // ── Short-link sharing: PUBLIC (no auth) page view ──
 if($action==='share_view'){
     cleanupExpiredOneTimeShares($pdo);
@@ -2306,12 +2344,10 @@ if($action==='share_revoke'){
     header('Location: ?action=my_shares&msg=share_revoked'); exit;
 }
 
-// ── Share file (admin or user with can_share) ──
+// ── Share file with other users (admin only — users must not see other users) ──
 if($action=='share_file'){
     if(!isset($_SESSION['user']))die("خطای امنیتی!");verifyCsrf();
-    $ps=$pdo->prepare("SELECT role,can_share FROM users WHERE username=?");$ps->execute([$_SESSION['user']]);$pr=$ps->fetch();
-    $isAdmin=$pr&&$pr['role']==='admin';$canShare=$isAdmin||($pr&&$pr['can_share']);
-    if(!$canShare){header("Location: ?action=dashboard&msg=no_permission");exit;}
+    if(($_SESSION['role']??'')!=='admin'){header("Location: ?action=dashboard&msg=no_permission");exit;}
     $fn=basename($_POST['filename']??'');$owner=$_POST['owner']??'';$targets=$_POST['share_with']??[];
     if(!empty($fn)&&!empty($owner)&&is_array($targets)){
         $fp=getUserUploadPath($owner).$fn;
@@ -2352,10 +2388,10 @@ if($action=='remove_public_access'){
     header("Location: ?action=dashboard&tab=public&msg=removed");exit;
 }
 
-// ── Get shares for a file (AJAX) ──
+// ── Get shares for a file (AJAX, admin only) ──
 if($action=='get_shares'){
     header('Content-Type: application/json');
-    if(!isset($_SESSION['user'])){echo json_encode(['shares'=>[]]);exit;}
+    if(!isset($_SESSION['user'])||($_SESSION['role']??'')!=='admin'){echo json_encode(['shares'=>[]]);exit;}
     $fn=basename($_GET['filename']??'');$owner=$_GET['owner']??'';
     $st=$pdo->prepare("SELECT id,shared_with,shared_by,created_at FROM file_shares WHERE original_owner=? AND filename=?");
     $st->execute([$owner,$fn]);
@@ -4655,8 +4691,13 @@ elseif($action=='dashboard'){
                             <input type="file" name="fileToUpload[]" id="fileInput" multiple required>
                         </div>
                         <div style="margin-top:12px">
-                            <div class="section-title" style="font-size:.74rem">انتخاب کاربران مجاز:</div>
-                            <div class="share-user-list">
+                            <div class="section-title" style="font-size:.74rem;display:flex;justify-content:space-between;align-items:center">
+                                <span>انتخاب کاربران مجاز:</span>
+                                <label style="font-size:.7rem;cursor:pointer;display:flex;align-items:center;gap:4px">
+                                    <input type="checkbox" id="publicUploadSelectAll" onchange="toggleAllCheckboxes('publicUploadUserList', this.checked)"> انتخاب همه
+                                </label>
+                            </div>
+                            <div class="share-user-list" id="publicUploadUserList">
                                 <?php foreach($allUsernamesAll as $un):?>
                                 <div class="share-user-item">
                                     <input type="checkbox" name="access_users[]" value="<?php echo h($un);?>" id="pub_user_<?php echo h($un);?>">
@@ -4714,8 +4755,10 @@ elseif($action=='dashboard'){
                             <?php if($showDotMenu):?>
                             <button class="three-dot-btn" onclick="toggleDotMenu(this)" title="بیشتر">&#8942;</button>
                             <div class="dot-menu">
-                                <?php if($canShare||$role==='admin'):?>
+                                <?php if($role==='admin'):?>
                                 <button class="dot-menu-item" onclick="openShareModal('<?php echo h(addslashes($file));?>','<?php echo h(addslashes($viewUser));?>')">📤 اشتراک‌گذاری</button>
+                                <?php endif;?>
+                                <?php if($canShare||$role==='admin'):?>
                                 <button class="dot-menu-item" onclick="openShortLinkModal('<?php echo h(addslashes($file));?>','<?php echo h(addslashes($viewUser));?>')">🔗 لینک عمومی</button>
                                 <?php endif;?>
                                 <?php if(isCaptionable($file)):?>
@@ -4837,13 +4880,23 @@ elseif($action=='dashboard'){
                             <button class="three-dot-btn" onclick="toggleDotMenu(this)" title="بیشتر">&#8942;</button>
                             <div class="dot-menu">
                                 <button class="dot-menu-item" onclick="openPublicAccessModal(<?php echo $pf['id'];?>,'<?php echo h(addslashes($pf['filename']));?>')">👥 مدیریت دسترسی</button>
+                                <button class="dot-menu-item" onclick="openPublicRenameModal(<?php echo $pf['id'];?>,<?php echo h(json_encode($pf['filename'],JSON_UNESCAPED_UNICODE|JSON_HEX_TAG|JSON_HEX_QUOT|JSON_HEX_APOS|JSON_HEX_AMP));?>)">✏️ تغییر نام</button>
+                                <?php if(isCaptionable($pf['filename'])):?>
+                                <button class="dot-menu-item" onclick="openPublicCaptionModal(<?php echo $pf['id'];?>,<?php echo h(json_encode($pf['filename'],JSON_UNESCAPED_UNICODE|JSON_HEX_TAG|JSON_HEX_QUOT|JSON_HEX_APOS|JSON_HEX_AMP));?>,<?php echo h(json_encode((string)($pf['caption']??''),JSON_UNESCAPED_UNICODE|JSON_HEX_TAG|JSON_HEX_QUOT|JSON_HEX_APOS|JSON_HEX_AMP));?>)">📝 کپشن</button>
+                                <?php endif;?>
                                 <a class="dot-menu-item danger" href="?action=delete_public_file&file_id=<?php echo $pf['id'];?>" onclick="return confirm('حذف فایل عمومی «<?php echo h($pf['filename']);?>»؟')">🗑 حذف</a>
                             </div>
                             <?php endif;?>
                         </div>
 
-                        <?php if($pfExists&&isImage($pf['filename'])):?>
+                        <?php if($pfExists&&isGif($pf['filename'])):?>
+                        <div class="file-preview-wrap"><div class="file-preview-gif"><img src="<?php echo h($pfPath);?>?_t=<?php echo @filemtime($pfPath);?>" alt="<?php echo h($pf['filename']);?>"></div><span class="gif-badge">GIF</span></div>
+                        <?php elseif($pfExists&&isImage($pf['filename'])):?>
                         <div class="file-preview"><img src="<?php echo h($pfPath);?>" alt="<?php echo h($pf['filename']);?>" loading="lazy"></div>
+                        <?php endif;?>
+
+                        <?php if(isCaptionable($pf['filename']) && !empty($pf['caption'])): ?>
+                        <div class="file-caption"><?php echo nl2br(h($pf['caption']));?></div>
                         <?php endif;?>
 
                         <div class="file-actions">
@@ -5049,7 +5102,8 @@ elseif($action=='dashboard'){
     });
     </script>
 
-    <!-- Share Modal -->
+    <!-- Share Modal (admin-only: lists usernames, so guarded server-side) -->
+    <?php if($role==='admin'):?>
     <div class="modal-overlay" id="shareModal">
         <div class="modal-box" style="max-width:400px">
             <h3>📤 اشتراک‌گذاری فایل</h3>
@@ -5058,7 +5112,12 @@ elseif($action=='dashboard'){
                 <input type="hidden" name="csrf_token" value="<?php echo $csrf;?>">
                 <input type="hidden" name="filename" id="shareFileInput">
                 <input type="hidden" name="owner" id="shareOwnerInput">
-                <div class="section-title" style="font-size:.74rem">انتخاب کاربران:</div>
+                <div class="section-title" style="font-size:.74rem;display:flex;justify-content:space-between;align-items:center">
+                    <span>انتخاب کاربران:</span>
+                    <label style="font-size:.7rem;cursor:pointer;display:flex;align-items:center;gap:4px">
+                        <input type="checkbox" id="shareSelectAll" onchange="toggleAllCheckboxes('shareUserList', this.checked)"> انتخاب همه
+                    </label>
+                </div>
                 <div class="share-user-list" id="shareUserList">
                     <?php foreach($allUsernamesAll as $un):?>
                     <div class="share-user-item">
@@ -5075,8 +5134,10 @@ elseif($action=='dashboard'){
             </form>
         </div>
     </div>
+    <?php endif;?>
 
-    <!-- Public Access Modal -->
+    <!-- Public Access Modal (admin-only) -->
+    <?php if($role==='admin'):?>
     <div class="modal-overlay" id="publicAccessModal">
         <div class="modal-box" style="max-width:400px">
             <h3>👥 مدیریت دسترسی فایل عمومی</h3>
@@ -5084,7 +5145,12 @@ elseif($action=='dashboard'){
             <form action="?action=update_public_access" method="POST" id="publicAccessForm">
                 <input type="hidden" name="csrf_token" value="<?php echo $csrf;?>">
                 <input type="hidden" name="file_id" id="publicFileIdInput">
-                <div class="section-title" style="font-size:.74rem">کاربران مجاز:</div>
+                <div class="section-title" style="font-size:.74rem;display:flex;justify-content:space-between;align-items:center">
+                    <span>کاربران مجاز:</span>
+                    <label style="font-size:.7rem;cursor:pointer;display:flex;align-items:center;gap:4px">
+                        <input type="checkbox" id="publicAccessSelectAll" onchange="toggleAllCheckboxes('publicUserList', this.checked)"> انتخاب همه
+                    </label>
+                </div>
                 <div class="share-user-list" id="publicUserList">
                     <?php foreach($allUsernamesAll as $un):?>
                     <div class="share-user-item">
@@ -5100,6 +5166,40 @@ elseif($action=='dashboard'){
             </form>
         </div>
     </div>
+
+    <!-- Public File Rename Modal (admin-only) -->
+    <div class="modal-overlay" id="publicRenameModal">
+        <div class="modal-box">
+            <h3>✏️ تغییر نام فایل عمومی</h3>
+            <form action="?action=rename_public_file" method="POST">
+                <input type="hidden" name="csrf_token" value="<?php echo $csrf;?>">
+                <input type="hidden" name="file_id" id="publicRenameIdInput">
+                <input type="text" name="new_name" id="publicRenameNameInput" required maxlength="255">
+                <div class="modal-actions">
+                    <button type="button" class="cancel" onclick="closePublicRenameModal()">انصراف</button>
+                    <button type="submit" class="confirm">ذخیره</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- Public File Caption Modal (admin-only) -->
+    <div class="modal-overlay" id="publicCaptionModal">
+        <div class="modal-box">
+            <h3>📝 کپشن فایل عمومی</h3>
+            <p id="publicCaptionFileName" style="font-size:.76rem;color:var(--text-dim);margin-bottom:10px"></p>
+            <form action="?action=set_public_caption" method="POST">
+                <input type="hidden" name="csrf_token" value="<?php echo $csrf;?>">
+                <input type="hidden" name="file_id" id="publicCaptionIdInput">
+                <textarea name="caption" id="publicCaptionTextInput" class="text-input" placeholder="کپشن را وارد کنید (حداکثر ۱۰۰۰ کاراکتر) — برای حذف کپشن، خالی بگذارید" maxlength="1000" style="min-height:110px"></textarea>
+                <div class="modal-actions" style="margin-top:10px">
+                    <button type="button" class="cancel" onclick="closePublicCaptionModal()">انصراف</button>
+                    <button type="submit" class="confirm">ذخیره</button>
+                </div>
+            </form>
+        </div>
+    </div>
+    <?php endif;?>
 
     <!-- New Folder Modal -->
     <div class="modal-overlay" id="newFolderModal">
@@ -5234,14 +5334,21 @@ elseif($action=='dashboard'){
         }
     });
 
+    // Helper: toggle all checkboxes inside a list container
+    function toggleAllCheckboxes(listId,checked){
+        document.querySelectorAll('#'+listId+' input[type="checkbox"]').forEach(cb=>{cb.checked=!!checked;});
+    }
+
     // Share Modal
     function openShareModal(filename,owner){
-        document.querySelectorAll('.dot-menu.show').forEach(m=>m.classList.remove('show'));
+        const m=document.getElementById('shareModal');if(!m)return;
+        document.querySelectorAll('.dot-menu.show').forEach(x=>x.classList.remove('show'));
         document.getElementById('shareFileInput').value=filename;
         document.getElementById('shareOwnerInput').value=owner;
         document.getElementById('shareFileName').textContent='فایل: '+filename+' (صاحب: '+owner+')';
         // Uncheck all
         document.querySelectorAll('#shareUserList input[type="checkbox"]').forEach(cb=>{cb.checked=false;});
+        const sa=document.getElementById('shareSelectAll');if(sa)sa.checked=false;
         // Load existing shares
         fetch('?action=get_shares&filename='+encodeURIComponent(filename)+'&owner='+encodeURIComponent(owner))
             .then(r=>r.json()).then(data=>{
@@ -5256,18 +5363,20 @@ elseif($action=='dashboard'){
                     });
                 }else{div.innerHTML='';}
             }).catch(()=>{});
-        document.getElementById('shareModal').classList.add('active');
+        m.classList.add('active');
     }
-    function closeShareModal(){document.getElementById('shareModal').classList.remove('active');}
-    document.getElementById('shareModal').addEventListener('click',function(e){if(e.target===this)closeShareModal();});
+    function closeShareModal(){const m=document.getElementById('shareModal');if(m)m.classList.remove('active');}
+    (function(){const m=document.getElementById('shareModal');if(m)m.addEventListener('click',function(e){if(e.target===this)closeShareModal();});})();
 
     // Public Access Modal
     function openPublicAccessModal(fileId,filename){
-        document.querySelectorAll('.dot-menu.show').forEach(m=>m.classList.remove('show'));
+        const m=document.getElementById('publicAccessModal');if(!m)return;
+        document.querySelectorAll('.dot-menu.show').forEach(x=>x.classList.remove('show'));
         document.getElementById('publicFileIdInput').value=fileId;
         document.getElementById('publicFileName').textContent='فایل: '+filename;
         // Uncheck all
         document.querySelectorAll('#publicUserList input[type="checkbox"]').forEach(cb=>{cb.checked=false;});
+        const sa=document.getElementById('publicAccessSelectAll');if(sa)sa.checked=false;
         // Load existing access
         fetch('?action=get_public_access&file_id='+fileId)
             .then(r=>r.json()).then(data=>{
@@ -5278,10 +5387,35 @@ elseif($action=='dashboard'){
                     });
                 }
             }).catch(()=>{});
-        document.getElementById('publicAccessModal').classList.add('active');
+        m.classList.add('active');
     }
-    function closePublicAccessModal(){document.getElementById('publicAccessModal').classList.remove('active');}
-    document.getElementById('publicAccessModal').addEventListener('click',function(e){if(e.target===this)closePublicAccessModal();});
+    function closePublicAccessModal(){const m=document.getElementById('publicAccessModal');if(m)m.classList.remove('active');}
+    (function(){const m=document.getElementById('publicAccessModal');if(m)m.addEventListener('click',function(e){if(e.target===this)closePublicAccessModal();});})();
+
+    // Public Rename Modal
+    function openPublicRenameModal(fileId,filename){
+        const m=document.getElementById('publicRenameModal');if(!m)return;
+        document.querySelectorAll('.dot-menu.show').forEach(x=>x.classList.remove('show'));
+        document.getElementById('publicRenameIdInput').value=fileId;
+        document.getElementById('publicRenameNameInput').value=filename;
+        m.classList.add('active');
+        setTimeout(()=>document.getElementById('publicRenameNameInput').focus(),100);
+    }
+    function closePublicRenameModal(){const m=document.getElementById('publicRenameModal');if(m)m.classList.remove('active');}
+    (function(){const m=document.getElementById('publicRenameModal');if(m)m.addEventListener('click',function(e){if(e.target===this)closePublicRenameModal();});})();
+
+    // Public Caption Modal
+    function openPublicCaptionModal(fileId,filename,caption){
+        const m=document.getElementById('publicCaptionModal');if(!m)return;
+        document.querySelectorAll('.dot-menu.show').forEach(x=>x.classList.remove('show'));
+        document.getElementById('publicCaptionIdInput').value=fileId;
+        document.getElementById('publicCaptionFileName').textContent='فایل: '+filename;
+        document.getElementById('publicCaptionTextInput').value=caption||'';
+        m.classList.add('active');
+        setTimeout(()=>document.getElementById('publicCaptionTextInput').focus(),100);
+    }
+    function closePublicCaptionModal(){const m=document.getElementById('publicCaptionModal');if(m)m.classList.remove('active');}
+    (function(){const m=document.getElementById('publicCaptionModal');if(m)m.addEventListener('click',function(e){if(e.target===this)closePublicCaptionModal();});})();
 
     // Folder modals
     function openNewFolder(){

@@ -4569,7 +4569,7 @@ elseif($action=='dashboard'){
                     📁 <?php echo h($uf['name']);?> <span class="folder-count"><?php echo $cnt;?></span>
                 </a>
                 <?php if($canManageFolders&&$isActive):?>
-                <button type="button" class="folder-tab-mini" onclick="openRenameFolder(<?php echo $fid;?>,<?php echo json_encode($uf['name'],JSON_UNESCAPED_UNICODE|JSON_HEX_TAG|JSON_HEX_QUOT);?>)" title="تغییر نام">✏️</button>
+                <button type="button" class="folder-tab-mini" onclick="openRenameFolder(<?php echo $fid;?>,<?php echo h(json_encode($uf['name'],JSON_UNESCAPED_UNICODE|JSON_HEX_TAG|JSON_HEX_QUOT|JSON_HEX_APOS|JSON_HEX_AMP));?>)" title="تغییر نام">✏️</button>
                 <a class="folder-tab-mini danger" href="?action=delete_folder&folder_id=<?php echo $fid;?><?php echo $viewUserQS;?>" onclick="return confirm('حذف پوشه «<?php echo h($uf['name']);?>»؟ فایل‌ها حذف نمی‌شوند و به تب همه می‌روند.')" title="حذف پوشه">🗑</a>
                 <?php endif;?>
             </span>
@@ -4719,7 +4719,7 @@ elseif($action=='dashboard'){
                                 <button class="dot-menu-item" onclick="openShortLinkModal('<?php echo h(addslashes($file));?>','<?php echo h(addslashes($viewUser));?>')">🔗 لینک عمومی</button>
                                 <?php endif;?>
                                 <?php if(isCaptionable($file)):?>
-                                <button class="dot-menu-item" onclick="openCaptionModal(<?php echo json_encode($file,JSON_UNESCAPED_UNICODE|JSON_HEX_TAG|JSON_HEX_QUOT);?>,<?php echo json_encode($viewUser,JSON_UNESCAPED_UNICODE|JSON_HEX_TAG|JSON_HEX_QUOT);?>,<?php echo json_encode($fileCaptionsMap[$file]??'',JSON_UNESCAPED_UNICODE|JSON_HEX_TAG|JSON_HEX_QUOT);?>)">📝 کپشن</button>
+                                <button class="dot-menu-item" onclick="openCaptionModal(<?php echo h(json_encode($file,JSON_UNESCAPED_UNICODE|JSON_HEX_TAG|JSON_HEX_QUOT|JSON_HEX_APOS|JSON_HEX_AMP));?>,<?php echo h(json_encode($viewUser,JSON_UNESCAPED_UNICODE|JSON_HEX_TAG|JSON_HEX_QUOT|JSON_HEX_APOS|JSON_HEX_AMP));?>,<?php echo h(json_encode($fileCaptionsMap[$file]??'',JSON_UNESCAPED_UNICODE|JSON_HEX_TAG|JSON_HEX_QUOT|JSON_HEX_APOS|JSON_HEX_AMP));?>)">📝 کپشن</button>
                                 <?php endif;?>
                                 <?php if($canMoveThis):?>
                                 <div class="move-submenu">

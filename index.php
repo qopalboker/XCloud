@@ -127,11 +127,21 @@ function inbound_imap_connect($pdo) {
         return ['mode' => 'native', 'conn' => $conn, 'cfg' => $cfg];
     }
 
-    // Socket fallback
+    // Socket fallback. Mirror the native /novalidate-cert behaviour so cPanel
+    // hosts with hostname-mismatched IMAP certs connect consistently in both
+    // modes.
+    $contextOpts = [
+        'ssl' => [
+            'verify_peer'       => false,
+            'verify_peer_name'  => false,
+            'allow_self_signed' => true,
+        ],
+    ];
+    $ctx    = stream_context_create($contextOpts);
     $scheme = $cfg['encryption'] === 'tls' ? 'tcp' : 'ssl';
     $remote = $scheme . '://' . $cfg['host'] . ':' . $cfg['port'];
-    $errno = 0; $errstr = '';
-    $sock = @stream_socket_client($remote, $errno, $errstr, 15);
+    $errno  = 0; $errstr = '';
+    $sock   = @stream_socket_client($remote, $errno, $errstr, 15, STREAM_CLIENT_CONNECT, $ctx);
     if (!$sock) {
         return ['error' => "socket connect failed: $errstr ($errno)"];
     }
@@ -151,7 +161,12 @@ function inbound_imap_connect($pdo) {
             fclose($sock);
             return ['error' => 'STARTTLS rejected: ' . trim((string)$resp)];
         }
-        if (!@stream_socket_enable_crypto($sock, true, STREAM_CRYPTO_METHOD_TLS_CLIENT)) {
+        // Cert validation already disabled via the context opts above
+        $crypto = STREAM_CRYPTO_METHOD_TLS_CLIENT;
+        if (defined('STREAM_CRYPTO_METHOD_TLSv1_2_CLIENT')) {
+            $crypto |= STREAM_CRYPTO_METHOD_TLSv1_2_CLIENT;
+        }
+        if (!@stream_socket_enable_crypto($sock, true, $crypto)) {
             fclose($sock);
             return ['error' => 'TLS handshake failed'];
         }
@@ -429,7 +444,10 @@ function inbound_close(&$state) {
 }
 
 function inbound_acquire_lock() {
-    $path = sys_get_temp_dir() . '/xcloud_inbound.lock';
+    // Namespace by install dir so multiple XCloud instances on a shared host
+    // don't contend on the same lock file.
+    $ns   = substr(hash('sha1', __DIR__), 0, 12);
+    $path = sys_get_temp_dir() . '/xcloud_inbound_' . $ns . '.lock';
     $fp = @fopen($path, 'c');
     if (!$fp) return null;
     if (!@flock($fp, LOCK_EX | LOCK_NB)) {
@@ -522,10 +540,19 @@ function inbound_run($pdo, $maxOverride = null) {
         'started_at' => date('Y-m-d H:i:s'), 'finished_at' => null,
         'error' => null,
     ];
+    $persist = function() use (&$stats, $pdo) {
+        $stats['finished_at'] = date('Y-m-d H:i:s');
+        // Don't overwrite last_cron_run_at on 'busy' — keep prior real run visible
+        if ($stats['error'] !== 'busy') {
+            setSetting($pdo, 'inbound_last_cron_run_at', $stats['finished_at']);
+        }
+        setSetting($pdo, 'inbound_last_cron_result', json_encode($stats, JSON_UNESCAPED_UNICODE));
+    };
 
     $lock = inbound_acquire_lock();
     if (!$lock) {
         $stats['error'] = 'busy';
+        $persist();
         return $stats;
     }
 
@@ -649,11 +676,9 @@ function inbound_run($pdo, $maxOverride = null) {
         $stats['error'] = mb_substr($e->getMessage(), 0, 300);
     } finally {
         inbound_release_lock($lock);
+        $persist();
     }
 
-    $stats['finished_at'] = date('Y-m-d H:i:s');
-    setSetting($pdo, 'inbound_last_cron_run_at', $stats['finished_at']);
-    setSetting($pdo, 'inbound_last_cron_result', json_encode($stats, JSON_UNESCAPED_UNICODE));
     return $stats;
 }
 
@@ -3538,7 +3563,10 @@ if ($action == 'register_step1_process') {
             'fake'          => true,
             'expires_at'    => date('Y-m-d H:i:s', time() + 1800),
         ];
-        unset($_SESSION['pending_register_otp_id']);
+        // Sentinel -1 keeps the JS poller seeing {pending} → indistinguishable
+        // from a real attempt until the fake expiry passes.
+        $_SESSION['pending_register_otp_id'] = -1;
+        $_SESSION['pending_fake_expires_at'] = time() + 1800;
         usleep(random_int(200000, 500000));
         header("Location: ?action=register_step2"); exit;
     }
@@ -3566,6 +3594,7 @@ if ($action == 'register_step1_process') {
         'expires_at'    => $result['expires_at'],
     ];
     $_SESSION['pending_register_otp_id'] = (int)$result['otp_id'];
+    unset($_SESSION['pending_fake_expires_at']);
     logActivity($pdo, $username, 'register_otp_requested', $email);
     header("Location: ?action=register_step2"); exit;
 }
@@ -3590,7 +3619,12 @@ if ($action == 'register_step2') {
 
     $msgText = '';
     if ($msg === 'resent')  $msgText = '✅ توکن جدید صادر شد.';
-    if ($msg === 'checked') $msgText = '🔄 بررسی انجام شد. در حال انتظار برای پیام شما...';
+    if ($msg === 'checked') {
+        $busy = (($_GET['busy'] ?? '0') === '1');
+        $msgText = $busy
+            ? '⏳ یک بررسی دیگر هم‌اکنون در حال اجرا است — تا چند ثانیه دیگر نتیجه‌اش می‌رسد.'
+            : '🔄 بررسی انجام شد. در حال انتظار برای پیام شما...';
+    }
 
     $expiresAtTs = strtotime($pending['expires_at']);
     $toAddr = getSetting($pdo, 'inbound_to_address', 'xcloud@retrivo.ir');
@@ -3742,6 +3776,7 @@ h1{font-size:1.35rem;margin:0 0 8px;color:#f1f5f9;text-align:center}
         return;
       }
       if (j.status === 'expired') { stopped = true; setState('fail', '⏰ توکن منقضی شده است.'); return; }
+      if (j.status === 'race_error') { stopped = true; setState('fail', j.message || 'خطا در ساخت حساب — لطفاً دوباره تلاش کن.'); return; }
       if (j.status === 'no_session') { stopped = true; setState('fail', 'نشست منقضی شد.'); return; }
       pollTimer = setTimeout(poll, 5000);
     } catch (e) {
@@ -3776,6 +3811,8 @@ if ($action == 'register_resend_otp') {
         // Anti-enumeration: pretend success, rotate the displayed fake token
         $_SESSION['pending_registration']['token']      = generate_otp_code(8);
         $_SESSION['pending_registration']['expires_at'] = date('Y-m-d H:i:s', time() + 1800);
+        $_SESSION['pending_register_otp_id']            = -1;
+        $_SESSION['pending_fake_expires_at']            = time() + 1800;
         $_SESSION['register_resend_count'] = $count + 1;
         header("Location: ?action=register_step2&msg=resent"); exit;
     }
@@ -3796,6 +3833,7 @@ if ($action == 'register_resend_otp') {
         $_SESSION['pending_registration']['otp_id']     = $result['otp_id'];
         $_SESSION['pending_registration']['expires_at'] = $result['expires_at'];
         $_SESSION['pending_register_otp_id'] = (int)$result['otp_id'];
+        unset($_SESSION['pending_fake_expires_at']);
         $_SESSION['register_resend_count'] = $count + 1;
         header("Location: ?action=register_step2&msg=resent"); exit;
     }
@@ -3814,6 +3852,12 @@ if ($action == 'forgot_password_step1') {
     $errMsg = [
         'invalid_email'  => '⚠️ فرمت ایمیل نامعتبر است.',
         'captcha_wrong'  => '⚠️ پاسخ کپچا اشتباه است.',
+        'send_failed'    => '⚠️ صدور توکن جدید با مشکل مواجه شد. لطفاً چند دقیقه صبر کن.',
+        'rate_limited'   => '⏳ تعداد درخواست‌ها از حد مجاز عبور کرد. لطفاً بعداً تلاش کن.',
+        'cooldown'       => '⏳ لطفاً قبل از درخواست مجدد چند ثانیه صبر کن.',
+        'email_quota'    => '⛔ تعداد درخواست‌ها برای این ایمیل امروز پر شده است.',
+        'ip_quota'       => '⛔ تعداد درخواست‌ها از این IP پر شده است.',
+        'expired'        => '⏰ پنجرهٔ تنظیم رمز جدید منقضی شد. لطفاً از نو شروع کن.',
     ][$err] ?? '';
 ?>
 <!DOCTYPE html><html lang="fa" dir="rtl"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>بازیابی رمز عبور — XCloud</title>
@@ -3885,23 +3929,26 @@ if ($action == 'forgot_password_step1_process') {
                 'expires_at' => $result['expires_at'],
             ];
             $_SESSION['pending_reset_otp_id'] = (int)$result['otp_id'];
+            unset($_SESSION['pending_fake_expires_at']);
             logActivity($pdo, $user['username'], 'password_reset_requested', $email);
         } else {
-            $_SESSION['pending_password_reset'] = [
-                'email' => $email, 'fake' => true,
-                'token' => generate_otp_code(8),
-                'expires_at' => date('Y-m-d H:i:s', time() + 1800),
-            ];
-            unset($_SESSION['pending_reset_otp_id']);
+            // User exists but token issuance failed (rate-limit, DB error). Surface
+            // honestly — the user already knows they have an account, so leaking
+            // the rate-limit is acceptable and necessary for UX.
+            $err = $result['reason'] ?? 'send_failed';
+            header("Location: ?action=forgot_password_step1&error=" . urlencode($err) . "&email=" . urlencode($email));
+            exit;
         }
     } else {
-        // Anti-enumeration: store fake pending
+        // Anti-enumeration: store fake pending with sentinel otp_id = -1 so the
+        // status poller keeps reporting "pending" until the fake expiry.
         $_SESSION['pending_password_reset'] = [
             'email' => $email, 'fake' => true,
             'token' => generate_otp_code(8),
             'expires_at' => date('Y-m-d H:i:s', time() + 1800),
         ];
-        unset($_SESSION['pending_reset_otp_id']);
+        $_SESSION['pending_reset_otp_id'] = -1;
+        $_SESSION['pending_fake_expires_at'] = time() + 1800;
         usleep(random_int(300000, 700000));
     }
 
@@ -3927,7 +3974,12 @@ if ($action == 'forgot_password_step2') {
     $msgText = '';
     if ($msg === 'sent')    $msgText = '✅ اگر این ایمیل ثبت شده باشد، آماده‌ٔ تایید است.';
     if ($msg === 'resent')  $msgText = '✅ توکن جدید صادر شد.';
-    if ($msg === 'checked') $msgText = '🔄 بررسی انجام شد.';
+    if ($msg === 'checked') {
+        $busy = (($_GET['busy'] ?? '0') === '1');
+        $msgText = $busy
+            ? '⏳ یک بررسی دیگر هم‌اکنون در حال اجرا است — تا چند ثانیه دیگر نتیجه‌اش می‌رسد.'
+            : '🔄 بررسی انجام شد.';
+    }
 
     $expiresAtTs = strtotime($pending['expires_at']);
     $toAddr = getSetting($pdo, 'inbound_to_address', 'xcloud@retrivo.ir');
@@ -4044,6 +4096,7 @@ h1{font-size:1.35rem;margin:0 0 8px;color:#f1f5f9;text-align:center}
       if(j.status==='verified'){ stopped=true; setState('ok','✓ تایید شد — در حال انتقال به صفحهٔ تنظیم رمز جدید...');
         setTimeout(function(){ window.location = j.redirect || '?action=forgot_password_step3'; }, 800); return; }
       if(j.status==='expired'){ stopped=true; setState('fail','⏰ توکن منقضی شده است.'); return; }
+      if(j.status==='race_error'){ stopped=true; setState('fail', j.message || 'خطا در پردازش — لطفاً دوباره تلاش کن.'); return; }
       if(j.status==='no_session'){ stopped=true; setState('fail','نشست منقضی شد.'); return; }
       pt=setTimeout(poll,5000);
     } catch(e){ pt=setTimeout(poll,8000); }
@@ -4183,6 +4236,8 @@ if ($action == 'forgot_password_resend') {
     if (!empty($pending['fake'])) {
         $_SESSION['pending_password_reset']['token']      = generate_otp_code(8);
         $_SESSION['pending_password_reset']['expires_at'] = date('Y-m-d H:i:s', time() + 1800);
+        $_SESSION['pending_reset_otp_id']                 = -1;
+        $_SESSION['pending_fake_expires_at']              = time() + 1800;
         $_SESSION['reset_resend_count'] = $count + 1;
         header("Location: ?action=forgot_password_step2&msg=resent"); exit;
     }
@@ -4199,6 +4254,7 @@ if ($action == 'forgot_password_resend') {
         $_SESSION['pending_password_reset']['otp_id']     = $result['otp_id'];
         $_SESSION['pending_password_reset']['expires_at'] = $result['expires_at'];
         $_SESSION['pending_reset_otp_id'] = (int)$result['otp_id'];
+        unset($_SESSION['pending_fake_expires_at']);
         $_SESSION['reset_resend_count'] = $count + 1;
         header("Location: ?action=forgot_password_step2&msg=resent"); exit;
     }
@@ -4241,12 +4297,22 @@ if ($action == 'inbound_status') {
 
     $otpId = 0;
     $kind  = '';
-    if (!empty($_SESSION['pending_register_otp_id'])) {
+    if (isset($_SESSION['pending_register_otp_id']) && $_SESSION['pending_register_otp_id'] !== 0) {
         $otpId = (int)$_SESSION['pending_register_otp_id'];
         $kind  = 'register';
-    } elseif (!empty($_SESSION['pending_reset_otp_id'])) {
+    } elseif (isset($_SESSION['pending_reset_otp_id']) && $_SESSION['pending_reset_otp_id'] !== 0) {
         $otpId = (int)$_SESSION['pending_reset_otp_id'];
         $kind  = 'reset';
+    }
+
+    if ($otpId === -1) {
+        // Anti-enumeration fake branch: always look pending until the fake
+        // expiry passes, then look expired — indistinguishable from real flow.
+        $fakeExp = (int)($_SESSION['pending_fake_expires_at'] ?? 0);
+        if ($fakeExp > 0 && time() > $fakeExp) {
+            echo json_encode(['status' => 'expired']); exit;
+        }
+        echo json_encode(['status' => 'pending']); exit;
     }
     if ($otpId <= 0) { echo json_encode(['status' => 'no_session']); exit; }
 
@@ -4271,8 +4337,13 @@ if ($action == 'inbound_status') {
                 echo json_encode(['status' => 'verified', 'redirect' => '?action=dashboard&msg=welcome']);
                 exit;
             }
-            // Edge case: race between cron and poller (shouldn't happen in practice)
-            echo json_encode(['status' => 'pending']);
+            // OTP consumed but no matching verified user — apply_payload early-
+            // returned on a collision (username/email taken between step1 and
+            // the inbound match). Stop the poller and ask the user to retry.
+            echo json_encode([
+                'status'  => 'race_error',
+                'message' => 'حساب ساخته نشد (احتمالاً نام کاربری یا ایمیل بین زمان درخواست و دریافت ایمیل توسط فرد دیگری گرفته شد). لطفاً با اطلاعات دیگری دوباره تلاش کن.',
+            ]);
             exit;
         }
         if ($kind === 'reset') {
@@ -4314,7 +4385,8 @@ if ($action == 'inbound_check_now') {
 
     $stats = inbound_run($pdo, 20);
     $matched = (int)($stats['matched'] ?? 0);
-    header("Location: ?action=$redirect&msg=checked&matched=$matched"); exit;
+    $busy    = (!empty($stats['error']) && $stats['error'] === 'busy') ? '1' : '0';
+    header("Location: ?action=$redirect&msg=checked&matched=$matched&busy=$busy"); exit;
 }
 
 /**
@@ -4379,6 +4451,7 @@ if ($action == 'inbound_test_connection') {
     if (!isset($_SESSION['user']) || $_SESSION['role'] !== 'admin') {
         http_response_code(403); echo 'Forbidden'; exit;
     }
+    verifyCsrf();
     header('Content-Type: application/json; charset=utf-8');
     $state = inbound_imap_connect($pdo);
     if (isset($state['error'])) {
@@ -4577,12 +4650,18 @@ table.hist th{background:#0a0e1a;color:#94a3b8;font-weight:600}
   </div>
 </div>
 <script>
+var __inboundCsrf = <?= json_encode($csrf) ?>;
 document.getElementById('testBtn').addEventListener('click', async function(){
   var box = document.getElementById('testBox');
   box.className = 'testbox show';
   box.textContent = 'در حال آزمایش...';
   try {
-    var r = await fetch('?action=inbound_test_connection', {credentials:'same-origin', headers:{'Accept':'application/json'}});
+    var r = await fetch('?action=inbound_test_connection', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: {'Accept':'application/json', 'Content-Type':'application/x-www-form-urlencoded'},
+      body: 'csrf_token=' + encodeURIComponent(__inboundCsrf)
+    });
     var j = await r.json();
     if (j.ok) {
       box.className = 'testbox show ok';

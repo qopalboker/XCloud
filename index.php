@@ -1,14 +1,6 @@
 <?php
 date_default_timezone_set('Asia/Tehran');
 
-require_once __DIR__ . '/lib/PHPMailer/Exception.php';
-require_once __DIR__ . '/lib/PHPMailer/PHPMailer.php';
-require_once __DIR__ . '/lib/PHPMailer/SMTP.php';
-
-use PHPMailer\PHPMailer\PHPMailer;
-use PHPMailer\PHPMailer\SMTP;
-use PHPMailer\PHPMailer\Exception as PHPMailerException;
-
 // ============================================================
 // XCloud v3.2
 // ✅ سطل زباله اصلی با پاکسازی خودکار
@@ -78,153 +70,616 @@ function setSetting($pdo,$key,$value){
     $s=$pdo->prepare("INSERT INTO settings (setting_key,setting_value) VALUES(?,?) ON DUPLICATE KEY UPDATE setting_value=?,updated_at=CURRENT_TIMESTAMP");
     $s->execute([$key,$value,$value]);
 }
-function xcloud_send_email($pdo, $to, $subject, $html_body, $text_body = null, $purpose = 'general') {
-    $host      = getSetting($pdo, 'smtp_host');
-    $port      = (int)getSetting($pdo, 'smtp_port', 465);
-    $enc       = getSetting($pdo, 'smtp_encryption', 'ssl');
-    $user      = getSetting($pdo, 'smtp_username');
-    $pass      = getSetting($pdo, 'smtp_password');
-    $fromEmail = getSetting($pdo, 'smtp_from_email');
-    $fromName  = getSetting($pdo, 'smtp_from_name', 'XCloud');
-    $timeout   = (int)getSetting($pdo, 'smtp_timeout', 15);
-    $debug     = (int)getSetting($pdo, 'smtp_debug', 0);
-    $ip        = $_SERVER['REMOTE_ADDR'] ?? 'unknown';
+// ================================================================
+// INBOUND EMAIL VERIFICATION (reverse OTP via IMAP)
+// ================================================================
+// Users prove email ownership by sending a token from their address
+// to our shared inbox. A cron + manual button scan unread messages,
+// validate auth (SPF/DKIM), match the token, and consume the OTP.
+// ================================================================
 
-    if (empty($host) || empty($user) || empty($pass) || empty($fromEmail)) {
-        $pdo->prepare("INSERT INTO email_send_log (email,ip_address,purpose,status,error_message) VALUES(?,?,?,'failed',?)")
-            ->execute([$to, $ip, $purpose, 'SMTP not configured (host/user/pass/from missing)']);
-        return ['ok' => false, 'error' => 'SMTP not configured'];
-    }
-
-    $mail = new PHPMailer(true);
-    try {
-        $mail->isSMTP();
-        $mail->Host = $host;
-        $mail->Port = $port;
-        $mail->SMTPAuth = true;
-        $mail->Username = $user;
-        $mail->Password = $pass;
-        $mail->Timeout = $timeout;
-
-        if ($enc === 'ssl')      $mail->SMTPSecure = PHPMailer::ENCRYPTION_SMTPS;
-        elseif ($enc === 'tls')  $mail->SMTPSecure = PHPMailer::ENCRYPTION_STARTTLS;
-        else                     $mail->SMTPSecure = false;
-
-        if ($debug) $mail->SMTPDebug = SMTP::DEBUG_SERVER;
-
-        $mail->CharSet  = 'UTF-8';
-        $mail->Encoding = 'base64';
-        $mail->setFrom($fromEmail, $fromName);
-        $mail->addAddress($to);
-        $mail->isHTML(true);
-        $mail->Subject = $subject;
-        $mail->Body    = $html_body;
-        $mail->AltBody = $text_body ?: trim(strip_tags($html_body));
-
-        $mail->send();
-
-        $pdo->prepare("INSERT INTO email_send_log (email,ip_address,purpose,status) VALUES(?,?,?,'sent')")
-            ->execute([$to, $ip, $purpose]);
-        return ['ok' => true];
-
-    } catch (\Exception $e) {
-        $err = $mail->ErrorInfo ?: $e->getMessage();
-        if (stripos($err, 'connection timed out') !== false || stripos($err, 'code: 110') !== false) {
-            $err .= "\n\n💡 این خطا معمولاً به این معنی است که فایروال خروجی هاست شما، پورت SMTP را بسته است. "
-                  . "از پشتیبان هاست بخواهید پورت‌های ۴۶۵ و ۵۸۷ به مقصد '$host' را باز کنند، "
-                  . "یا از یک سرویس Email Relay مانند Mailgun/SendGrid/Brevo استفاده کنید.";
-        }
-        $pdo->prepare("INSERT INTO email_send_log (email,ip_address,purpose,status,error_message) VALUES(?,?,?,'failed',?)")
-            ->execute([$to, $ip, $purpose, mb_substr($err, 0, 1000)]);
-        return ['ok' => false, 'error' => $err];
-    }
+function inbound_load_settings($pdo) {
+    return [
+        'enabled'             => getSetting($pdo, 'inbound_enabled', '1') === '1',
+        'host'                => getSetting($pdo, 'inbound_host', ''),
+        'port'                => (int)getSetting($pdo, 'inbound_port', 993),
+        'encryption'          => getSetting($pdo, 'inbound_encryption', 'ssl'),
+        'username'            => getSetting($pdo, 'inbound_username', ''),
+        'password'            => getSetting($pdo, 'inbound_password', ''),
+        'inbox_folder'        => getSetting($pdo, 'inbound_inbox_folder', 'INBOX'),
+        'processed_folder'    => getSetting($pdo, 'inbound_processed_folder', 'INBOX.XCloud-Processed'),
+        'rejected_folder'     => getSetting($pdo, 'inbound_rejected_folder', 'INBOX.XCloud-Rejected'),
+        'to_address'          => getSetting($pdo, 'inbound_to_address', ''),
+        'mta_hostname'        => trim(strtolower(getSetting($pdo, 'inbound_mta_hostname', ''))),
+        'require_spf_or_dkim' => getSetting($pdo, 'inbound_require_spf_or_dkim', '1') === '1',
+        'cron_secret'         => getSetting($pdo, 'inbound_cron_secret', ''),
+        'max_per_run'         => max(1, min(500, (int)getSetting($pdo, 'inbound_max_messages_per_run', 50))),
+    ];
 }
+
 /**
- * Render the OTP email subject + HTML + plain text for a given purpose.
+ * Open an IMAP connection. Prefers ext/imap if available; otherwise uses a
+ * lightweight socket-based fallback that supports LOGIN + a handful of UID
+ * commands.
  *
- * @param string $purpose 'register' | 'password_reset' | 'email_add'
- * @param string $code The plaintext OTP code to embed
- * @param int $ttlMinutes Validity in minutes
- * @return array [string $subject, string $html, string $text]
+ * Returns either ['mode' => 'native', 'conn' => $resource, 'cfg' => $cfg]
+ *           or ['mode' => 'socket', 'sock' => $stream, 'tag' => int, 'cfg' => $cfg]
+ *           or ['error' => 'message'].
  */
-function render_otp_email($purpose, $code, $ttlMinutes) {
-    switch ($purpose) {
-        case 'password_reset':
-            $subject = 'بازیابی رمز عبور — XCloud';
-            $heading = 'بازیابی رمز عبور';
-            $intro   = 'برای بازیابی رمز عبور حساب XCloud خود، از کد یکبارمصرف زیر استفاده کنید.';
-            break;
-        case 'email_add':
-            $subject = 'تأیید ایمیل — XCloud';
-            $heading = 'تأیید آدرس ایمیل';
-            $intro   = 'برای تأیید این ایمیل و افزودن آن به حساب XCloud خود، از کد یکبارمصرف زیر استفاده کنید.';
-            break;
-        case 'register':
-        default:
-            $subject = 'کد تأیید ثبت‌نام — XCloud';
-            $heading = 'به XCloud خوش آمدید';
-            $intro   = 'برای تکمیل ثبت‌نام در XCloud، از کد یکبارمصرف زیر استفاده کنید.';
-            break;
+function inbound_imap_connect($pdo) {
+    $cfg = inbound_load_settings($pdo);
+    if ($cfg['host'] === '' || $cfg['username'] === '' || $cfg['password'] === '') {
+        return ['error' => 'IMAP credentials not configured'];
     }
 
-    $html = '<!DOCTYPE html><html lang="fa" dir="rtl"><head><meta charset="UTF-8">'
-          . '<meta name="viewport" content="width=device-width,initial-scale=1">'
-          . '<title>' . h($subject) . '</title></head>'
-          . '<body style="margin:0;padding:0;background:#f1f5f9;font-family:Tahoma,Arial,sans-serif">'
-          . '<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="background:#f1f5f9;padding:30px 10px">'
-          . '<tr><td align="center">'
-          . '<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="max-width:560px;background:#ffffff;border-radius:14px;overflow:hidden;box-shadow:0 4px 20px rgba(0,0,0,.08)">'
-          . '<tr><td style="background:linear-gradient(135deg,#3b82f6,#1e40af);padding:32px 24px;text-align:center;color:#fff">'
-          . '<div style="font-size:2rem;font-weight:700;margin-bottom:6px">XCloud</div>'
-          . '<div style="font-size:.95rem;opacity:.9">' . h($heading) . '</div>'
-          . '</td></tr>'
-          . '<tr><td style="padding:32px 28px;color:#1e293b;font-size:.95rem;line-height:1.8" dir="rtl">'
-          . '<p style="margin:0 0 16px">سلام،</p>'
-          . '<p style="margin:0 0 24px">' . h($intro) . '</p>'
-          . '<div style="text-align:center;margin:28px 0">'
-          . '<div style="display:inline-block;background:#f1f5f9;border:2px dashed #3b82f6;'
-          . 'padding:20px 36px;border-radius:12px;font-size:2.2rem;font-weight:700;'
-          . 'color:#1e40af;letter-spacing:.4em;font-family:Consolas,monospace">'
-          . h($code) . '</div></div>'
-          . '<p style="margin:20px 0 8px;color:#64748b;font-size:.85rem;text-align:center">'
-          . 'این کد تا <strong>' . (int)$ttlMinutes . ' دقیقه</strong> اعتبار دارد.</p>'
-          . '<hr style="border:none;border-top:1px solid #e2e8f0;margin:28px 0">'
-          . '<p style="margin:0;color:#94a3b8;font-size:.8rem;line-height:1.6">'
-          . '⚠️ اگر این درخواست از طرف شما نبود، این ایمیل را نادیده بگیرید. '
-          . 'هیچ‌کدام از کارکنان XCloud هرگز از شما این کد را نخواهد خواست.'
-          . '</p></td></tr>'
-          . '<tr><td style="background:#f8fafc;padding:18px 24px;text-align:center;color:#94a3b8;font-size:.75rem">'
-          . 'این ایمیل به‌صورت خودکار ارسال شده است. لطفاً پاسخ ندهید.<br>'
-          . '© ' . date('Y') . ' XCloud — همه حقوق محفوظ است.'
-          . '</td></tr>'
-          . '</table></td></tr></table></body></html>';
+    if (function_exists('imap_open')) {
+        $enc = $cfg['encryption'] === 'tls' ? '/imap/tls' : '/imap/ssl';
+        // /novalidate-cert handles shared hosts with mismatched certs (common on cPanel)
+        $mbox = '{' . $cfg['host'] . ':' . $cfg['port'] . $enc . '/novalidate-cert}' . $cfg['inbox_folder'];
+        $err = '';
+        set_error_handler(function($n, $s) use (&$err) { $err = $s; return true; });
+        $conn = @imap_open($mbox, $cfg['username'], $cfg['password'], 0, 1);
+        restore_error_handler();
+        if (!$conn) {
+            $imapErrs = @imap_errors();
+            return ['error' => 'imap_open failed: ' . ($err ?: (is_array($imapErrs) ? implode('; ', $imapErrs) : 'unknown'))];
+        }
+        return ['mode' => 'native', 'conn' => $conn, 'cfg' => $cfg];
+    }
 
-    $text = "XCloud — $heading\n\n"
-          . "سلام،\n\n"
-          . "$intro\n\n"
-          . "کد تأیید: $code\n\n"
-          . "این کد تا $ttlMinutes دقیقه اعتبار دارد.\n\n"
-          . "اگر این درخواست از طرف شما نبود، این ایمیل را نادیده بگیرید.\n\n"
-          . "© " . date('Y') . " XCloud";
+    // Socket fallback
+    $scheme = $cfg['encryption'] === 'tls' ? 'tcp' : 'ssl';
+    $remote = $scheme . '://' . $cfg['host'] . ':' . $cfg['port'];
+    $errno = 0; $errstr = '';
+    $sock = @stream_socket_client($remote, $errno, $errstr, 15);
+    if (!$sock) {
+        return ['error' => "socket connect failed: $errstr ($errno)"];
+    }
+    stream_set_timeout($sock, 15);
 
-    return [$subject, $html, $text];
+    $greeting = fgets($sock, 8192);
+    if (!$greeting || stripos($greeting, '* OK') !== 0) {
+        fclose($sock);
+        return ['error' => 'unexpected IMAP greeting: ' . trim((string)$greeting)];
+    }
+
+    if ($cfg['encryption'] === 'tls') {
+        // STARTTLS upgrade
+        fwrite($sock, "A001 STARTTLS\r\n");
+        $resp = fgets($sock, 8192);
+        if (!$resp || stripos($resp, 'A001 OK') === false) {
+            fclose($sock);
+            return ['error' => 'STARTTLS rejected: ' . trim((string)$resp)];
+        }
+        if (!@stream_socket_enable_crypto($sock, true, STREAM_CRYPTO_METHOD_TLS_CLIENT)) {
+            fclose($sock);
+            return ['error' => 'TLS handshake failed'];
+        }
+    }
+
+    $state = ['mode' => 'socket', 'sock' => $sock, 'tag' => 2, 'cfg' => $cfg, 'selected' => null];
+
+    // LOGIN
+    $loginResp = inbound_socket_cmd($state, 'LOGIN ' . inbound_imap_quote($cfg['username']) . ' ' . inbound_imap_quote($cfg['password']));
+    if (!$loginResp['ok']) {
+        fclose($sock);
+        return ['error' => 'LOGIN failed: ' . $loginResp['line']];
+    }
+
+    return $state;
+}
+
+function inbound_imap_quote($s) {
+    return '"' . str_replace(['\\', '"'], ['\\\\', '\\"'], $s) . '"';
+}
+
+/**
+ * Run a tagged IMAP command on the socket fallback and read response lines
+ * until the tagged "OK/NO/BAD" terminator. Returns ['ok'=>bool,'lines'=>[],'line'=>terminator].
+ * Handles literal "{N}\r\n<N bytes>" continuations on a best-effort basis.
+ */
+function inbound_socket_cmd(&$state, $cmd) {
+    $tag = 'A' . str_pad((string)$state['tag']++, 3, '0', STR_PAD_LEFT);
+    fwrite($state['sock'], $tag . ' ' . $cmd . "\r\n");
+    $lines = [];
+    $terminator = '';
+    while (!feof($state['sock'])) {
+        $line = fgets($state['sock'], 65536);
+        if ($line === false) break;
+        // Literal continuation: { N }
+        if (preg_match('/\{(\d+)\}\r?\n$/', $line, $m)) {
+            $need = (int)$m[1];
+            $blob = '';
+            while ($need > 0 && !feof($state['sock'])) {
+                $chunk = fread($state['sock'], min($need, 65536));
+                if ($chunk === false || $chunk === '') break;
+                $blob .= $chunk;
+                $need -= strlen($chunk);
+            }
+            $lines[] = $line . $blob;
+            continue;
+        }
+        if (strpos($line, $tag . ' ') === 0) {
+            $terminator = $line;
+            break;
+        }
+        $lines[] = $line;
+    }
+    $ok = (bool)preg_match('/^' . preg_quote($tag, '/') . ' OK\b/i', $terminator);
+    return ['ok' => $ok, 'lines' => $lines, 'line' => trim($terminator)];
+}
+
+function inbound_select_folder(&$state, $folder) {
+    if ($state['mode'] === 'native') {
+        $cfg = $state['cfg'];
+        $enc = $cfg['encryption'] === 'tls' ? '/imap/tls' : '/imap/ssl';
+        $mbox = '{' . $cfg['host'] . ':' . $cfg['port'] . $enc . '/novalidate-cert}' . $folder;
+        return @imap_reopen($state['conn'], $mbox);
+    }
+    $r = inbound_socket_cmd($state, 'SELECT ' . inbound_imap_quote($folder));
+    if ($r['ok']) $state['selected'] = $folder;
+    return $r['ok'];
+}
+
+function inbound_ensure_folders(&$state) {
+    $cfg = $state['cfg'];
+    foreach ([$cfg['processed_folder'], $cfg['rejected_folder']] as $f) {
+        if ($state['mode'] === 'native') {
+            $enc = $cfg['encryption'] === 'tls' ? '/imap/tls' : '/imap/ssl';
+            $ref = '{' . $cfg['host'] . ':' . $cfg['port'] . $enc . '/novalidate-cert}';
+            @imap_createmailbox($state['conn'], $ref . $f);
+            @imap_errors(); // discard "ALREADYEXISTS"
+        } else {
+            inbound_socket_cmd($state, 'CREATE ' . inbound_imap_quote($f));
+        }
+    }
+}
+
+function inbound_list_unread(&$state, $limit) {
+    if ($state['mode'] === 'native') {
+        $ids = @imap_search($state['conn'], 'UNSEEN', SE_UID);
+        if (!is_array($ids)) return [];
+        sort($ids);
+        return array_slice($ids, 0, $limit);
+    }
+    // Socket: UID SEARCH UNSEEN
+    $r = inbound_socket_cmd($state, 'UID SEARCH UNSEEN');
+    if (!$r['ok']) return [];
+    $uids = [];
+    foreach ($r['lines'] as $line) {
+        if (preg_match('/^\* SEARCH\s+(.*)$/i', trim($line), $m)) {
+            foreach (preg_split('/\s+/', trim($m[1])) as $tok) {
+                if (ctype_digit($tok)) $uids[] = (int)$tok;
+            }
+        }
+    }
+    sort($uids);
+    return array_slice($uids, 0, $limit);
+}
+
+/**
+ * Fetch headers + Message-ID + From + Subject + raw header block for a UID.
+ * Returns ['raw' => '...', 'message_id' => '', 'from' => '', 'subject' => '', 'received_at' => ...] or null.
+ */
+function inbound_fetch_headers(&$state, $uid) {
+    $raw = '';
+    if ($state['mode'] === 'native') {
+        $raw = (string)@imap_fetchheader($state['conn'], $uid, FT_UID);
+    } else {
+        $r = inbound_socket_cmd($state, "UID FETCH $uid BODY.PEEK[HEADER]");
+        if (!$r['ok']) return null;
+        // Concat literal blob lines
+        foreach ($r['lines'] as $line) {
+            if (preg_match('/\{(\d+)\}\r?\n(.*)/s', $line, $m)) {
+                $raw .= $m[2];
+            }
+        }
+    }
+    if ($raw === '') return null;
+
+    $unfold = preg_replace("/\r?\n[ \t]+/", ' ', $raw);
+
+    $msgId = '';
+    if (preg_match('/^Message-ID:\s*<([^>]+)>/im', $unfold, $m)) {
+        $msgId = trim($m[1]);
+    }
+
+    $fromRaw = '';
+    if (preg_match('/^From:\s*(.+?)$/im', $unfold, $m)) {
+        $fromRaw = trim($m[1]);
+    }
+    $from = inbound_extract_email($fromRaw);
+
+    $subjectRaw = '';
+    if (preg_match('/^Subject:\s*(.+?)$/im', $unfold, $m)) {
+        $subjectRaw = trim($m[1]);
+    }
+    $subject = inbound_decode_mime_words($subjectRaw);
+
+    $receivedAt = null;
+    if (preg_match('/^Date:\s*(.+?)$/im', $unfold, $m)) {
+        $ts = strtotime(trim($m[1]));
+        if ($ts) $receivedAt = date('Y-m-d H:i:s', $ts);
+    }
+
+    return [
+        'raw'         => $raw,
+        'unfold'      => $unfold,
+        'message_id'  => $msgId,
+        'from'        => $from,
+        'from_raw'    => $fromRaw,
+        'subject'     => $subject,
+        'subject_raw' => $subjectRaw,
+        'received_at' => $receivedAt,
+    ];
+}
+
+/**
+ * Extract a bare lowercased email from a From header that may be:
+ *   "Display Name" <addr@x.com>
+ *   addr@x.com (Display Name)
+ *   addr@x.com
+ *   =?UTF-8?B?...?= <addr@x.com>
+ */
+function inbound_extract_email($s) {
+    if ($s === '') return '';
+    if (preg_match('/<([^>]+@[^>]+)>/', $s, $m)) {
+        return trim(strtolower($m[1]));
+    }
+    if (preg_match('/([A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,})/', $s, $m)) {
+        return trim(strtolower($m[1]));
+    }
+    return '';
+}
+
+function inbound_decode_mime_words($s) {
+    if ($s === '') return '';
+    if (function_exists('iconv_mime_decode')) {
+        $d = @iconv_mime_decode($s, ICONV_MIME_DECODE_CONTINUE_ON_ERROR, 'UTF-8');
+        if ($d !== false) return $d;
+    }
+    if (function_exists('mb_decode_mimeheader')) {
+        return mb_decode_mimeheader($s);
+    }
+    return $s;
+}
+
+/**
+ * Parse Authentication-Results header(s). Only trusts lines stamped by the
+ * configured MTA hostname (first token before the semicolon). This is the
+ * key anti-spoofing gate: an attacker could include their own
+ * "Authentication-Results: ..." line in the email body, but it would be
+ * stamped with a different hostname.
+ *
+ * Returns ['spf' => 'pass'|'fail'|'none', 'dkim' => same, 'trusted' => bool].
+ */
+function inbound_parse_auth_results($raw, $expectedMta) {
+    $expectedMta = trim(strtolower((string)$expectedMta));
+    $result = ['spf' => 'none', 'dkim' => 'none', 'trusted' => false];
+    if ($expectedMta === '') return $result;
+
+    // Unfold then grab each Authentication-Results: line
+    $unfold = preg_replace("/\r?\n[ \t]+/", ' ', $raw);
+    if (!preg_match_all('/^Authentication-Results:\s*(.+)$/im', $unfold, $matches)) {
+        return $result;
+    }
+    foreach ($matches[1] as $line) {
+        $parts = explode(';', $line);
+        $stampedBy = trim(strtolower(array_shift($parts)));
+        // Some servers add "i=..." after the hostname; strip
+        $stampedBy = preg_replace('/\s+.*$/', '', $stampedBy);
+        if ($stampedBy !== $expectedMta) continue;
+        $result['trusted'] = true;
+        foreach ($parts as $kv) {
+            $kv = trim($kv);
+            if (preg_match('/^spf\s*=\s*([a-z]+)/i', $kv, $m)) {
+                $result['spf'] = strtolower($m[1]);
+            } elseif (preg_match('/^dkim\s*=\s*([a-z]+)/i', $kv, $m)) {
+                $result['dkim'] = strtolower($m[1]);
+            }
+        }
+    }
+    return $result;
+}
+
+/**
+ * Extract an XV-XXXXXXXX token from a subject. Strips common forward/reply
+ * prefixes and decodes MIME-encoded words. Returns uppercase token or null.
+ */
+function inbound_extract_token($subject) {
+    if ($subject === '' || $subject === null) return null;
+    // Strip Re:/Fwd:/[Tag] prefixes iteratively
+    $s = trim($subject);
+    for ($i = 0; $i < 8; $i++) {
+        $before = $s;
+        $s = preg_replace('/^\s*(re|fw|fwd|پاسخ|ارجاع)\s*:\s*/iu', '', $s);
+        $s = preg_replace('/^\s*\[[^\]]{1,40}\]\s*/u', '', $s);
+        if ($s === $before) break;
+    }
+    if (preg_match('/\bXV-([A-Z2-9]{8})\b/i', $s, $m)) {
+        return 'XV-' . strtoupper($m[1]);
+    }
+    return null;
+}
+
+function inbound_move_message(&$state, $uid, $destFolder) {
+    if ($state['mode'] === 'native') {
+        $ok = @imap_mail_move($state['conn'], (string)$uid, $destFolder, CP_UID);
+        if ($ok) @imap_expunge($state['conn']);
+        return (bool)$ok;
+    }
+    // Prefer UID MOVE if server supports it; fall back to COPY + STORE + EXPUNGE
+    $r = inbound_socket_cmd($state, "UID MOVE $uid " . inbound_imap_quote($destFolder));
+    if ($r['ok']) return true;
+    $r = inbound_socket_cmd($state, "UID COPY $uid " . inbound_imap_quote($destFolder));
+    if (!$r['ok']) return false;
+    inbound_socket_cmd($state, "UID STORE $uid +FLAGS (\\Deleted)");
+    inbound_socket_cmd($state, "EXPUNGE");
+    return true;
+}
+
+function inbound_close(&$state) {
+    if (!is_array($state) || empty($state['mode'])) return;
+    if ($state['mode'] === 'native') {
+        @imap_close($state['conn'], CL_EXPUNGE);
+    } else {
+        @inbound_socket_cmd($state, 'LOGOUT');
+        @fclose($state['sock']);
+    }
+}
+
+function inbound_acquire_lock() {
+    $path = sys_get_temp_dir() . '/xcloud_inbound.lock';
+    $fp = @fopen($path, 'c');
+    if (!$fp) return null;
+    if (!@flock($fp, LOCK_EX | LOCK_NB)) {
+        fclose($fp);
+        return null;
+    }
+    ftruncate($fp, 0);
+    fwrite($fp, (string)getmypid() . "\n");
+    fflush($fp);
+    return $fp;
+}
+
+function inbound_release_lock($fp) {
+    if (!is_resource($fp)) return;
+    @flock($fp, LOCK_UN);
+    @fclose($fp);
+}
+
+/**
+ * Record a processed inbound message. Uses INSERT IGNORE on the Message-ID
+ * unique index so a re-scan of the same message is a no-op.
+ */
+function inbound_record($pdo, $messageId, $fromEmail, $outcome, $matchedOtpId = null, $receivedAt = null) {
+    if ($messageId === '' || $messageId === null) {
+        // Synthesize a stable-ish ID so we can still log malformed messages
+        $messageId = 'no-msgid-' . hash('sha1', ($fromEmail ?? '') . '|' . ($receivedAt ?? '') . '|' . microtime(true));
+    }
+    try {
+        $st = $pdo->prepare("INSERT IGNORE INTO email_inbound_processed
+            (message_id, from_email, matched_otp_id, outcome, received_at)
+            VALUES (?, ?, ?, ?, ?)");
+        $st->execute([$messageId, $fromEmail, $matchedOtpId, $outcome, $receivedAt]);
+    } catch (\Exception $e) { /* swallow */ }
+}
+
+/**
+ * Apply the payload of a matched OTP. For 'register' this creates the user
+ * account directly (with email_verified=1). For 'password_reset' it does
+ * nothing here — the user's poll on the reset page will detect the consumed
+ * row and grant a session-bound new-password authorization.
+ *
+ * @param array $otpRow Row from email_otps (id, email, purpose, payload)
+ */
+function inbound_apply_payload($pdo, array $otpRow) {
+    $purpose = $otpRow['purpose'];
+    $email   = mb_strtolower($otpRow['email']);
+    $payload = $otpRow['payload'] ? json_decode($otpRow['payload'], true) : [];
+
+    if ($purpose === 'register') {
+        if (empty($payload['username']) || empty($payload['password_hash'])) return;
+        $username = $payload['username'];
+        // Race-check: skip if username or email already taken
+        $st = $pdo->prepare("SELECT id FROM users WHERE username = ? OR email = ?");
+        $st->execute([$username, $email]);
+        if ($st->fetch()) return;
+        $cd   = (int)getSetting($pdo, 'default_user_can_download', 1);
+        $ccp  = (int)getSetting($pdo, 'default_user_can_change_password', 1);
+        $cdel = (int)getSetting($pdo, 'default_user_can_delete', 0);
+        $csh  = (int)getSetting($pdo, 'default_user_can_share', 0);
+        $ins = $pdo->prepare("INSERT INTO users
+            (username, password, email, email_verified, email_verified_at, role,
+             can_download, can_change_password, can_delete, can_share)
+            VALUES (?, ?, ?, 1, NOW(), 'user', ?, ?, ?, ?)");
+        $ins->execute([$username, $payload['password_hash'], $email, $cd, $ccp, $cdel, $csh]);
+        logActivity($pdo, $username, 'inbound_register_completed', $email);
+    } elseif ($purpose === 'email_add') {
+        // Admin-only flow in Phase 10; supports legacy email_add OTPs too.
+        if (empty($payload['user_id'])) return;
+        $pdo->prepare("UPDATE users SET email = ?, email_verified = 1, email_verified_at = NOW() WHERE id = ?")
+            ->execute([$email, (int)$payload['user_id']]);
+        $u = $pdo->prepare("SELECT username FROM users WHERE id = ?");
+        $u->execute([(int)$payload['user_id']]);
+        $row = $u->fetch();
+        if ($row) logActivity($pdo, $row['username'], 'inbound_email_added', $email);
+    }
+    // For 'password_reset': nothing here. The poller picks up consumed_at.
+}
+
+/**
+ * Main inbound worker. Acquires a lock, connects, scans unread messages,
+ * validates auth, matches tokens, consumes OTPs, moves messages. Returns
+ * a stats array.
+ *
+ * @param int|null $maxOverride Override max messages per run (admin "run now")
+ */
+function inbound_run($pdo, $maxOverride = null) {
+    $stats = [
+        'scanned' => 0, 'matched' => 0, 'rejected' => 0, 'skipped_dup' => 0,
+        'auth_fail' => 0, 'no_token' => 0, 'wrong_from' => 0, 'expired' => 0,
+        'started_at' => date('Y-m-d H:i:s'), 'finished_at' => null,
+        'error' => null,
+    ];
+
+    $lock = inbound_acquire_lock();
+    if (!$lock) {
+        $stats['error'] = 'busy';
+        return $stats;
+    }
+
+    try {
+        $cfg = inbound_load_settings($pdo);
+        if (!$cfg['enabled']) {
+            $stats['error'] = 'disabled';
+            return $stats;
+        }
+
+        $state = inbound_imap_connect($pdo);
+        if (isset($state['error'])) {
+            $stats['error'] = $state['error'];
+            return $stats;
+        }
+
+        inbound_ensure_folders($state);
+
+        $limit = $maxOverride !== null ? max(1, (int)$maxOverride) : $cfg['max_per_run'];
+        $uids = inbound_list_unread($state, $limit);
+
+        foreach ($uids as $uid) {
+            $stats['scanned']++;
+            $h = inbound_fetch_headers($state, $uid);
+            if (!$h) {
+                inbound_record($pdo, '', '', 'malformed', null, null);
+                inbound_move_message($state, $uid, $cfg['rejected_folder']);
+                $stats['rejected']++;
+                continue;
+            }
+
+            // Dedup by Message-ID
+            if ($h['message_id'] !== '') {
+                $st = $pdo->prepare("SELECT id FROM email_inbound_processed WHERE message_id = ? LIMIT 1");
+                $st->execute([$h['message_id']]);
+                if ($st->fetch()) {
+                    inbound_move_message($state, $uid, $cfg['rejected_folder']);
+                    $stats['skipped_dup']++;
+                    continue;
+                }
+            }
+
+            // Auth check
+            if ($cfg['require_spf_or_dkim']) {
+                $auth = inbound_parse_auth_results($h['raw'], $cfg['mta_hostname']);
+                if (!$auth['trusted'] || ($auth['spf'] !== 'pass' && $auth['dkim'] !== 'pass')) {
+                    inbound_record($pdo, $h['message_id'], $h['from'], 'auth_fail', null, $h['received_at']);
+                    inbound_move_message($state, $uid, $cfg['rejected_folder']);
+                    logActivity($pdo, 'system', 'inbound_reject_auth', $h['from'], 'spf=' . $auth['spf'] . ' dkim=' . $auth['dkim'] . ' trusted=' . ($auth['trusted'] ? '1' : '0'));
+                    $stats['auth_fail']++; $stats['rejected']++;
+                    continue;
+                }
+            }
+
+            // Token extract from subject
+            $token = inbound_extract_token($h['subject']);
+            if (!$token) {
+                inbound_record($pdo, $h['message_id'], $h['from'], 'no_token', null, $h['received_at']);
+                inbound_move_message($state, $uid, $cfg['rejected_folder']);
+                $stats['no_token']++; $stats['rejected']++;
+                continue;
+            }
+
+            // Match token (case-insensitive) against unconsumed, unexpired OTPs
+            $tokenHash = hash_otp($pdo, $token);
+            $sel = $pdo->prepare("SELECT id, email, purpose, payload, expires_at, consumed_at
+                FROM email_otps WHERE otp_hash = ? ORDER BY id DESC LIMIT 1");
+            $sel->execute([$tokenHash]);
+            $otp = $sel->fetch();
+
+            if (!$otp) {
+                inbound_record($pdo, $h['message_id'], $h['from'], 'no_token', null, $h['received_at']);
+                inbound_move_message($state, $uid, $cfg['rejected_folder']);
+                $stats['no_token']++; $stats['rejected']++;
+                continue;
+            }
+
+            if (!empty($otp['consumed_at'])) {
+                // Token already used — treat as duplicate
+                inbound_record($pdo, $h['message_id'], $h['from'], 'expired', (int)$otp['id'], $h['received_at']);
+                inbound_move_message($state, $uid, $cfg['rejected_folder']);
+                $stats['expired']++; $stats['rejected']++;
+                continue;
+            }
+
+            if (strtotime($otp['expires_at']) < time()) {
+                $pdo->prepare("UPDATE email_otps SET consumed_at = NOW() WHERE id = ?")->execute([$otp['id']]);
+                inbound_record($pdo, $h['message_id'], $h['from'], 'expired', (int)$otp['id'], $h['received_at']);
+                inbound_move_message($state, $uid, $cfg['rejected_folder']);
+                $stats['expired']++; $stats['rejected']++;
+                continue;
+            }
+
+            // From-match (case-insensitive, exact local+domain)
+            if ($h['from'] === '' || strtolower($h['from']) !== strtolower($otp['email'])) {
+                inbound_record($pdo, $h['message_id'], $h['from'], 'wrong_from', (int)$otp['id'], $h['received_at']);
+                inbound_move_message($state, $uid, $cfg['rejected_folder']);
+                logActivity($pdo, 'system', 'inbound_reject_wrong_from', $h['from'], 'expected=' . $otp['email']);
+                $stats['wrong_from']++; $stats['rejected']++;
+                continue;
+            }
+
+            // MATCH — consume OTP and apply payload in a transaction
+            try {
+                $pdo->beginTransaction();
+                $pdo->prepare("UPDATE email_otps SET consumed_at = NOW() WHERE id = ? AND consumed_at IS NULL")
+                    ->execute([(int)$otp['id']]);
+                inbound_apply_payload($pdo, $otp);
+                inbound_record($pdo, $h['message_id'], $h['from'], 'matched', (int)$otp['id'], $h['received_at']);
+                $pdo->commit();
+            } catch (\Exception $e) {
+                if ($pdo->inTransaction()) $pdo->rollBack();
+                logActivity($pdo, 'system', 'inbound_match_error', $h['from'], mb_substr($e->getMessage(), 0, 200));
+            }
+            inbound_move_message($state, $uid, $cfg['processed_folder']);
+            $stats['matched']++;
+        }
+
+        inbound_close($state);
+    } catch (\Exception $e) {
+        $stats['error'] = mb_substr($e->getMessage(), 0, 300);
+    } finally {
+        inbound_release_lock($lock);
+    }
+
+    $stats['finished_at'] = date('Y-m-d H:i:s');
+    setSetting($pdo, 'inbound_last_cron_run_at', $stats['finished_at']);
+    setSetting($pdo, 'inbound_last_cron_result', json_encode($stats, JSON_UNESCAPED_UNICODE));
+    return $stats;
 }
 
 // ================================================================
-// EMAIL OTP SERVICE
+// EMAIL OTP SERVICE (inbound-verification tokens)
 // ================================================================
 
-function generate_otp_code($length = 6) {
-    $code = '';
+/**
+ * Generate an inbound-verification token in the form XV-XXXXXXXX.
+ * Alphabet drops ambiguous chars (0/O/1/I/L) so users can hand-copy
+ * the token if they need to.
+ */
+function generate_otp_code($length = 8) {
+    $alphabet = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789'; // 31 chars
+    $max = strlen($alphabet) - 1;
+    $body = '';
     for ($i = 0; $i < $length; $i++) {
-        $code .= random_int(0, 9);
+        $body .= $alphabet[random_int(0, $max)];
     }
-    return $code;
+    return 'XV-' . $body;
 }
 
 function hash_otp($pdo, $code) {
     $pepper = getSetting($pdo, 'otp_pepper', 'xcloud_default_pepper');
-    return hash('sha256', $pepper . '|' . $code);
+    // Always normalize to uppercase so case-insensitive subject extraction matches
+    return hash('sha256', $pepper . '|' . strtoupper(trim($code)));
 }
 
 // ─── Rate limiting ────────────────────────────────────────────
@@ -304,18 +759,20 @@ function math_captcha_verify($userAnswer) {
 }
 
 /**
- * Request a new OTP for a given email and purpose. Sends the email.
+ * Generate a new inbound-verification token for an email/purpose. The caller
+ * is responsible for displaying the token to the user (who then sends an
+ * email from their address with the token in the subject). No outbound mail
+ * is sent.
  *
  * @param string $purpose 'register' | 'password_reset' | 'email_add'
  * @param string|null $payload JSON string with extra context (e.g., username, user_id)
- * @return array ['ok' => bool, 'reason' => string|null, 'expires_at' => string|null, 'retry_after' => int|null]
+ * @return array ['ok' => bool, 'reason'|'expires_at'|'token'|'otp_id', ...]
  */
 function request_email_otp($pdo, $email, $purpose = 'register', $payload = null) {
     $email = trim(mb_strtolower($email));
     $ip    = $_SERVER['REMOTE_ADDR'] ?? 'unknown';
     $ua    = mb_substr($_SERVER['HTTP_USER_AGENT'] ?? '', 0, 250);
 
-    // Rate limit (function from Phase 4)
     $rl = check_otp_rate_limit($pdo, $email, $ip);
     if (!$rl['ok']) {
         $pdo->prepare("INSERT INTO email_send_log (email,ip_address,purpose,status,error_message) VALUES(?,?,?,'rate_limited',?)")
@@ -323,35 +780,32 @@ function request_email_otp($pdo, $email, $purpose = 'register', $payload = null)
         return $rl;
     }
 
-    $length     = max(4, min(8, (int)getSetting($pdo, 'otp_length', 6)));
-    $ttlMin     = max(1, min(60, (int)getSetting($pdo, 'otp_ttl_minutes', 10)));
+    $ttlMin     = max(1, min(120, (int)getSetting($pdo, 'otp_ttl_minutes', 30)));
     $maxAttempt = max(3, min(10, (int)getSetting($pdo, 'otp_max_attempts', 5)));
-    $code       = generate_otp_code($length);
-    $hash       = hash_otp($pdo, $code);
+    $token      = generate_otp_code(8);
+    $hash       = hash_otp($pdo, $token);
     $expiresAt  = date('Y-m-d H:i:s', time() + $ttlMin * 60);
 
-    // Invalidate prior unconsumed OTPs
+    // Invalidate prior unconsumed OTPs for this email/purpose
     $pdo->prepare("UPDATE email_otps SET consumed_at = NOW() WHERE email = ? AND purpose = ? AND consumed_at IS NULL")
         ->execute([$email, $purpose]);
 
-    // Insert new OTP
     $pdo->prepare("INSERT INTO email_otps
         (email, otp_hash, purpose, max_attempts, ip_address, user_agent, payload, expires_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
         ->execute([$email, $hash, $purpose, $maxAttempt, $ip, $ua, $payload, $expiresAt]);
     $otpId = (int)$pdo->lastInsertId();
 
-    // Render and send email (function from Phase 10)
-    [$subject, $html, $text] = render_otp_email($purpose, $code, $ttlMin);
-    $send = xcloud_send_email($pdo, $email, $subject, $html, $text, $purpose);
+    // Reuse email_send_log for rate-limit accounting; semantically "token issued"
+    $pdo->prepare("INSERT INTO email_send_log (email,ip_address,purpose,status) VALUES(?,?,?,'sent')")
+        ->execute([$email, $ip, $purpose]);
 
-    if (!$send['ok']) {
-        // Burn this OTP if delivery failed
-        $pdo->prepare("UPDATE email_otps SET consumed_at = NOW() WHERE id = ?")->execute([$otpId]);
-        return ['ok' => false, 'reason' => 'send_failed', 'error' => $send['error']];
-    }
-
-    return ['ok' => true, 'expires_at' => $expiresAt];
+    return [
+        'ok'         => true,
+        'token'      => $token,
+        'otp_id'     => $otpId,
+        'expires_at' => $expiresAt,
+    ];
 }
 
 /**
@@ -361,9 +815,10 @@ function request_email_otp($pdo, $email, $purpose = 'register', $payload = null)
  */
 function verify_email_otp($pdo, $email, $code, $purpose = 'register') {
     $email = trim(mb_strtolower($email));
-    $code  = trim($code);
+    $code  = strtoupper(trim($code));
 
-    if (!preg_match('/^\d{4,8}$/', $code)) {
+    // Accept XV- inbound tokens (post-Phase 3) only.
+    if (!preg_match('/^XV-[A-Z2-9]{8}$/', $code)) {
         return ['ok' => false, 'reason' => 'invalid_format'];
     }
 
@@ -575,6 +1030,20 @@ $pdo->exec("CREATE TABLE IF NOT EXISTS email_send_log (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     INDEX idx_email_time (email, created_at),
     INDEX idx_ip_time (ip_address, created_at)
+)");
+
+// Inbound email verification: Message-ID dedup + audit trail
+$pdo->exec("CREATE TABLE IF NOT EXISTS email_inbound_processed (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    message_id VARCHAR(255) NOT NULL,
+    from_email VARCHAR(255) DEFAULT NULL,
+    matched_otp_id INT DEFAULT NULL,
+    outcome ENUM('matched','no_token','expired','wrong_from','auth_fail','malformed') NOT NULL,
+    received_at TIMESTAMP NULL DEFAULT NULL,
+    processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE KEY uq_message_id (message_id),
+    INDEX idx_processed_at (processed_at),
+    INDEX idx_outcome (outcome)
 )");
 
 // Add can_share permission for users
@@ -1046,10 +1515,8 @@ function renderEmailAddBanner($pdo) {
     return '<div style="background:#fef3c7;border:1px solid #f59e0b;color:#78350f;'
          . 'padding:12px 18px;border-radius:8px;margin:12px 0;display:flex;'
          . 'align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap" dir="rtl">'
-         . '<div>📧 <strong>برای امنیت بیشتر و امکان بازیابی رمز عبور</strong>، یک ایمیل به حساب خود اضافه کنید.</div>'
+         . '<div>📧 <strong>برای فعال‌سازی بازیابی رمز عبور</strong>، از ادمین بخواه ایمیلت را ثبت کند.</div>'
          . '<div style="display:flex;gap:8px">'
-         . '<a href="?action=email_add_step1" style="background:#f59e0b;color:#fff;padding:8px 16px;'
-         . 'border-radius:6px;text-decoration:none;font-weight:600;font-size:.85rem">افزودن ایمیل</a>'
          . '<a href="?action=email_add_dismiss" style="color:#78350f;padding:8px 12px;'
          . 'text-decoration:none;font-size:.85rem">بستن</a>'
          . '</div></div>';
@@ -1188,18 +1655,9 @@ foreach(['ALTER TABLE users MODIFY COLUMN password VARCHAR(255) NOT NULL','ALTER
 $pdo->exec("UPDATE users SET can_download=1,can_change_password=1,can_delete=1,can_share=1 WHERE role='admin'");
 
 $defaultSettings = [
-    'smtp_host'                       => 'xcloud.retrivo.ir',
-    'smtp_port'                       => '465',
-    'smtp_encryption'                 => 'ssl',
-    'smtp_username'                   => 'otp@xcloud.retrivo.ir',
-    'smtp_password'                   => '',
-    'smtp_from_email'                 => 'otp@xcloud.retrivo.ir',
-    'smtp_from_name'                  => 'XCloud',
-    'smtp_timeout'                    => '15',
-    'smtp_debug'                      => '0',
     'registration_enabled'            => '0',
-    'otp_length'                      => '6',
-    'otp_ttl_minutes'                 => '10',
+    'otp_length'                      => '8',
+    'otp_ttl_minutes'                 => '30',
     'otp_resend_cooldown_seconds'     => '60',
     'otp_max_attempts'                => '5',
     'otp_max_per_email_per_hour'      => '5',
@@ -1210,11 +1668,31 @@ $defaultSettings = [
     'default_user_can_delete'         => '0',
     'default_user_can_share'          => '0',
     'setup_completed'                 => '0',
+    // Inbound email verification (reverse OTP)
+    'inbound_enabled'                 => '1',
+    'inbound_host'                    => 'mail.retrivo.ir',
+    'inbound_port'                    => '993',
+    'inbound_encryption'              => 'ssl',
+    'inbound_username'                => 'xcloud@retrivo.ir',
+    'inbound_password'                => '',
+    'inbound_inbox_folder'            => 'INBOX',
+    'inbound_processed_folder'        => 'INBOX.XCloud-Processed',
+    'inbound_rejected_folder'         => 'INBOX.XCloud-Rejected',
+    'inbound_to_address'              => 'xcloud@retrivo.ir',
+    'inbound_mta_hostname'            => '',
+    'inbound_require_spf_or_dkim'     => '1',
+    'inbound_cron_secret'             => '',
+    'inbound_max_messages_per_run'    => '50',
+    'inbound_last_cron_run_at'        => '',
+    'inbound_last_cron_result'        => '',
 ];
 foreach($defaultSettings as $k=>$v){
     $pdo->prepare("INSERT IGNORE INTO settings (setting_key,setting_value) VALUES(?,?)")
         ->execute([$k,$v]);
 }
+
+// Cleanup of legacy SMTP rows (one-shot per request, idempotent)
+try { $pdo->exec("DELETE FROM settings WHERE setting_key IN ('smtp_host','smtp_port','smtp_encryption','smtp_username','smtp_password','smtp_from_email','smtp_from_name','smtp_timeout','smtp_debug')"); } catch (\Exception $e) {}
 
 $ca=$pdo->query("SELECT id,password FROM users WHERE username='admin'")->fetch();
 if(!$ca){$h=password_hash('1234',PASSWORD_DEFAULT);$s=$pdo->prepare("INSERT INTO users (username,password,role) VALUES('admin',?,'admin')");$s->execute([$h]);}
@@ -1356,32 +1834,16 @@ if ($action == 'setup_wizard' || strpos($action, 'setup_') === 0) {
     }
 }
 
-// ─── Pre-flight check (returns array of [name, ok, detail]) ──
 function setup_preflight_checks($pdo) {
     $checks = [];
-
-    // PHP version
     $checks[] = ['PHP version (>= 7.4)', version_compare(PHP_VERSION, '7.4.0', '>='), PHP_VERSION];
-
-    // Required extensions
-    foreach (['pdo_mysql', 'openssl', 'mbstring', 'fileinfo'] as $ext) {
+    foreach (['pdo_mysql','openssl','mbstring','fileinfo'] as $ext) {
         $checks[] = ["PHP extension: $ext", extension_loaded($ext), extension_loaded($ext) ? 'loaded' : 'MISSING'];
     }
-    $checks[] = ['PHP extension: gd (for captcha)', extension_loaded('gd'), extension_loaded('gd') ? 'loaded' : 'MISSING — captcha will fall back to text'];
-
-    // PHPMailer files
-    $files = ['PHPMailer.php', 'SMTP.php', 'Exception.php'];
-    foreach ($files as $f) {
-        $p = __DIR__ . "/lib/PHPMailer/$f";
-        $checks[] = ["lib/PHPMailer/$f", file_exists($p), file_exists($p) ? 'present' : 'MISSING'];
-    }
-
-    // PHPMailer class loadable
-    $checks[] = ['PHPMailer class', class_exists('PHPMailer\PHPMailer\PHPMailer'),
-                 class_exists('PHPMailer\PHPMailer\PHPMailer') ? 'loaded' : 'NOT LOADED'];
-
-    // Required tables
-    foreach (['users', 'settings', 'email_otps', 'email_send_log', 'activity_log'] as $tbl) {
+    $checks[] = ['PHP extension: gd (for captcha)', extension_loaded('gd'), extension_loaded('gd') ? 'loaded' : 'MISSING — captcha falls back to text'];
+    $checks[] = ['PHP extension: imap (preferred)', function_exists('imap_open'),
+                 function_exists('imap_open') ? 'loaded' : 'missing — socket fallback will be used'];
+    foreach (['users','settings','email_otps','email_send_log','email_inbound_processed','activity_log'] as $tbl) {
         try {
             $pdo->query("SELECT 1 FROM `$tbl` LIMIT 1");
             $checks[] = ["Table: $tbl", true, 'exists'];
@@ -1389,176 +1851,25 @@ function setup_preflight_checks($pdo) {
             $checks[] = ["Table: $tbl", false, 'MISSING'];
         }
     }
-
-    // Required users columns
     try {
         $cols = $pdo->query("SHOW COLUMNS FROM users")->fetchAll(PDO::FETCH_COLUMN);
-        foreach (['email', 'email_verified', 'email_verified_at'] as $c) {
+        foreach (['email','email_verified','email_verified_at'] as $c) {
             $checks[] = ["users.$c column", in_array($c, $cols), in_array($c, $cols) ? 'exists' : 'MISSING'];
         }
     } catch (\Exception $e) {
         $checks[] = ['users columns check', false, $e->getMessage()];
     }
-
-    // Required settings keys
-    $required = ['smtp_host', 'smtp_port', 'smtp_username', 'smtp_from_email', 'otp_pepper',
-                 'registration_enabled', 'otp_length', 'otp_ttl_minutes'];
-    foreach ($required as $key) {
+    foreach (['otp_pepper','registration_enabled','inbound_enabled','inbound_host','inbound_username','inbound_to_address'] as $key) {
         $val = getSetting($pdo, $key, null);
         $checks[] = ["Setting: $key", $val !== null, $val !== null ? 'present' : 'MISSING'];
     }
-
-    // SMTP password set
-    $smtpPass = getSetting($pdo, 'smtp_password', '');
-    $checks[] = ['SMTP password configured', !empty($smtpPass), !empty($smtpPass) ? 'set' : 'EMPTY (will be set in next step)'];
-
-    // Admin has email
-    $st = $pdo->prepare("SELECT email FROM users WHERE username = ?");
-    $st->execute([$_SESSION['user']]);
-    $adminEmail = $st->fetchColumn();
-    $checks[] = ['Admin user has email', !empty($adminEmail), !empty($adminEmail) ? $adminEmail : 'OPTIONAL (will be set if needed for tests)'];
-
+    $hasInboundPw = getSetting($pdo, 'inbound_password', '') !== '';
+    $checks[] = ['Inbound IMAP password configured', $hasInboundPw, $hasInboundPw ? 'set' : 'EMPTY (set in Inbound Settings)'];
+    $hasCron = getSetting($pdo, 'inbound_cron_secret', '') !== '';
+    $checks[] = ['Inbound cron secret configured', $hasCron, $hasCron ? 'set' : 'EMPTY (set in Inbound Settings)'];
     return $checks;
 }
 
-// ─── POST: Save SMTP config ──────────────────────────────────
-if ($action == 'setup_save_smtp') {
-    if (!isset($_SESSION['user']) || $_SESSION['role'] !== 'admin') { die('Forbidden'); }
-    verifyCsrf();
-    $fields = ['smtp_host', 'smtp_port', 'smtp_encryption', 'smtp_username',
-               'smtp_from_email', 'smtp_from_name'];
-    foreach ($fields as $f) {
-        if (isset($_POST[$f])) setSetting($pdo, $f, trim($_POST[$f]));
-    }
-    // Password only updates if non-empty (preserves existing on re-save)
-    if (!empty($_POST['smtp_password'])) {
-        setSetting($pdo, 'smtp_password', $_POST['smtp_password']);
-    }
-    logActivity($pdo, $_SESSION['user'], 'setup_smtp_saved');
-    header("Location: ?action=setup_wizard&msg=smtp_saved"); exit;
-}
-
-// ─── GET: SMTP network diagnostics ───────────────────────────
-if ($action == 'setup_smtp_diagnose') {
-    if (!isset($_SESSION['user']) || $_SESSION['role'] !== 'admin') { die('Forbidden'); }
-    header('Content-Type: application/json; charset=utf-8');
-
-    $host = getSetting($pdo, 'smtp_host');
-    $port = (int)getSetting($pdo, 'smtp_port', 465);
-    $result = ['host' => $host, 'port' => $port, 'tests' => []];
-
-    $ip = gethostbyname($host);
-    $result['tests'][] = [
-        'name'   => 'DNS resolution',
-        'ok'     => ($ip !== $host && filter_var($ip, FILTER_VALIDATE_IP)),
-        'detail' => $ip !== $host ? "Resolved to $ip" : 'FAILED — host not resolvable',
-    ];
-
-    $errno = 0; $errstr = '';
-    $start = microtime(true);
-    $sock = @stream_socket_client("tcp://$host:$port", $errno, $errstr, 3);
-    $elapsed = round((microtime(true) - $start) * 1000);
-    if ($sock) {
-        $result['tests'][] = [
-            'name'   => "TCP connect to $host:$port",
-            'ok'     => true,
-            'detail' => "Connected in {$elapsed}ms",
-        ];
-        fclose($sock);
-    } else {
-        $result['tests'][] = [
-            'name'   => "TCP connect to $host:$port",
-            'ok'     => false,
-            'detail' => "FAILED ({$elapsed}ms) — errno=$errno, $errstr — likely outbound firewall blocks port $port",
-        ];
-    }
-
-    foreach ([465, 587, 25, 2525] as $altPort) {
-        if ($altPort === $port) continue;
-        $sock = @stream_socket_client("tcp://$host:$altPort", $errno, $errstr, 2);
-        if ($sock) {
-            $result['tests'][] = [
-                'name'   => "Alternative port $altPort",
-                'ok'     => true,
-                'detail' => 'Reachable — try this port instead',
-            ];
-            fclose($sock);
-        }
-    }
-
-    echo json_encode($result, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE);
-    exit;
-}
-
-// ─── POST: Send test email ───────────────────────────────────
-if ($action == 'setup_test_email') {
-    if (!isset($_SESSION['user']) || $_SESSION['role'] !== 'admin') { die('Forbidden'); }
-    verifyCsrf();
-    $to = trim($_POST['test_email'] ?? '');
-    if (!validate_email_address($to)) {
-        header("Location: ?action=setup_wizard&error=invalid_email"); exit;
-    }
-    $subject = 'XCloud — تست SMTP';
-    $html = '<!DOCTYPE html><html lang="fa" dir="rtl"><body style="font-family:Tahoma">'
-          . '<div style="max-width:500px;margin:30px auto;padding:24px;background:#f1f5f9;border-radius:12px">'
-          . '<h2 style="color:#1e40af">✅ XCloud SMTP کار می‌کند</h2>'
-          . '<p>این یک پیام تست از Setup Wizard است. اگر این ایمیل را دریافت کردید، '
-          . 'پیکربندی SMTP شما کاملاً موفق بوده است.</p>'
-          . '<p style="color:#64748b;font-size:.85rem">زمان ارسال: ' . date('Y-m-d H:i:s') . '</p>'
-          . '</div></body></html>';
-    $result = xcloud_send_email($pdo, $to, $subject, $html, null, 'setup_test');
-    if ($result['ok']) {
-        $_SESSION['setup_test_email_ok'] = true;
-        logActivity($pdo, $_SESSION['user'], 'setup_test_email_sent', $to);
-        header("Location: ?action=setup_wizard&msg=test_sent&to=" . urlencode($to)); exit;
-    }
-    header("Location: ?action=setup_wizard&error=test_failed&detail=" . urlencode(mb_substr($result['error'], 0, 200))); exit;
-}
-
-// ─── POST: Smoke test - send OTP for a purpose ──────────────
-if ($action == 'setup_smoke_send') {
-    if (!isset($_SESSION['user']) || $_SESSION['role'] !== 'admin') { die('Forbidden'); }
-    verifyCsrf();
-    $purpose = $_POST['purpose'] ?? 'register';
-    $email = trim(mb_strtolower($_POST['smoke_email'] ?? ''));
-    if (!in_array($purpose, ['register', 'password_reset', 'email_add'], true)) {
-        die('Invalid purpose');
-    }
-    if (!validate_email_address($email)) {
-        header("Location: ?action=setup_wizard&error=invalid_email"); exit;
-    }
-    $payload = json_encode(['smoke_test' => true, 'admin' => $_SESSION['user']]);
-    $result = request_email_otp($pdo, $email, $purpose, $payload);
-    if (!$result['ok']) {
-        header("Location: ?action=setup_wizard&error=smoke_send_failed&purpose=" . urlencode($purpose)
-             . "&detail=" . urlencode($result['reason'] ?? 'unknown')); exit;
-    }
-    $_SESSION['setup_smoke'][$purpose] = ['email' => $email, 'expires_at' => $result['expires_at']];
-    header("Location: ?action=setup_wizard&msg=smoke_sent&purpose=" . urlencode($purpose)); exit;
-}
-
-// ─── POST: Smoke test - verify OTP that admin received ──────
-if ($action == 'setup_smoke_verify') {
-    if (!isset($_SESSION['user']) || $_SESSION['role'] !== 'admin') { die('Forbidden'); }
-    verifyCsrf();
-    $purpose = $_POST['purpose'] ?? 'register';
-    $code = trim($_POST['smoke_code'] ?? '');
-    if (empty($_SESSION['setup_smoke'][$purpose])) {
-        header("Location: ?action=setup_wizard&error=smoke_no_pending"); exit;
-    }
-    $email = $_SESSION['setup_smoke'][$purpose]['email'];
-    $verify = verify_email_otp($pdo, $email, $code, $purpose);
-    if ($verify['ok']) {
-        $_SESSION['setup_smoke_done'][$purpose] = true;
-        unset($_SESSION['setup_smoke'][$purpose]);
-        logActivity($pdo, $_SESSION['user'], 'setup_smoke_verified', $purpose);
-        header("Location: ?action=setup_wizard&msg=smoke_ok&purpose=" . urlencode($purpose)); exit;
-    }
-    header("Location: ?action=setup_wizard&error=smoke_verify_failed&purpose=" . urlencode($purpose)
-         . "&reason=" . urlencode($verify['reason'])); exit;
-}
-
-// ─── POST: Enable registration ───────────────────────────────
 if ($action == 'setup_enable_registration') {
     if (!isset($_SESSION['user']) || $_SESSION['role'] !== 'admin') { die('Forbidden'); }
     verifyCsrf();
@@ -1567,233 +1878,80 @@ if ($action == 'setup_enable_registration') {
     header("Location: ?action=setup_wizard&msg=registration_on"); exit;
 }
 
-// ─── POST: Lock the wizard ───────────────────────────────────
 if ($action == 'setup_lock') {
     if (!isset($_SESSION['user']) || $_SESSION['role'] !== 'admin') { die('Forbidden'); }
     verifyCsrf();
     setSetting($pdo, 'setup_completed', '1');
     logActivity($pdo, $_SESSION['user'], 'setup_completed');
-    unset($_SESSION['setup_smoke'], $_SESSION['setup_smoke_done'], $_SESSION['setup_test_email_ok']);
     header("Location: ?action=dashboard&msg=setup_locked"); exit;
 }
 
-// ─── GET: The wizard page itself ─────────────────────────────
 if ($action == 'setup_wizard') {
     $checks = setup_preflight_checks($pdo);
     $allGreen = true;
     foreach ($checks as $c) if (!$c[1]) { $allGreen = false; break; }
     $csrf = generateCsrfToken();
     $msg = $_GET['msg'] ?? '';
-    $err = $_GET['error'] ?? '';
-    $smokeDone = $_SESSION['setup_smoke_done'] ?? [];
-    $testEmailOk = !empty($_SESSION['setup_test_email_ok']);
     $regEnabled = getSetting($pdo, 'registration_enabled') === '1';
-
-    // Current SMTP values for the form
-    $smtpVals = [
-        'smtp_host' => getSetting($pdo, 'smtp_host'),
-        'smtp_port' => getSetting($pdo, 'smtp_port'),
-        'smtp_encryption' => getSetting($pdo, 'smtp_encryption', 'ssl'),
-        'smtp_username' => getSetting($pdo, 'smtp_username'),
-        'smtp_from_email' => getSetting($pdo, 'smtp_from_email'),
-        'smtp_from_name' => getSetting($pdo, 'smtp_from_name', 'XCloud'),
-        'smtp_password_set' => !empty(getSetting($pdo, 'smtp_password')),
-    ];
 ?>
-<!DOCTYPE html>
-<html lang="fa" dir="rtl">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Setup Wizard — XCloud</title>
+<!DOCTYPE html><html lang="fa" dir="rtl"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Setup Wizard — XCloud</title>
+<?= renderHeadAssets() ?>
 <style>
-body{margin:0;font-family:Tahoma,sans-serif;background:#0f172a;color:#e2e8f0;padding:30px 15px}
-.wrap{max-width:760px;margin:0 auto}
-h1{color:#f1f5f9;font-size:1.6rem;margin:0 0 4px}
-.lead{color:#94a3b8;margin:0 0 24px}
-.card{background:#1e293b;border:1px solid #334155;border-radius:12px;padding:22px 24px;margin-bottom:18px}
-.card h2{margin:0 0 14px;color:#f1f5f9;font-size:1.05rem;display:flex;align-items:center;gap:8px}
-.badge{font-size:.7rem;padding:2px 8px;border-radius:99px;font-weight:600}
-.badge-ok{background:#14532d;color:#bbf7d0}
-.badge-pending{background:#713f12;color:#fde68a}
-.check-row{display:flex;justify-content:space-between;align-items:center;padding:7px 0;border-bottom:1px solid #334155;font-size:.85rem}
-.check-row:last-child{border:none}
-.check-ok{color:#86efac}
-.check-fail{color:#fca5a5}
-.field{margin-bottom:12px}
-label{display:block;color:#cbd5e1;font-size:.8rem;margin-bottom:4px;font-weight:600}
-input,select{width:100%;background:#0f172a;border:1px solid #334155;color:#f1f5f9;padding:9px 11px;border-radius:7px;font-family:inherit;font-size:.85rem;box-sizing:border-box}
-.row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
-.btn{background:#3b82f6;color:#fff;border:none;padding:10px 18px;border-radius:7px;font-weight:600;cursor:pointer;font-family:inherit;font-size:.85rem}
-.btn-green{background:#16a34a}
-.btn-red{background:#dc2626}
-.btn-gray{background:#475569}
-.btn:disabled{background:#334155;color:#64748b;cursor:not-allowed}
-.msg{padding:10px 14px;border-radius:7px;margin-bottom:14px;font-size:.85rem}
+body{margin:0;font-family:Tahoma,sans-serif;background:#0a0e1a;color:#e2e8f0;padding:24px}
+.wrap{max-width:780px;margin:0 auto}
+h1{font-size:1.3rem;margin:0 0 8px;color:#f1f5f9}
+.subtitle{color:#94a3b8;font-size:.88rem;margin-bottom:24px}
+.card{background:#111827;border:1px solid #1e293b;border-radius:14px;padding:18px;margin-bottom:14px}
+.card h2{font-size:.95rem;margin:0 0 12px;color:#e2e8f0}
+.check{display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid #1e293b;font-size:.82rem}
+.check:last-child{border:none}
+.check .ok{color:#86efac}.check .bad{color:#fca5a5}
+.btn{display:inline-block;padding:10px 16px;background:linear-gradient(135deg,#3b82f6,#6366f1);color:#fff;border:none;border-radius:10px;font-weight:700;cursor:pointer;font-family:inherit;text-decoration:none;font-size:.88rem}
+.btn-red{background:linear-gradient(135deg,#ef4444,#b91c1c)}
+.btn[disabled]{opacity:.45;cursor:not-allowed}
+.msg{padding:10px 14px;border-radius:8px;margin-bottom:14px;font-size:.85rem;text-align:center}
 .msg-ok{background:#14532d;color:#bbf7d0}
-.msg-err{background:#7f1d1d;color:#fee2e2}
-.msg-info{background:#1e3a8a;color:#dbeafe}
-.inline-form{display:flex;gap:8px;flex-wrap:wrap;align-items:end}
-.inline-form .field{flex:1;min-width:200px;margin:0}
-.smoke-grid{display:grid;grid-template-columns:1fr;gap:12px}
-.smoke-item{background:#0f172a;border:1px solid #334155;border-radius:8px;padding:14px}
-.smoke-item h3{margin:0 0 10px;color:#cbd5e1;font-size:.9rem}
-.hint{color:#64748b;font-size:.75rem;margin-top:4px}
-</style>
-</head>
-<body>
-<div class="wrap">
-  <h1>🛠️ Setup Wizard — XCloud v3.2</h1>
-  <p class="lead">پیکربندی خودکار پس از deploy. هر مرحله را به ترتیب کامل کنید، در پایان دکمه «قفل کردن Setup» را بزنید.</p>
+</style></head><body><div class="wrap">
+<h1>🪄 Setup Wizard</h1>
+<div class="subtitle">پیش‌نیازها را بررسی کن، تنظیمات دریافت ایمیل را در صفحهٔ مربوطه کامل کن، و وقتی همه‌چیز سبز شد، ثبت‌نام را روشن و wizard را قفل کن.</div>
 
-  <?php if ($msg === 'smtp_saved'): ?><div class="msg msg-ok">✅ تنظیمات SMTP ذخیره شد.</div><?php endif; ?>
-  <?php if ($msg === 'test_sent'): ?><div class="msg msg-ok">📨 ایمیل تست به <?= h($_GET['to'] ?? '') ?> ارسال شد. صندوق ورودی را چک کنید.</div><?php endif; ?>
-  <?php if ($msg === 'smoke_sent'): ?><div class="msg msg-info">📨 OTP برای smoke test (<?= h($_GET['purpose']) ?>) ارسال شد. کد را از ایمیل وارد کنید.</div><?php endif; ?>
-  <?php if ($msg === 'smoke_ok'): ?><div class="msg msg-ok">✅ Smoke test برای <?= h($_GET['purpose']) ?> موفق بود.</div><?php endif; ?>
-  <?php if ($msg === 'registration_on'): ?><div class="msg msg-ok">✅ ثبت‌نام عمومی فعال شد.</div><?php endif; ?>
+<?php if ($msg === 'registration_on'): ?><div class="msg msg-ok">✅ ثبت‌نام عمومی فعال شد</div><?php endif; ?>
 
-  <?php if ($err === 'invalid_email'): ?><div class="msg msg-err">⚠️ فرمت ایمیل نامعتبر است.</div><?php endif; ?>
-  <?php if ($err === 'test_failed'): ?><div class="msg msg-err">❌ ارسال ایمیل تست شکست خورد. جزئیات: <?= h($_GET['detail'] ?? '') ?></div><?php endif; ?>
-  <?php if ($err === 'smoke_send_failed'): ?><div class="msg msg-err">❌ ارسال smoke OTP شکست خورد (<?= h($_GET['purpose']) ?>): <?= h($_GET['detail'] ?? '') ?></div><?php endif; ?>
-  <?php if ($err === 'smoke_verify_failed'): ?><div class="msg msg-err">❌ تأیید smoke OTP شکست خورد (<?= h($_GET['purpose']) ?>): <?= h($_GET['reason'] ?? '') ?></div><?php endif; ?>
-
-  <!-- ─── Step 1: Pre-flight ─── -->
-  <div class="card">
-    <h2>۱. بررسی پیش‌نیازها <span class="badge <?= $allGreen ? 'badge-ok' : 'badge-pending' ?>"><?= $allGreen ? 'OK' : 'مشکل دارد' ?></span></h2>
-    <?php foreach ($checks as $c): ?>
-      <div class="check-row">
-        <span><?= h($c[0]) ?></span>
-        <span class="<?= $c[1] ? 'check-ok' : 'check-fail' ?>"><?= $c[1] ? '✅' : '❌' ?> <?= h($c[2]) ?></span>
-      </div>
-    <?php endforeach; ?>
-    <div style="margin-top:12px"><a href="?action=setup_wizard" class="btn btn-gray">🔄 بررسی مجدد</a></div>
-  </div>
-
-  <!-- ─── Step 2: SMTP Config ─── -->
-  <div class="card">
-    <h2>۲. پیکربندی SMTP <?php if ($smtpVals['smtp_password_set']): ?><span class="badge badge-ok">پسورد تنظیم شده</span><?php endif; ?></h2>
-    <form method="POST" action="?action=setup_save_smtp">
-      <input type="hidden" name="csrf_token" value="<?= h($csrf) ?>">
-      <div class="row">
-        <div class="field"><label>Host</label><input type="text" name="smtp_host" value="<?= h($smtpVals['smtp_host']) ?>" required></div>
-        <div class="field"><label>Port</label><input type="number" name="smtp_port" value="<?= h($smtpVals['smtp_port']) ?>" required></div>
-      </div>
-      <div class="row">
-        <div class="field"><label>Encryption</label>
-          <select name="smtp_encryption">
-            <option value="ssl" <?= $smtpVals['smtp_encryption']==='ssl'?'selected':'' ?>>SSL (port 465)</option>
-            <option value="tls" <?= $smtpVals['smtp_encryption']==='tls'?'selected':'' ?>>TLS (port 587)</option>
-            <option value="none" <?= $smtpVals['smtp_encryption']==='none'?'selected':'' ?>>None</option>
-          </select>
-        </div>
-        <div class="field"><label>Username</label><input type="text" name="smtp_username" value="<?= h($smtpVals['smtp_username']) ?>" required></div>
-      </div>
-      <div class="field">
-        <label>Password</label>
-        <input type="password" name="smtp_password" placeholder="<?= $smtpVals['smtp_password_set'] ? 'بدون تغییر — برای تغییر، مقدار جدید وارد کنید' : 'وارد کنید' ?>" autocomplete="new-password">
-        <div class="hint">برای حفظ پسورد فعلی این فیلد را خالی بگذارید</div>
-      </div>
-      <div class="row">
-        <div class="field"><label>From Email</label><input type="email" name="smtp_from_email" value="<?= h($smtpVals['smtp_from_email']) ?>" required></div>
-        <div class="field"><label>From Name</label><input type="text" name="smtp_from_name" value="<?= h($smtpVals['smtp_from_name']) ?>"></div>
-      </div>
-      <button class="btn btn-green">ذخیره تنظیمات SMTP</button>
-    </form>
-  </div>
-
-  <!-- ─── Step 3: Test SMTP ─── -->
-  <div class="card">
-    <h2>۳. تست ارسال SMTP <?php if ($testEmailOk): ?><span class="badge badge-ok">✓ موفق</span><?php endif; ?></h2>
-    <p style="color:#94a3b8;font-size:.85rem;margin:0 0 12px">یک ایمیل ساده به آدرس زیر ارسال می‌شود تا اتصال SMTP را بررسی کنیم.</p>
-    <div style="margin-bottom:14px">
-      <button type="button" onclick="diagnose()" class="btn" style="background:#475569">🔍 بررسی اتصال SMTP</button>
-      <pre id="diagResult" style="background:#0a0e1a;padding:12px;border-radius:8px;display:none;direction:ltr;text-align:left;font-family:monospace;font-size:.8rem;color:#94a3b8;white-space:pre-wrap;margin-top:10px"></pre>
-      <script>
-      async function diagnose(){
-        var pre = document.getElementById('diagResult');
-        pre.style.display='block';
-        pre.textContent='در حال بررسی...';
-        try {
-          var r = await fetch('?action=setup_smtp_diagnose');
-          pre.textContent = await r.text();
-        } catch(e) { pre.textContent = 'خطا: ' + e.message; }
-      }
-      </script>
-    </div>
-    <form method="POST" action="?action=setup_test_email" class="inline-form">
-      <input type="hidden" name="csrf_token" value="<?= h($csrf) ?>">
-      <div class="field"><label>ایمیل تست</label><input type="email" name="test_email" required placeholder="your@email.com"></div>
-      <button class="btn">📧 ارسال ایمیل تست</button>
-    </form>
-  </div>
-
-  <!-- ─── Step 4: Smoke Tests (E2E for each purpose) ─── -->
-  <div class="card">
-    <h2>۴. Smoke Test کامل end-to-end</h2>
-    <p style="color:#94a3b8;font-size:.85rem;margin:0 0 14px">برای هر کدوم از سه نوع OTP، یک ایمیل واقعی ارسال می‌شه. کدی که دریافت می‌کنید رو وارد کنید تا verify بشه.</p>
-    <div class="smoke-grid">
-      <?php foreach (['register' => 'ثبت‌نام', 'password_reset' => 'بازیابی رمز', 'email_add' => 'افزودن ایمیل'] as $p => $label): ?>
-        <div class="smoke-item">
-          <h3><?= h($label) ?> <?php if (!empty($smokeDone[$p])): ?><span class="badge badge-ok">✓ تأیید شد</span><?php endif; ?></h3>
-          <?php if (!empty($smokeDone[$p])): ?>
-            <div style="color:#86efac;font-size:.85rem">این تست با موفقیت انجام شده است.</div>
-          <?php elseif (!empty($_SESSION['setup_smoke'][$p])): ?>
-            <div style="color:#fde68a;font-size:.85rem;margin-bottom:8px">📨 OTP به <code><?= h($_SESSION['setup_smoke'][$p]['email']) ?></code> ارسال شد. کد را وارد کنید:</div>
-            <form method="POST" action="?action=setup_smoke_verify" class="inline-form">
-              <input type="hidden" name="csrf_token" value="<?= h($csrf) ?>">
-              <input type="hidden" name="purpose" value="<?= h($p) ?>">
-              <div class="field"><input type="text" name="smoke_code" required inputmode="numeric" pattern="\d{4,8}" placeholder="کد ۶ رقمی" autocomplete="off"></div>
-              <button class="btn btn-green">تأیید کد</button>
-            </form>
-          <?php else: ?>
-            <form method="POST" action="?action=setup_smoke_send" class="inline-form">
-              <input type="hidden" name="csrf_token" value="<?= h($csrf) ?>">
-              <input type="hidden" name="purpose" value="<?= h($p) ?>">
-              <div class="field"><input type="email" name="smoke_email" required placeholder="ایمیل برای ارسال تست"></div>
-              <button class="btn">📨 ارسال OTP</button>
-            </form>
-          <?php endif; ?>
-        </div>
-      <?php endforeach; ?>
-    </div>
-  </div>
-
-  <!-- ─── Step 5: Enable Registration ─── -->
-  <div class="card">
-    <h2>۵. فعال‌سازی ثبت‌نام عمومی <?php if ($regEnabled): ?><span class="badge badge-ok">فعال</span><?php endif; ?></h2>
-    <?php if (!$regEnabled): ?>
-      <p style="color:#94a3b8;font-size:.85rem;margin:0 0 12px">پس از فعال‌سازی، کاربران جدید می‌توانند با ایمیل ثبت‌نام کنند.</p>
-      <form method="POST" action="?action=setup_enable_registration" style="margin:0">
-        <input type="hidden" name="csrf_token" value="<?= h($csrf) ?>">
-        <button class="btn btn-green">✅ فعال کردن ثبت‌نام</button>
-      </form>
-    <?php else: ?>
-      <p style="color:#86efac;font-size:.85rem;margin:0">ثبت‌نام عمومی فعال است. می‌توانید بعداً از پنل ادمین آن را غیرفعال کنید.</p>
-    <?php endif; ?>
-  </div>
-
-  <!-- ─── Step 6: Lock Setup ─── -->
-  <div class="card" style="border-color:#f59e0b">
-    <h2>۶. قفل کردن Setup Wizard</h2>
-    <p style="color:#94a3b8;font-size:.85rem;margin:0 0 14px">پس از قفل کردن، این صفحه دیگر قابل دسترس نخواهد بود (مگر اینکه با phpMyAdmin مقدار <code>setup_completed</code> را به <code>0</code> برگردانید).</p>
-    <?php
-    $allDone = $allGreen && $testEmailOk && count($smokeDone) === 3;
-    ?>
-    <?php if (!$allDone): ?>
-      <div class="msg msg-info">⚠️ لطفاً قبل از قفل کردن، همه‌ی مراحل بالا را کامل کنید (پیش‌نیازها سبز، تست SMTP موفق، هر سه smoke test تأیید شده).</div>
-    <?php endif; ?>
-    <form method="POST" action="?action=setup_lock" style="margin:0" onsubmit="return confirm('Setup را قفل کنیم؟ این صفحه دیگر در دسترس نخواهد بود.');">
-      <input type="hidden" name="csrf_token" value="<?= h($csrf) ?>">
-      <button class="btn btn-red" <?= $allDone ? '' : 'disabled' ?>>🔒 قفل کردن Setup</button>
-    </form>
-  </div>
-
-  <p style="text-align:center;color:#475569;font-size:.75rem;margin-top:24px">
-    XCloud Setup Wizard v1.0 — برای دسترسی مجدد بعد از قفل، در phpMyAdmin مقدار <code>setup_completed</code> در جدول <code>settings</code> را به <code>0</code> تغییر دهید.
-  </p>
+<div class="card">
+  <h2>1. پیش‌نیازها</h2>
+  <?php foreach ($checks as $c): ?>
+    <div class="check"><span><?= h($c[0]) ?></span><span class="<?= $c[1] ? 'ok' : 'bad' ?>"><?= h($c[2]) ?></span></div>
+  <?php endforeach; ?>
 </div>
-</body>
-</html>
+
+<div class="card">
+  <h2>2. تنظیمات دریافت ایمیل (IMAP)</h2>
+  <p style="font-size:.85rem;color:#94a3b8;margin-bottom:12px">برای ساخت اتصال IMAP و آزمایش اتصال، به صفحهٔ <a href="?action=inbound_settings" style="color:#60a5fa">دریافت ایمیل</a> برو. آنجا باید رمز IMAP، آدرس MTA، و cron secret را تنظیم کنی.</p>
+  <a class="btn" href="?action=inbound_settings">باز کردن تنظیمات دریافت</a>
+</div>
+
+<div class="card">
+  <h2>3. فعال‌سازی ثبت‌نام</h2>
+  <p style="font-size:.85rem;color:#94a3b8;margin-bottom:12px">وضعیت فعلی: <?= $regEnabled ? '<span style="color:#86efac">فعال</span>' : '<span style="color:#fca5a5">غیرفعال</span>' ?></p>
+  <?php if (!$regEnabled): ?>
+    <form method="POST" action="?action=setup_enable_registration" style="margin:0">
+      <input type="hidden" name="csrf_token" value="<?= h($csrf) ?>">
+      <button class="btn">فعال‌سازی ثبت‌نام عمومی</button>
+    </form>
+  <?php else: ?>
+    <div style="color:#86efac;font-size:.85rem">✓ ثبت‌نام عمومی فعال است.</div>
+  <?php endif; ?>
+</div>
+
+<div class="card">
+  <h2>4. قفل کردن Setup</h2>
+  <form method="POST" action="?action=setup_lock" style="margin:0" onsubmit="return confirm('Setup را قفل کنیم؟ این صفحه دیگر در دسترس نخواهد بود (مگر از طریق admin_unlock_setup).');">
+    <input type="hidden" name="csrf_token" value="<?= h($csrf) ?>">
+    <button class="btn btn-red" <?= $allGreen ? '' : 'disabled' ?>>🔒 قفل کردن</button>
+  </form>
+  <?php if (!$allGreen): ?><p style="color:#fca5a5;font-size:.78rem;margin-top:8px">برای قفل کردن، همهٔ پیش‌نیازها باید سبز باشند.</p><?php endif; ?>
+</div>
+</div></body></html>
 <?php
     exit;
 }
@@ -3035,6 +3193,40 @@ if($action=='admin_change_password'){
     header("Location: ?action=users&msg=password_error");exit;
 }
 
+if ($action == 'admin_set_email') {
+    if (!isset($_SESSION['user']) || $_SESSION['role'] !== 'admin') die("دسترسی غیرمجاز!");
+    verifyCsrf();
+    $uid = (int)($_POST['user_id'] ?? 0);
+    $email = trim(mb_strtolower($_POST['email'] ?? ''));
+    $clear = !empty($_POST['clear_email']);
+    if ($uid <= 0) { header("Location: ?action=users&msg=email_error"); exit; }
+    $c = $pdo->prepare("SELECT username FROM users WHERE id = ?");
+    $c->execute([$uid]); $t = $c->fetch();
+    if (!$t) { header("Location: ?action=users&msg=email_error"); exit; }
+
+    if ($clear) {
+        $pdo->prepare("UPDATE users SET email = NULL, email_verified = 0, email_verified_at = NULL WHERE id = ?")
+            ->execute([$uid]);
+        logActivity($pdo, $_SESSION['user'], 'admin_email_cleared', $t['username']);
+        header("Location: ?action=users&msg=email_set"); exit;
+    }
+
+    if (!validate_email_address($email)) {
+        header("Location: ?action=users&msg=email_invalid"); exit;
+    }
+    // Conflict check
+    $ex = $pdo->prepare("SELECT id FROM users WHERE email = ? AND id <> ?");
+    $ex->execute([$email, $uid]);
+    if ($ex->fetch()) {
+        header("Location: ?action=users&msg=email_taken"); exit;
+    }
+    $verified = isset($_POST['email_verified']) ? 1 : 0;
+    $pdo->prepare("UPDATE users SET email = ?, email_verified = ?, email_verified_at = " . ($verified ? "NOW()" : "NULL") . " WHERE id = ?")
+        ->execute([$email, $verified, $uid]);
+    logActivity($pdo, $_SESSION['user'], 'admin_email_set', $t['username'], $email . ($verified ? ' (verified)' : ''));
+    header("Location: ?action=users&msg=email_set"); exit;
+}
+
 // ---- Trash Actions ----
 if($action=='trash_restore'){
     if(!isset($_SESSION['user'])||$_SESSION['role']!=='admin')die("دسترسی غیرمجاز!");verifyCsrf();
@@ -3334,29 +3526,30 @@ if ($action == 'register_step1_process') {
     $existing = $st->fetch();
 
     if ($existing) {
-        $subject = 'اطلاعات حساب شما در XCloud';
-        $html = '<div dir="rtl" style="font-family:Tahoma,sans-serif">'
-              . '<p>سلام،</p>'
-              . '<p>یک تلاش برای ثبت‌نام با ایمیل شما در XCloud انجام شد. شما قبلاً یک حساب با نام کاربری <strong>'
-              . h($existing['username']) . '</strong> دارید.</p>'
-              . '<p>اگر این درخواست از طرف شما نبود، نگران نباشید — هیچ تغییری در حساب شما اعمال نشده است.</p>'
-              . '<p>برای ورود از <a href="https://xcloud.retrivo.ir">https://xcloud.retrivo.ir</a> استفاده کنید.</p>'
-              . '<p>اگر رمز عبور خود را فراموش کرده‌اید، از گزینه «بازیابی رمز عبور» استفاده کنید.</p>'
-              . '</div>';
-        @xcloud_send_email($pdo, $email, $subject, $html, null, 'register_collision');
-
+        // Anti-enumeration: show step 2 with a fake token. The user will never
+        // be able to verify it because the OTP table has no matching row.
+        $fakeToken = generate_otp_code(8);
         $_SESSION['pending_registration'] = [
-            'email' => $email,
-            'username' => $username,
+            'email'         => $email,
+            'username'      => $username,
             'password_hash' => password_hash($password, PASSWORD_DEFAULT),
-            'fake' => true,
-            'expires_at' => date('Y-m-d H:i:s', time() + 600),
+            'token'         => $fakeToken,
+            'otp_id'        => 0,
+            'fake'          => true,
+            'expires_at'    => date('Y-m-d H:i:s', time() + 1800),
         ];
+        unset($_SESSION['pending_register_otp_id']);
+        usleep(random_int(200000, 500000));
         header("Location: ?action=register_step2"); exit;
     }
 
-    // Request OTP
-    $payload = json_encode(['username' => $username]);
+    // Issue inbound-verification token. The OTP payload carries the future
+    // user record so the inbound cron can create the account on match.
+    $passwordHash = password_hash($password, PASSWORD_DEFAULT);
+    $payload = json_encode([
+        'username'      => $username,
+        'password_hash' => $passwordHash,
+    ]);
     $result = request_email_otp($pdo, $email, 'register', $payload);
     if (!$result['ok']) {
         $err = $result['reason'] ?? 'send_failed';
@@ -3364,43 +3557,48 @@ if ($action == 'register_step1_process') {
     }
 
     $_SESSION['pending_registration'] = [
-        'email' => $email,
-        'username' => $username,
-        'password_hash' => password_hash($password, PASSWORD_DEFAULT),
-        'fake' => false,
-        'expires_at' => $result['expires_at'],
+        'email'         => $email,
+        'username'      => $username,
+        'password_hash' => $passwordHash,
+        'token'         => $result['token'],
+        'otp_id'        => $result['otp_id'],
+        'fake'          => false,
+        'expires_at'    => $result['expires_at'],
     ];
+    $_SESSION['pending_register_otp_id'] = (int)$result['otp_id'];
     logActivity($pdo, $username, 'register_otp_requested', $email);
     header("Location: ?action=register_step2"); exit;
 }
 
-// ─── GET: Step 2 form ────────────────────────────────────────
+// ─── GET: Step 2 — inbound verification "send us an email" page ─
 if ($action == 'register_step2') {
     if (!registrationEnabled($pdo)) { header("Location: index.php"); exit; }
     if (empty($_SESSION['pending_registration'])) {
         header("Location: ?action=register_step1&error=session_expired"); exit;
     }
     $pending = $_SESSION['pending_registration'];
-    $captcha = math_captcha_generate();
     $csrf = generateCsrfToken();
     $err = $_GET['error'] ?? '';
     $msg = $_GET['msg'] ?? '';
 
     $errMsg = [
-        'wrong_code'        => '⚠️ کد وارد شده اشتباه است.',
-        'expired'           => '⏰ کد منقضی شده. لطفاً «ارسال مجدد کد» را بزنید.',
-        'too_many_attempts' => '⛔ تعداد تلاش‌های اشتباه از حد مجاز عبور کرد. لطفاً کد جدید درخواست کنید.',
-        'captcha_wrong'     => '⚠️ پاسخ کپچا اشتباه است.',
-        'send_failed'       => '⚠️ ارسال مجدد ایمیل با مشکل مواجه شد.',
-        'cooldown'          => '⏳ لطفاً قبل از درخواست مجدد چند ثانیه صبر کنید.',
-        'invalid_format'    => '⚠️ کد باید فقط شامل ارقام باشد.',
-        'not_found'         => '⛔ کد فعالی یافت نشد. لطفاً «ارسال مجدد کد» را بزنید.',
+        'send_failed'    => '⚠️ صدور توکن جدید با مشکل مواجه شد.',
+        'cooldown'       => '⏳ لطفاً قبل از درخواست مجدد چند ثانیه صبر کنید.',
+        'rate_limit'     => '⏳ کمی صبر کن — یک چک خودکار به‌تازگی اجرا شده است.',
+        'check_disabled' => '⚠️ سامانهٔ دریافت ایمیل خاموش است. با ادمین تماس بگیر.',
     ][$err] ?? '';
 
     $msgText = '';
-    if ($msg === 'resent') $msgText = '✅ کد جدید ارسال شد.';
+    if ($msg === 'resent')  $msgText = '✅ توکن جدید صادر شد.';
+    if ($msg === 'checked') $msgText = '🔄 بررسی انجام شد. در حال انتظار برای پیام شما...';
 
     $expiresAtTs = strtotime($pending['expires_at']);
+    $toAddr = getSetting($pdo, 'inbound_to_address', 'xcloud@retrivo.ir');
+    $token  = $pending['token'];
+    $bodyText = 'تایید ثبت‌نام در XCloud';
+    $mailtoHref = 'mailto:' . rawurlencode($toAddr)
+        . '?subject=' . rawurlencode($token)
+        . '&body=' . rawurlencode($bodyText);
 ?>
 <!DOCTYPE html>
 <html lang="fa" dir="rtl">
@@ -3410,56 +3608,79 @@ if ($action == 'register_step2') {
 <title>تأیید ایمیل — XCloud</title>
 <style>
 body{margin:0;font-family:Tahoma,system-ui,sans-serif;background:#0f172a;color:#e2e8f0;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:20px}
-.card{max-width:440px;width:100%;background:#1e293b;border:1px solid #334155;border-radius:14px;padding:32px;box-shadow:0 10px 40px rgba(0,0,0,.3)}
-h1{font-size:1.4rem;margin:0 0 8px;color:#f1f5f9;text-align:center}
-.subtitle{color:#94a3b8;font-size:.85rem;text-align:center;margin-bottom:8px}
-.email-display{background:#0f172a;border:1px solid #334155;color:#fde68a;padding:10px;border-radius:8px;text-align:center;font-weight:600;margin-bottom:18px;font-size:.9rem;direction:ltr}
-.field{margin-bottom:16px}
-label{display:block;color:#cbd5e1;font-size:.85rem;margin-bottom:6px;font-weight:600}
-input{width:100%;background:#0f172a;border:1px solid #334155;color:#f1f5f9;padding:11px 12px;border-radius:8px;font-size:.9rem;font-family:inherit;box-sizing:border-box}
-input:focus{outline:none;border-color:#3b82f6}
-.otp-input{font-size:1.6rem;text-align:center;letter-spacing:.5em;direction:ltr;font-family:Consolas,monospace;font-weight:700}
-.captcha{background:#0f172a;border:1px dashed #475569;padding:10px 14px;border-radius:8px;color:#fde68a;font-weight:700;text-align:center;margin-bottom:8px;font-size:1rem}
-.btn{width:100%;background:#3b82f6;color:#fff;border:none;padding:12px;border-radius:8px;font-weight:700;font-size:.95rem;cursor:pointer;font-family:inherit;margin-top:8px}
+.card{max-width:520px;width:100%;background:#1e293b;border:1px solid #334155;border-radius:14px;padding:28px;box-shadow:0 10px 40px rgba(0,0,0,.3)}
+h1{font-size:1.35rem;margin:0 0 8px;color:#f1f5f9;text-align:center}
+.subtitle{color:#94a3b8;font-size:.85rem;text-align:center;margin-bottom:18px;line-height:1.8}
+.info-block{background:#0f172a;border:1px solid #334155;border-radius:10px;padding:12px 14px;margin-bottom:10px;display:flex;align-items:center;justify-content:space-between;gap:10px}
+.info-label{color:#94a3b8;font-size:.75rem;font-weight:600;min-width:48px}
+.info-value{flex:1;color:#fde68a;font-family:Consolas,monospace;font-size:.95rem;direction:ltr;text-align:left;overflow-wrap:anywhere}
+.info-value.token{color:#a5b4fc;font-weight:700;font-size:1.05rem;letter-spacing:.05em}
+.copy-btn{background:#334155;color:#e2e8f0;border:none;border-radius:6px;padding:6px 10px;font-size:.72rem;cursor:pointer;font-family:inherit;flex-shrink:0}
+.copy-btn:hover{background:#475569}
+.copy-btn.copied{background:#14532d;color:#bbf7d0}
+.btn{display:block;width:100%;background:#3b82f6;color:#fff;border:none;padding:12px;border-radius:8px;font-weight:700;font-size:.95rem;cursor:pointer;font-family:inherit;margin-top:12px;text-decoration:none;text-align:center;box-sizing:border-box}
 .btn:hover{background:#2563eb}
 .btn-secondary{background:#475569;margin-top:8px}
 .btn-secondary:hover{background:#334155}
-.btn:disabled{background:#334155;color:#64748b;cursor:not-allowed}
+.status{margin-top:16px;padding:12px;background:#0f172a;border:1px solid #334155;border-radius:8px;text-align:center;font-size:.88rem;color:#cbd5e1;display:flex;align-items:center;justify-content:center;gap:10px}
+.spinner{width:14px;height:14px;border:2px solid #334155;border-top-color:#3b82f6;border-radius:50%;animation:spin .8s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+.status.ok{background:#14532d;color:#bbf7d0;border-color:#166534}
+.status.fail{background:#7f1d1d;color:#fee2e2;border-color:#991b1b}
 .err{background:#7f1d1d;color:#fee2e2;padding:10px 14px;border-radius:8px;margin-bottom:16px;font-size:.85rem;text-align:center}
 .ok{background:#14532d;color:#bbf7d0;padding:10px 14px;border-radius:8px;margin-bottom:16px;font-size:.85rem;text-align:center}
-.timer{text-align:center;color:#94a3b8;font-size:.8rem;margin-top:8px}
-.links{text-align:center;margin-top:14px;font-size:.85rem;color:#94a3b8}
-.links a{color:#3b82f6;text-decoration:none;font-weight:600}
+.timer{text-align:center;color:#94a3b8;font-size:.78rem;margin-top:8px}
+.links-row{display:flex;justify-content:space-between;margin-top:14px;font-size:.82rem;color:#94a3b8}
+.links-row a{color:#3b82f6;text-decoration:none;font-weight:600}
+.hint{color:#64748b;font-size:.78rem;text-align:center;margin-top:14px;line-height:1.7}
 </style>
 </head>
 <body>
 <div class="card">
   <h1>📨 تأیید ایمیل</h1>
-  <div class="subtitle">کد ۶ رقمی ارسال‌شده به ایمیل خود را وارد کنید</div>
-  <div class="email-display"><?= h($pending['email']) ?></div>
+  <div class="subtitle">برای تایید ایمیلت، یک پیام از همان آدرس به ما بفرست — موضوع و گیرنده را از کادرهای زیر بردار.</div>
   <?php if ($errMsg): ?><div class="err"><?= $errMsg ?></div><?php endif; ?>
   <?php if ($msgText): ?><div class="ok"><?= $msgText ?></div><?php endif; ?>
-  <form method="POST" action="?action=register_step2_process">
-    <input type="hidden" name="csrf_token" value="<?= h($csrf) ?>">
-    <div class="field">
-      <label for="otp_code">کد تأیید</label>
-      <input type="text" id="otp_code" name="otp_code" required inputmode="numeric" autocomplete="one-time-code" maxlength="8" pattern="\d{4,8}" class="otp-input">
-      <div class="timer" id="otpTimer"></div>
-    </div>
-    <div class="field">
-      <label>پاسخ این محاسبه چیست؟</label>
-      <div class="captcha-box" style="background:#0f172a;border:1px solid #334155;padding:8px;border-radius:8px;margin-bottom:8px;text-align:center"><img src="?action=captcha_image&amp;v=<?= time() ?>" alt="کپچا" width="160" height="50" style="display:inline-block"></div>
-      <input type="text" name="captcha" required inputmode="numeric" autocomplete="off">
-    </div>
-    <button type="submit" class="btn">تأیید و تکمیل ثبت‌نام</button>
-  </form>
-  <form method="POST" action="?action=register_resend_otp" style="margin-top:8px">
-    <input type="hidden" name="csrf_token" value="<?= h($csrf) ?>">
-    <button type="submit" class="btn btn-secondary" id="resendBtn">ارسال مجدد کد</button>
-  </form>
-  <div class="links">
-    <a href="?action=register_step1">تغییر ایمیل</a>
+
+  <div class="info-block">
+    <span class="info-label">به:</span>
+    <span class="info-value" id="infoTo"><?= h($toAddr) ?></span>
+    <button type="button" class="copy-btn" data-target="infoTo">کپی</button>
   </div>
+  <div class="info-block">
+    <span class="info-label">موضوع:</span>
+    <span class="info-value token" id="infoSubject"><?= h($token) ?></span>
+    <button type="button" class="copy-btn" data-target="infoSubject">کپی</button>
+  </div>
+  <div class="info-block">
+    <span class="info-label">از:</span>
+    <span class="info-value" id="infoFrom"><?= h($pending['email']) ?></span>
+    <button type="button" class="copy-btn" data-target="infoFrom">کپی</button>
+  </div>
+
+  <a class="btn" href="<?= h($mailtoHref) ?>">📧 باز کردن برنامهٔ ایمیل</a>
+
+  <form method="POST" action="?action=inbound_check_now" style="margin:0">
+    <input type="hidden" name="csrf_token" value="<?= h($csrf) ?>">
+    <input type="hidden" name="redirect" value="register_step2">
+    <button type="submit" class="btn btn-secondary">🔄 چک کردن دستی</button>
+  </form>
+
+  <div class="status" id="statusLine">
+    <span class="spinner" id="statusSpin"></span>
+    <span id="statusText">منتظر دریافت ایمیلت هستیم...</span>
+  </div>
+  <div class="timer" id="otpTimer"></div>
+
+  <div class="links-row">
+    <a href="?action=register_step1">تغییر ایمیل</a>
+    <form method="POST" action="?action=register_resend_otp" style="display:inline;margin:0">
+      <input type="hidden" name="csrf_token" value="<?= h($csrf) ?>">
+      <button type="submit" style="background:none;border:none;color:#3b82f6;font-weight:600;cursor:pointer;font-family:inherit;font-size:inherit;padding:0">صدور توکن جدید</button>
+    </form>
+  </div>
+
+  <div class="hint">پیام را از همان آدرسی که بالا نشان داده شده بفرست. تا ۱ دقیقه بعد از رسیدن، حسابت ساخته می‌شود.</div>
 </div>
 <script>
 (function(){
@@ -3467,12 +3688,67 @@ input:focus{outline:none;border-color:#3b82f6}
   var timerEl = document.getElementById('otpTimer');
   function tick(){
     var s = expires - Math.floor(Date.now()/1000);
-    if (s <= 0){ timerEl.textContent = 'کد منقضی شده. لطفاً ارسال مجدد بزنید.'; timerEl.style.color='#fca5a5'; return; }
+    if (s <= 0){ timerEl.textContent = '⏰ توکن منقضی شد — صدور توکن جدید لازم است.'; timerEl.style.color='#fca5a5'; return; }
     var m = Math.floor(s/60), r = s%60;
-    timerEl.textContent = 'اعتبار کد: ' + m + ':' + (r<10?'0':'') + r;
+    timerEl.textContent = 'اعتبار توکن: ' + m + ':' + (r<10?'0':'') + r;
     setTimeout(tick, 1000);
+  } tick();
+
+  // Copy buttons
+  document.querySelectorAll('.copy-btn').forEach(function(btn){
+    btn.addEventListener('click', function(){
+      var t = document.getElementById(btn.getAttribute('data-target'));
+      if (!t) return;
+      var txt = t.textContent.trim();
+      if (navigator.clipboard && window.isSecureContext) {
+        navigator.clipboard.writeText(txt).then(showCopied);
+      } else {
+        var ta = document.createElement('textarea');
+        ta.value = txt; ta.style.position='fixed'; ta.style.opacity=0;
+        document.body.appendChild(ta); ta.select();
+        try { document.execCommand('copy'); } catch(e){}
+        document.body.removeChild(ta);
+        showCopied();
+      }
+      function showCopied(){
+        var orig = btn.textContent;
+        btn.classList.add('copied'); btn.textContent = '✓';
+        setTimeout(function(){ btn.classList.remove('copied'); btn.textContent = orig; }, 1200);
+      }
+    });
+  });
+
+  // Status polling
+  var pollTimer = null;
+  var spin = document.getElementById('statusSpin');
+  var txt  = document.getElementById('statusText');
+  var line = document.getElementById('statusLine');
+  var stopped = false;
+  function setState(state, message){
+    line.classList.remove('ok','fail');
+    if (state === 'ok') { line.classList.add('ok'); if (spin) spin.style.display='none'; }
+    else if (state === 'fail') { line.classList.add('fail'); if (spin) spin.style.display='none'; }
+    txt.textContent = message;
   }
-  tick();
+  async function poll(){
+    if (stopped) return;
+    try {
+      var r = await fetch('?action=inbound_status', {credentials:'same-origin', headers:{'Accept':'application/json'}});
+      var j = await r.json();
+      if (j.status === 'verified') {
+        stopped = true;
+        setState('ok', '✓ تایید شد — در حال انتقال...');
+        setTimeout(function(){ window.location = j.redirect || '?action=dashboard'; }, 800);
+        return;
+      }
+      if (j.status === 'expired') { stopped = true; setState('fail', '⏰ توکن منقضی شده است.'); return; }
+      if (j.status === 'no_session') { stopped = true; setState('fail', 'نشست منقضی شد.'); return; }
+      pollTimer = setTimeout(poll, 5000);
+    } catch (e) {
+      pollTimer = setTimeout(poll, 8000);
+    }
+  }
+  poll();
 })();
 </script>
 </body>
@@ -3481,67 +3757,7 @@ input:focus{outline:none;border-color:#3b82f6}
     exit;
 }
 
-// ─── POST: Step 2 process ────────────────────────────────────
-if ($action == 'register_step2_process') {
-    if (!registrationEnabled($pdo)) { header("Location: index.php"); exit; }
-    verifyCsrf();
-    if (empty($_SESSION['pending_registration'])) {
-        header("Location: ?action=register_step1&error=session_expired"); exit;
-    }
-    $pending = $_SESSION['pending_registration'];
-
-    $code = trim($_POST['otp_code'] ?? '');
-    $captchaAnswer = $_POST['captcha'] ?? '';
-
-    if (!math_captcha_verify($captchaAnswer)) {
-        header("Location: ?action=register_step2&error=captcha_wrong"); exit;
-    }
-
-    // Anti-enumeration: fake pending always fails
-    if (!empty($pending['fake'])) {
-        usleep(random_int(200000, 500000));
-        header("Location: ?action=register_step2&error=wrong_code"); exit;
-    }
-
-    $verify = verify_email_otp($pdo, $pending['email'], $code, 'register');
-    if (!$verify['ok']) {
-        header("Location: ?action=register_step2&error=" . urlencode($verify['reason'])); exit;
-    }
-
-    // Race-check: username/email could have been claimed during step 2
-    $st = $pdo->prepare("SELECT id FROM users WHERE username = ? OR email = ?");
-    $st->execute([$pending['username'], $pending['email']]);
-    if ($st->fetch()) {
-        unset($_SESSION['pending_registration']);
-        header("Location: ?action=register_step1&error=username_taken"); exit;
-    }
-
-    // Create user with default permissions from settings
-    $cd   = (int)getSetting($pdo, 'default_user_can_download', 1);
-    $ccp  = (int)getSetting($pdo, 'default_user_can_change_password', 1);
-    $cdel = (int)getSetting($pdo, 'default_user_can_delete', 0);
-    $csh  = (int)getSetting($pdo, 'default_user_can_share', 0);
-
-    $st = $pdo->prepare("INSERT INTO users
-        (username, password, email, email_verified, email_verified_at, role,
-         can_download, can_change_password, can_delete, can_share)
-        VALUES (?, ?, ?, 1, NOW(), 'user', ?, ?, ?, ?)");
-    $st->execute([
-        $pending['username'], $pending['password_hash'], $pending['email'],
-        $cd, $ccp, $cdel, $csh
-    ]);
-
-    // Auto-login
-    session_regenerate_id(true);
-    $_SESSION['user'] = $pending['username'];
-    $_SESSION['role'] = 'user';
-    unset($_SESSION['pending_registration']);
-
-    logActivity($pdo, $pending['username'], 'register_completed', $pending['email']);
-    header("Location: ?action=dashboard&msg=welcome"); exit;
-}
-
-// ─── POST: Resend OTP ────────────────────────────────────────
+// ─── POST: Resend / regenerate token (rate-limited) ──────────
 if ($action == 'register_resend_otp') {
     if (!registrationEnabled($pdo)) { header("Location: index.php"); exit; }
     verifyCsrf();
@@ -3550,16 +3766,37 @@ if ($action == 'register_resend_otp') {
     }
     $pending = $_SESSION['pending_registration'];
 
+    // Session-level resend cap (3 per session)
+    $count = (int)($_SESSION['register_resend_count'] ?? 0);
+    if ($count >= 3) {
+        header("Location: ?action=register_step2&error=cooldown"); exit;
+    }
+
     if (!empty($pending['fake'])) {
-        // Pretend success without doing anything (anti-enumeration)
+        // Anti-enumeration: pretend success, rotate the displayed fake token
+        $_SESSION['pending_registration']['token']      = generate_otp_code(8);
+        $_SESSION['pending_registration']['expires_at'] = date('Y-m-d H:i:s', time() + 1800);
+        $_SESSION['register_resend_count'] = $count + 1;
         header("Location: ?action=register_step2&msg=resent"); exit;
     }
 
-    $payload = json_encode(['username' => $pending['username']]);
+    // Invalidate prior unconsumed
+    if (!empty($pending['otp_id'])) {
+        $pdo->prepare("UPDATE email_otps SET consumed_at = NOW() WHERE id = ? AND consumed_at IS NULL")
+            ->execute([(int)$pending['otp_id']]);
+    }
+    $payload = json_encode([
+        'username'      => $pending['username'],
+        'password_hash' => $pending['password_hash'],
+    ]);
     $result = request_email_otp($pdo, $pending['email'], 'register', $payload);
 
     if ($result['ok']) {
+        $_SESSION['pending_registration']['token']      = $result['token'];
+        $_SESSION['pending_registration']['otp_id']     = $result['otp_id'];
         $_SESSION['pending_registration']['expires_at'] = $result['expires_at'];
+        $_SESSION['pending_register_otp_id'] = (int)$result['otp_id'];
+        $_SESSION['register_resend_count'] = $count + 1;
         header("Location: ?action=register_step2&msg=resent"); exit;
     }
     header("Location: ?action=register_step2&error=" . urlencode($result['reason'] ?? 'send_failed')); exit;
@@ -3639,93 +3876,225 @@ if ($action == 'forgot_password_step1_process') {
         $result = request_email_otp($pdo, $email, 'password_reset', $payload);
         if ($result['ok']) {
             $_SESSION['pending_password_reset'] = [
-                'email' => $email,
-                'user_id' => $user['id'],
-                'username' => $user['username'],
+                'email'      => $email,
+                'user_id'    => $user['id'],
+                'username'   => $user['username'],
+                'token'      => $result['token'],
+                'otp_id'     => $result['otp_id'],
+                'fake'       => false,
                 'expires_at' => $result['expires_at'],
             ];
+            $_SESSION['pending_reset_otp_id'] = (int)$result['otp_id'];
             logActivity($pdo, $user['username'], 'password_reset_requested', $email);
         } else {
-            // Even on rate limit, set a fake pending so step 2 page still appears
             $_SESSION['pending_password_reset'] = [
                 'email' => $email, 'fake' => true,
-                'expires_at' => date('Y-m-d H:i:s', time() + 600),
+                'token' => generate_otp_code(8),
+                'expires_at' => date('Y-m-d H:i:s', time() + 1800),
             ];
+            unset($_SESSION['pending_reset_otp_id']);
         }
     } else {
         // Anti-enumeration: store fake pending
         $_SESSION['pending_password_reset'] = [
             'email' => $email, 'fake' => true,
-            'expires_at' => date('Y-m-d H:i:s', time() + 600),
+            'token' => generate_otp_code(8),
+            'expires_at' => date('Y-m-d H:i:s', time() + 1800),
         ];
+        unset($_SESSION['pending_reset_otp_id']);
         usleep(random_int(300000, 700000));
     }
 
     header("Location: ?action=forgot_password_step2&msg=sent"); exit;
 }
 
-// ─── GET: Step 2 form ────────────────────────────────────────
+// ─── GET: Step 2 — inbound verification (send us an email) ─────
 if ($action == 'forgot_password_step2') {
     if (empty($_SESSION['pending_password_reset'])) {
         header("Location: ?action=forgot_password_step1"); exit;
     }
     $pending = $_SESSION['pending_password_reset'];
-    $captcha = math_captcha_generate();
     $csrf = generateCsrfToken();
     $err = $_GET['error'] ?? '';
     $msg = $_GET['msg'] ?? '';
 
     $errMsg = [
-        'wrong_code'        => '⚠️ کد وارد شده اشتباه است.',
-        'expired'           => '⏰ کد منقضی شده.',
-        'too_many_attempts' => '⛔ تعداد تلاش‌های اشتباه از حد گذشت.',
-        'captcha_wrong'     => '⚠️ پاسخ کپچا اشتباه است.',
-        'password_mismatch' => '⚠️ تکرار رمز با رمز اصلی مطابقت ندارد.',
-        'weak_password'     => '⚠️ رمز عبور باید حداقل ۸ کاراکتر و شامل حروف و اعداد باشد.',
-        'send_failed'       => '⚠️ ارسال مجدد با خطا مواجه شد.',
-        'cooldown'          => '⏳ لطفاً قبل از درخواست مجدد صبر کنید.',
-        'not_found'         => '⛔ کد فعالی یافت نشد.',
-        'invalid_format'    => '⚠️ کد باید فقط شامل ارقام باشد.',
+        'send_failed' => '⚠️ صدور توکن جدید با مشکل مواجه شد.',
+        'cooldown'    => '⏳ لطفاً قبل از درخواست مجدد صبر کنید.',
+        'rate_limit'  => '⏳ کمی صبر کن — به‌تازگی چک شد.',
     ][$err] ?? '';
 
     $msgText = '';
-    if ($msg === 'sent')   $msgText = '✅ اگر این ایمیل در سیستم ثبت شده باشد، کد بازیابی ارسال شده است.';
-    if ($msg === 'resent') $msgText = '✅ کد جدید ارسال شد.';
+    if ($msg === 'sent')    $msgText = '✅ اگر این ایمیل ثبت شده باشد، آماده‌ٔ تایید است.';
+    if ($msg === 'resent')  $msgText = '✅ توکن جدید صادر شد.';
+    if ($msg === 'checked') $msgText = '🔄 بررسی انجام شد.';
 
     $expiresAtTs = strtotime($pending['expires_at']);
+    $toAddr = getSetting($pdo, 'inbound_to_address', 'xcloud@retrivo.ir');
+    $token  = $pending['token'];
+    $mailtoHref = 'mailto:' . rawurlencode($toAddr)
+        . '?subject=' . rawurlencode($token)
+        . '&body=' . rawurlencode('بازیابی رمز عبور XCloud');
 ?>
 <!DOCTYPE html><html lang="fa" dir="rtl"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>بازیابی رمز — XCloud</title>
 <style>
 body{margin:0;font-family:Tahoma,sans-serif;background:#0f172a;color:#e2e8f0;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:20px}
-.card{max-width:440px;width:100%;background:#1e293b;border:1px solid #334155;border-radius:14px;padding:32px}
-h1{font-size:1.4rem;margin:0 0 8px;color:#f1f5f9;text-align:center}
-.subtitle{color:#94a3b8;font-size:.85rem;text-align:center;margin-bottom:8px}
-.email-display{background:#0f172a;border:1px solid #334155;color:#fde68a;padding:10px;border-radius:8px;text-align:center;font-weight:600;margin-bottom:18px;font-size:.9rem;direction:ltr}
-.field{margin-bottom:16px}
-label{display:block;color:#cbd5e1;font-size:.85rem;margin-bottom:6px;font-weight:600}
-input{width:100%;background:#0f172a;border:1px solid #334155;color:#f1f5f9;padding:11px 12px;border-radius:8px;font-family:inherit;box-sizing:border-box}
-.otp-input{font-size:1.6rem;text-align:center;letter-spacing:.5em;direction:ltr;font-family:Consolas,monospace;font-weight:700}
-.captcha{background:#0f172a;border:1px dashed #475569;padding:10px 14px;border-radius:8px;color:#fde68a;font-weight:700;text-align:center;margin-bottom:8px}
-.btn{width:100%;background:#3b82f6;color:#fff;border:none;padding:12px;border-radius:8px;font-weight:700;cursor:pointer;font-family:inherit;margin-top:8px}
-.btn-secondary{background:#475569}
+.card{max-width:520px;width:100%;background:#1e293b;border:1px solid #334155;border-radius:14px;padding:28px}
+h1{font-size:1.35rem;margin:0 0 8px;color:#f1f5f9;text-align:center}
+.subtitle{color:#94a3b8;font-size:.85rem;text-align:center;margin-bottom:18px;line-height:1.8}
+.info-block{background:#0f172a;border:1px solid #334155;border-radius:10px;padding:12px 14px;margin-bottom:10px;display:flex;align-items:center;justify-content:space-between;gap:10px}
+.info-label{color:#94a3b8;font-size:.75rem;font-weight:600;min-width:48px}
+.info-value{flex:1;color:#fde68a;font-family:Consolas,monospace;font-size:.95rem;direction:ltr;text-align:left;overflow-wrap:anywhere}
+.info-value.token{color:#a5b4fc;font-weight:700;font-size:1.05rem;letter-spacing:.05em}
+.copy-btn{background:#334155;color:#e2e8f0;border:none;border-radius:6px;padding:6px 10px;font-size:.72rem;cursor:pointer;font-family:inherit;flex-shrink:0}
+.copy-btn.copied{background:#14532d;color:#bbf7d0}
+.btn{display:block;width:100%;background:#3b82f6;color:#fff;border:none;padding:12px;border-radius:8px;font-weight:700;font-size:.95rem;cursor:pointer;font-family:inherit;margin-top:12px;text-decoration:none;text-align:center;box-sizing:border-box}
+.btn-secondary{background:#475569;margin-top:8px}
+.status{margin-top:16px;padding:12px;background:#0f172a;border:1px solid #334155;border-radius:8px;text-align:center;font-size:.88rem;color:#cbd5e1;display:flex;align-items:center;justify-content:center;gap:10px}
+.spinner{width:14px;height:14px;border:2px solid #334155;border-top-color:#3b82f6;border-radius:50%;animation:spin .8s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+.status.ok{background:#14532d;color:#bbf7d0;border-color:#166534}
+.status.fail{background:#7f1d1d;color:#fee2e2;border-color:#991b1b}
 .err{background:#7f1d1d;color:#fee2e2;padding:10px 14px;border-radius:8px;margin-bottom:16px;font-size:.85rem;text-align:center}
 .ok{background:#14532d;color:#bbf7d0;padding:10px 14px;border-radius:8px;margin-bottom:16px;font-size:.85rem;text-align:center}
-.timer{text-align:center;color:#94a3b8;font-size:.8rem;margin-top:8px}
-.hint{color:#64748b;font-size:.75rem;margin-top:4px}
+.timer{text-align:center;color:#94a3b8;font-size:.78rem;margin-top:8px}
+.links-row{display:flex;justify-content:space-between;margin-top:14px;font-size:.82rem;color:#94a3b8}
+.links-row a{color:#3b82f6;text-decoration:none;font-weight:600}
+.hint{color:#64748b;font-size:.78rem;text-align:center;margin-top:14px;line-height:1.7}
 </style></head><body>
 <div class="card">
   <h1>🔑 بازیابی رمز عبور</h1>
-  <div class="subtitle">کد ارسال‌شده و رمز جدید را وارد کنید</div>
-  <div class="email-display"><?= h($pending['email']) ?></div>
+  <div class="subtitle">برای تایید مالکیت ایمیلت، یک پیام از همان آدرس به ما بفرست.</div>
   <?php if ($errMsg): ?><div class="err"><?= $errMsg ?></div><?php endif; ?>
   <?php if ($msgText): ?><div class="ok"><?= $msgText ?></div><?php endif; ?>
-  <form method="POST" action="?action=forgot_password_step2_process">
+
+  <div class="info-block">
+    <span class="info-label">به:</span>
+    <span class="info-value" id="infoTo"><?= h($toAddr) ?></span>
+    <button type="button" class="copy-btn" data-target="infoTo">کپی</button>
+  </div>
+  <div class="info-block">
+    <span class="info-label">موضوع:</span>
+    <span class="info-value token" id="infoSubject"><?= h($token) ?></span>
+    <button type="button" class="copy-btn" data-target="infoSubject">کپی</button>
+  </div>
+  <div class="info-block">
+    <span class="info-label">از:</span>
+    <span class="info-value" id="infoFrom"><?= h($pending['email']) ?></span>
+    <button type="button" class="copy-btn" data-target="infoFrom">کپی</button>
+  </div>
+
+  <a class="btn" href="<?= h($mailtoHref) ?>">📧 باز کردن برنامهٔ ایمیل</a>
+
+  <form method="POST" action="?action=inbound_check_now" style="margin:0">
     <input type="hidden" name="csrf_token" value="<?= h($csrf) ?>">
-    <div class="field">
-      <label>کد تأیید</label>
-      <input type="text" name="otp_code" required inputmode="numeric" maxlength="8" pattern="\d{4,8}" class="otp-input" autocomplete="one-time-code">
-      <div class="timer" id="otpTimer"></div>
-    </div>
+    <input type="hidden" name="redirect" value="forgot_password_step2">
+    <button type="submit" class="btn btn-secondary">🔄 چک کردن دستی</button>
+  </form>
+
+  <div class="status" id="statusLine">
+    <span class="spinner" id="statusSpin"></span>
+    <span id="statusText">منتظر دریافت ایمیلت هستیم...</span>
+  </div>
+  <div class="timer" id="otpTimer"></div>
+
+  <div class="links-row">
+    <a href="?action=forgot_password_step1">تغییر ایمیل</a>
+    <form method="POST" action="?action=forgot_password_resend" style="display:inline;margin:0">
+      <input type="hidden" name="csrf_token" value="<?= h($csrf) ?>">
+      <button type="submit" style="background:none;border:none;color:#3b82f6;font-weight:600;cursor:pointer;font-family:inherit;font-size:inherit;padding:0">صدور توکن جدید</button>
+    </form>
+  </div>
+
+  <div class="hint">پیام را از همان آدرس بالا بفرست. بعد از دریافت، صفحهٔ تنظیم رمز جدید برایت باز می‌شود.</div>
+</div>
+<script>
+(function(){
+  var expires = <?= (int)$expiresAtTs ?>;
+  var t = document.getElementById('otpTimer');
+  function tick(){
+    var s = expires - Math.floor(Date.now()/1000);
+    if (s <= 0){ t.textContent = '⏰ توکن منقضی شد.'; t.style.color='#fca5a5'; return; }
+    var m = Math.floor(s/60), r = s%60;
+    t.textContent = 'اعتبار توکن: ' + m + ':' + (r<10?'0':'') + r;
+    setTimeout(tick, 1000);
+  } tick();
+
+  document.querySelectorAll('.copy-btn').forEach(function(btn){
+    btn.addEventListener('click', function(){
+      var el = document.getElementById(btn.getAttribute('data-target'));
+      if (!el) return;
+      var txt = el.textContent.trim();
+      var done = function(){ var o=btn.textContent; btn.classList.add('copied'); btn.textContent='✓';
+        setTimeout(function(){ btn.classList.remove('copied'); btn.textContent=o; }, 1200); };
+      if (navigator.clipboard && window.isSecureContext) navigator.clipboard.writeText(txt).then(done);
+      else { var ta=document.createElement('textarea'); ta.value=txt; ta.style.position='fixed'; ta.style.opacity=0;
+        document.body.appendChild(ta); ta.select(); try{document.execCommand('copy');}catch(e){}
+        document.body.removeChild(ta); done(); }
+    });
+  });
+
+  var spin=document.getElementById('statusSpin'), txt=document.getElementById('statusText'), line=document.getElementById('statusLine'), stopped=false, pt=null;
+  function setState(s,m){ line.classList.remove('ok','fail'); if(s==='ok'){line.classList.add('ok'); if(spin)spin.style.display='none';} else if(s==='fail'){line.classList.add('fail'); if(spin)spin.style.display='none';} txt.textContent=m; }
+  async function poll(){
+    if (stopped) return;
+    try {
+      var r=await fetch('?action=inbound_status',{credentials:'same-origin',headers:{'Accept':'application/json'}});
+      var j=await r.json();
+      if(j.status==='verified'){ stopped=true; setState('ok','✓ تایید شد — در حال انتقال به صفحهٔ تنظیم رمز جدید...');
+        setTimeout(function(){ window.location = j.redirect || '?action=forgot_password_step3'; }, 800); return; }
+      if(j.status==='expired'){ stopped=true; setState('fail','⏰ توکن منقضی شده است.'); return; }
+      if(j.status==='no_session'){ stopped=true; setState('fail','نشست منقضی شد.'); return; }
+      pt=setTimeout(poll,5000);
+    } catch(e){ pt=setTimeout(poll,8000); }
+  }
+  poll();
+})();
+</script>
+</body></html>
+<?php
+    exit;
+}
+
+// ─── GET: Step 3 — set new password (post-inbound verification) ─
+if ($action == 'forgot_password_step3') {
+    if (empty($_SESSION['reset_authorized_otp_id']) || empty($_SESSION['reset_authorized_at'])) {
+        header("Location: ?action=forgot_password_step1"); exit;
+    }
+    // 5-minute window after consume
+    if (time() - (int)$_SESSION['reset_authorized_at'] > 300) {
+        unset($_SESSION['reset_authorized_otp_id'], $_SESSION['reset_authorized_at']);
+        header("Location: ?action=forgot_password_step1&error=expired"); exit;
+    }
+    $csrf = generateCsrfToken();
+    $err = $_GET['error'] ?? '';
+    $errMsg = [
+        'password_mismatch' => '⚠️ تکرار رمز با رمز اصلی مطابقت ندارد.',
+        'weak_password'     => '⚠️ رمز عبور باید حداقل ۸ کاراکتر و شامل حروف و اعداد باشد.',
+        'captcha_wrong'     => '⚠️ پاسخ کپچا اشتباه است.',
+    ][$err] ?? '';
+?>
+<!DOCTYPE html><html lang="fa" dir="rtl"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>تنظیم رمز جدید — XCloud</title>
+<style>
+body{margin:0;font-family:Tahoma,sans-serif;background:#0f172a;color:#e2e8f0;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:20px}
+.card{max-width:440px;width:100%;background:#1e293b;border:1px solid #334155;border-radius:14px;padding:32px}
+h1{font-size:1.35rem;margin:0 0 8px;color:#f1f5f9;text-align:center}
+.subtitle{color:#94a3b8;font-size:.85rem;text-align:center;margin-bottom:18px}
+.field{margin-bottom:14px}
+label{display:block;color:#cbd5e1;font-size:.85rem;margin-bottom:6px;font-weight:600}
+input{width:100%;background:#0f172a;border:1px solid #334155;color:#f1f5f9;padding:11px 12px;border-radius:8px;font-family:inherit;box-sizing:border-box}
+.btn{width:100%;background:#3b82f6;color:#fff;border:none;padding:12px;border-radius:8px;font-weight:700;cursor:pointer;font-family:inherit;margin-top:8px}
+.err{background:#7f1d1d;color:#fee2e2;padding:10px 14px;border-radius:8px;margin-bottom:16px;font-size:.85rem;text-align:center}
+.hint{color:#64748b;font-size:.75rem;margin-top:4px}
+.ok-banner{background:#14532d;color:#bbf7d0;padding:10px 14px;border-radius:8px;margin-bottom:16px;font-size:.85rem;text-align:center}
+</style></head><body>
+<div class="card">
+  <h1>✅ ایمیل تایید شد</h1>
+  <div class="subtitle">حالا رمز عبور جدید را وارد کن</div>
+  <div class="ok-banner">مالکیت ایمیل تایید شده. این فرم ۵ دقیقه اعتبار دارد.</div>
+  <?php if ($errMsg): ?><div class="err"><?= $errMsg ?></div><?php endif; ?>
+  <form method="POST" action="?action=forgot_password_step3_process">
+    <input type="hidden" name="csrf_token" value="<?= h($csrf) ?>">
     <div class="field">
       <label>رمز عبور جدید</label>
       <input type="password" name="new_password" required autocomplete="new-password" minlength="8">
@@ -3742,73 +4111,63 @@ input{width:100%;background:#0f172a;border:1px solid #334155;color:#f1f5f9;paddi
     </div>
     <button class="btn">تغییر رمز عبور</button>
   </form>
-  <form method="POST" action="?action=forgot_password_resend" style="margin-top:8px">
-    <input type="hidden" name="csrf_token" value="<?= h($csrf) ?>">
-    <button class="btn btn-secondary">ارسال مجدد کد</button>
-  </form>
-</div>
-<script>
-(function(){
-  var expires = <?= (int)$expiresAtTs ?>;
-  var t = document.getElementById('otpTimer');
-  function tick(){
-    var s = expires - Math.floor(Date.now()/1000);
-    if (s <= 0){ t.textContent = 'کد منقضی شده.'; t.style.color='#fca5a5'; return; }
-    var m = Math.floor(s/60), r = s%60;
-    t.textContent = 'اعتبار کد: ' + m + ':' + (r<10?'0':'') + r;
-    setTimeout(tick, 1000);
-  } tick();
-})();
-</script>
-</body></html>
+</div></body></html>
 <?php
     exit;
 }
 
-// ─── POST: Step 2 process ────────────────────────────────────
-if ($action == 'forgot_password_step2_process') {
+// ─── POST: Step 3 process ────────────────────────────────────
+if ($action == 'forgot_password_step3_process') {
     verifyCsrf();
-    if (empty($_SESSION['pending_password_reset'])) {
+    if (empty($_SESSION['reset_authorized_otp_id']) || empty($_SESSION['reset_authorized_at'])) {
         header("Location: ?action=forgot_password_step1"); exit;
     }
-    $pending = $_SESSION['pending_password_reset'];
+    if (time() - (int)$_SESSION['reset_authorized_at'] > 300) {
+        unset($_SESSION['reset_authorized_otp_id'], $_SESSION['reset_authorized_at']);
+        header("Location: ?action=forgot_password_step1&error=expired"); exit;
+    }
 
-    $code = trim($_POST['otp_code'] ?? '');
     $newPass = $_POST['new_password'] ?? '';
     $newPassConfirm = $_POST['password_confirm'] ?? '';
     $captchaAnswer = $_POST['captcha'] ?? '';
 
     if (!math_captcha_verify($captchaAnswer)) {
-        header("Location: ?action=forgot_password_step2&error=captcha_wrong"); exit;
+        header("Location: ?action=forgot_password_step3&error=captcha_wrong"); exit;
     }
     if ($newPass !== $newPassConfirm) {
-        header("Location: ?action=forgot_password_step2&error=password_mismatch"); exit;
+        header("Location: ?action=forgot_password_step3&error=password_mismatch"); exit;
     }
     if (!validate_password_strength($newPass)) {
-        header("Location: ?action=forgot_password_step2&error=weak_password"); exit;
+        header("Location: ?action=forgot_password_step3&error=weak_password"); exit;
     }
 
-    if (!empty($pending['fake'])) {
-        usleep(random_int(200000, 500000));
-        header("Location: ?action=forgot_password_step2&error=wrong_code"); exit;
+    // Look up the user via the consumed OTP's payload
+    $st = $pdo->prepare("SELECT payload, email FROM email_otps WHERE id = ?");
+    $st->execute([(int)$_SESSION['reset_authorized_otp_id']]);
+    $otp = $st->fetch();
+    if (!$otp) {
+        unset($_SESSION['reset_authorized_otp_id'], $_SESSION['reset_authorized_at']);
+        header("Location: ?action=forgot_password_step1"); exit;
     }
-
-    $verify = verify_email_otp($pdo, $pending['email'], $code, 'password_reset');
-    if (!$verify['ok']) {
-        header("Location: ?action=forgot_password_step2&error=" . urlencode($verify['reason'])); exit;
+    $payload = $otp['payload'] ? json_decode($otp['payload'], true) : [];
+    $userId  = isset($payload['user_id']) ? (int)$payload['user_id'] : 0;
+    if (!$userId) {
+        unset($_SESSION['reset_authorized_otp_id'], $_SESSION['reset_authorized_at']);
+        header("Location: ?action=forgot_password_step1"); exit;
     }
 
     $hash = password_hash($newPass, PASSWORD_DEFAULT);
-    $pdo->prepare("UPDATE users SET password = ? WHERE id = ?")
-        ->execute([$hash, $pending['user_id']]);
+    $pdo->prepare("UPDATE users SET password = ? WHERE id = ?")->execute([$hash, $userId]);
+    logActivity($pdo, $payload['username'] ?? 'unknown', 'password_reset_completed', $otp['email']);
 
-    logActivity($pdo, $pending['username'], 'password_reset_completed', $pending['email']);
-    unset($_SESSION['pending_password_reset']);
+    // Burn the authorization
+    unset($_SESSION['reset_authorized_otp_id'], $_SESSION['reset_authorized_at'],
+          $_SESSION['pending_password_reset'], $_SESSION['pending_reset_otp_id']);
 
     header("Location: index.php?msg=password_reset_success"); exit;
 }
 
-// ─── POST: Resend OTP ────────────────────────────────────────
+// ─── POST: Resend reset token ────────────────────────────────
 if ($action == 'forgot_password_resend') {
     verifyCsrf();
     if (empty($_SESSION['pending_password_reset'])) {
@@ -3816,15 +4175,31 @@ if ($action == 'forgot_password_resend') {
     }
     $pending = $_SESSION['pending_password_reset'];
 
+    $count = (int)($_SESSION['reset_resend_count'] ?? 0);
+    if ($count >= 3) {
+        header("Location: ?action=forgot_password_step2&error=cooldown"); exit;
+    }
+
     if (!empty($pending['fake'])) {
+        $_SESSION['pending_password_reset']['token']      = generate_otp_code(8);
+        $_SESSION['pending_password_reset']['expires_at'] = date('Y-m-d H:i:s', time() + 1800);
+        $_SESSION['reset_resend_count'] = $count + 1;
         header("Location: ?action=forgot_password_step2&msg=resent"); exit;
     }
 
+    if (!empty($pending['otp_id'])) {
+        $pdo->prepare("UPDATE email_otps SET consumed_at = NOW() WHERE id = ? AND consumed_at IS NULL")
+            ->execute([(int)$pending['otp_id']]);
+    }
     $payload = json_encode(['user_id' => $pending['user_id'], 'username' => $pending['username']]);
     $result = request_email_otp($pdo, $pending['email'], 'password_reset', $payload);
 
     if ($result['ok']) {
+        $_SESSION['pending_password_reset']['token']      = $result['token'];
+        $_SESSION['pending_password_reset']['otp_id']     = $result['otp_id'];
         $_SESSION['pending_password_reset']['expires_at'] = $result['expires_at'];
+        $_SESSION['pending_reset_otp_id'] = (int)$result['otp_id'];
+        $_SESSION['reset_resend_count'] = $count + 1;
         header("Location: ?action=forgot_password_step2&msg=resent"); exit;
     }
     header("Location: ?action=forgot_password_step2&error=" . urlencode($result['reason'] ?? 'send_failed')); exit;
@@ -3840,291 +4215,391 @@ if ($action == 'email_add_dismiss') {
     header("Location: ?action=dashboard"); exit;
 }
 
-// ─── GET: Email-add step 1 ───────────────────────────────────
-if ($action == 'email_add_step1') {
+// Legacy user-facing email_add_* flow is replaced by admin-only email setting (Phase 10).
+// Redirect any stale bookmarks back to the dashboard.
+if (in_array($action, ['email_add_step1','email_add_step1_process','email_add_step2','email_add_step2_process','email_add_resend'], true)) {
     if (!isset($_SESSION['user'])) { header("Location: index.php"); exit; }
-    if (!userNeedsEmailAdd($pdo)) {
-        header("Location: ?action=dashboard&msg=email_already_verified"); exit;
+    unset($_SESSION['pending_email_add']);
+    header("Location: ?action=dashboard&msg=email_add_admin_only"); exit;
+}
+
+// ================================================================
+// INBOUND VERIFICATION — STATUS / MANUAL CHECK / CRON
+// ================================================================
+
+/**
+ * JSON polling endpoint used by register_step2 / forgot_password_step2.
+ * Reads the pending otp_id from session, returns:
+ *   {status: 'verified', redirect: '?action=...'} → JS redirects
+ *   {status: 'pending'}                           → JS polls again
+ *   {status: 'expired'}                           → JS shows error
+ *   {status: 'no_session'}                        → JS shows error
+ */
+if ($action == 'inbound_status') {
+    header('Content-Type: application/json; charset=utf-8');
+    header('Cache-Control: no-store');
+
+    $otpId = 0;
+    $kind  = '';
+    if (!empty($_SESSION['pending_register_otp_id'])) {
+        $otpId = (int)$_SESSION['pending_register_otp_id'];
+        $kind  = 'register';
+    } elseif (!empty($_SESSION['pending_reset_otp_id'])) {
+        $otpId = (int)$_SESSION['pending_reset_otp_id'];
+        $kind  = 'reset';
     }
-    $captcha = math_captcha_generate();
-    $csrf = generateCsrfToken();
-    $err = $_GET['error'] ?? '';
-    $errMsg = [
-        'invalid_email' => '⚠️ فرمت ایمیل نامعتبر است.',
-        'captcha_wrong' => '⚠️ پاسخ کپچا اشتباه است.',
-        'email_taken'   => '⚠️ این ایمیل قبلاً به حساب دیگری متصل شده است.',
-        'send_failed'   => '⚠️ ارسال ایمیل با خطا مواجه شد.',
-        'cooldown'      => '⏳ لطفاً چند ثانیه صبر کنید.',
-        'email_quota'   => '⛔ حداکثر تعداد درخواست به این ایمیل امروز پر شده.',
-        'ip_quota'      => '⛔ حداکثر تعداد درخواست از این IP پر شده.',
-    ][$err] ?? '';
-?>
-<!DOCTYPE html><html lang="fa" dir="rtl"><head>
-<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>افزودن ایمیل — XCloud</title>
-<?= renderHeadAssets() ?>
-<style>
-*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
-body{font-family:'Dana','JetBrains Mono',sans-serif;background:#0a0e1a;color:#e2e8f0;min-height:100vh}
-.app-header{position:sticky;top:0;z-index:1000;background:rgba(10,14,26,.88);backdrop-filter:blur(16px);padding:12px 20px;display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid #1e293b}
-.app-header .back-link{color:#cbd5e1;text-decoration:none;font-weight:600;font-size:.9rem}
-.app-header .back-link:hover{color:#fff}
-.container{max-width:520px;margin:0 auto;padding:24px 16px}
-.form-card{background:#111827;border-radius:16px;padding:24px;border:1px solid #1e293b;margin-bottom:20px}
-.file-icon-big{font-size:3rem;text-align:center;margin-bottom:8px}
-.file-title{font-size:1.25rem;font-weight:800;color:#f1f5f9;text-align:center}
-.field{margin-bottom:16px}
-.field label{display:block;color:#cbd5e1;font-size:.85rem;margin-bottom:6px;font-weight:600}
-.field input{width:100%;background:#0a0e1a;border:1px solid #1e293b;color:#f1f5f9;padding:11px 12px;border-radius:8px;font-family:inherit;box-sizing:border-box}
-.field input:focus{outline:none;border-color:#3b82f6}
-.captcha-box{background:#0a0e1a;border:1px solid #1e293b;padding:8px;border-radius:8px;margin-bottom:8px;text-align:center}
-.captcha-box img{display:inline-block}
-.btn-primary{width:100%;background:linear-gradient(135deg,#3b82f6,#8b5cf6);color:#fff;border:none;padding:12px;border-radius:8px;font-weight:700;cursor:pointer;font-family:inherit;font-size:.95rem}
-.btn-primary:hover{filter:brightness(1.1)}
-.err-banner{background:#7f1d1d;color:#fee2e2;padding:10px 14px;border-radius:8px;margin-bottom:16px;font-size:.85rem;text-align:center}
-.links-row{text-align:center;margin-top:14px;font-size:.85rem;color:#94a3b8}
-.links-row a{color:#3b82f6;text-decoration:none;font-weight:600}
-</style></head><body>
-<?= renderInAppHeader('افزودن ایمیل') ?>
-<div class="container">
-  <div class="form-card">
-    <div class="file-icon-big">📧</div>
-    <div class="file-title">افزودن ایمیل به حساب</div>
-    <p style="color:#94a3b8;font-size:.85rem;text-align:center;margin:8px 0 24px">با افزودن ایمیل می‌توانید رمز عبور خود را بازیابی کنید</p>
-    <?php if ($errMsg): ?><div class="err-banner"><?= $errMsg ?></div><?php endif; ?>
-    <form method="POST" action="?action=email_add_step1_process">
-      <input type="hidden" name="csrf_token" value="<?= h($csrf) ?>">
-      <div class="field">
-        <label>ایمیل</label>
-        <input type="email" name="email" required autocomplete="email">
-      </div>
-      <div class="field">
-        <label>پاسخ این محاسبه چیست؟</label>
-        <div class="captcha-box"><img src="?action=captcha_image&amp;v=<?= time() ?>" alt="کپچا" width="160" height="50"></div>
-        <input type="text" name="captcha" required inputmode="numeric" autocomplete="off">
-      </div>
-      <button class="btn-primary">ارسال کد تأیید</button>
-    </form>
-    <div class="links-row"><a href="?action=dashboard">انصراف</a></div>
-  </div>
-</div>
-</body></html>
-<?php
+    if ($otpId <= 0) { echo json_encode(['status' => 'no_session']); exit; }
+
+    $st = $pdo->prepare("SELECT id, email, purpose, consumed_at, expires_at, payload FROM email_otps WHERE id = ?");
+    $st->execute([$otpId]);
+    $otp = $st->fetch();
+    if (!$otp) { echo json_encode(['status' => 'no_session']); exit; }
+
+    if (!empty($otp['consumed_at'])) {
+        if ($kind === 'register') {
+            // The inbound worker already created the user. Auto-login.
+            $email = mb_strtolower($otp['email']);
+            $u = $pdo->prepare("SELECT username, role FROM users WHERE email = ? AND email_verified = 1");
+            $u->execute([$email]);
+            $userRow = $u->fetch();
+            if ($userRow) {
+                session_regenerate_id(true);
+                $_SESSION['user'] = $userRow['username'];
+                $_SESSION['role'] = $userRow['role'];
+                unset($_SESSION['pending_registration'], $_SESSION['pending_register_otp_id'], $_SESSION['register_resend_count']);
+                logActivity($pdo, $userRow['username'], 'inbound_register_autologin', $email);
+                echo json_encode(['status' => 'verified', 'redirect' => '?action=dashboard&msg=welcome']);
+                exit;
+            }
+            // Edge case: race between cron and poller (shouldn't happen in practice)
+            echo json_encode(['status' => 'pending']);
+            exit;
+        }
+        if ($kind === 'reset') {
+            $_SESSION['reset_authorized_otp_id'] = (int)$otp['id'];
+            $_SESSION['reset_authorized_at']     = time();
+            unset($_SESSION['pending_reset_otp_id']);
+            echo json_encode(['status' => 'verified', 'redirect' => '?action=forgot_password_step3']);
+            exit;
+        }
+    }
+
+    if (strtotime($otp['expires_at']) < time()) {
+        echo json_encode(['status' => 'expired']);
+        exit;
+    }
+    echo json_encode(['status' => 'pending']);
     exit;
 }
 
-// ─── POST: Step 1 process ────────────────────────────────────
-if ($action == 'email_add_step1_process') {
-    if (!isset($_SESSION['user'])) { header("Location: index.php"); exit; }
-    if (!userNeedsEmailAdd($pdo)) {
-        header("Location: ?action=dashboard&msg=email_already_verified"); exit;
-    }
+/**
+ * Manual "check now" button. Rate-limited to 1 call per 15 seconds per
+ * session to avoid hammering IMAP. Runs a small inbound scan (20 msgs).
+ */
+if ($action == 'inbound_check_now') {
     verifyCsrf();
-    $email = trim(mb_strtolower($_POST['email'] ?? ''));
-    $captchaAnswer = $_POST['captcha'] ?? '';
+    $redirect = $_POST['redirect'] ?? 'register_step2';
+    $allowedRedirects = ['register_step2', 'forgot_password_step2', 'inbound_settings'];
+    if (!in_array($redirect, $allowedRedirects, true)) $redirect = 'register_step2';
 
-    if (!math_captcha_verify($captchaAnswer)) {
-        header("Location: ?action=email_add_step1&error=captcha_wrong"); exit;
+    $last = (int)($_SESSION['inbound_check_last'] ?? 0);
+    if (time() - $last < 15) {
+        header("Location: ?action=$redirect&error=rate_limit"); exit;
     }
-    if (!validate_email_address($email)) {
-        header("Location: ?action=email_add_step1&error=invalid_email"); exit;
-    }
+    $_SESSION['inbound_check_last'] = time();
 
-    // Check email is not already used by another user
-    $st = $pdo->prepare("SELECT id FROM users WHERE email = ? AND username != ?");
-    $st->execute([$email, $_SESSION['user']]);
-    if ($st->fetch()) {
-        // Mimic OTP-send delay to prevent timing-based email enumeration
-        usleep(random_int(800000, 1500000));
-        header("Location: ?action=email_add_step1&error=email_taken"); exit;
+    if (getSetting($pdo, 'inbound_enabled', '1') !== '1') {
+        header("Location: ?action=$redirect&error=check_disabled"); exit;
     }
 
-    // Get current user id
-    $st = $pdo->prepare("SELECT id FROM users WHERE username = ?");
-    $st->execute([$_SESSION['user']]);
-    $userId = (int)$st->fetchColumn();
-
-    $payload = json_encode(['user_id' => $userId, 'username' => $_SESSION['user']]);
-    $result = request_email_otp($pdo, $email, 'email_add', $payload);
-    if (!$result['ok']) {
-        header("Location: ?action=email_add_step1&error=" . urlencode($result['reason'] ?? 'send_failed')); exit;
-    }
-
-    $_SESSION['pending_email_add'] = [
-        'email' => $email, 'user_id' => $userId,
-        'expires_at' => $result['expires_at'],
-    ];
-    logActivity($pdo, $_SESSION['user'], 'email_add_otp_requested', $email);
-    header("Location: ?action=email_add_step2"); exit;
+    $stats = inbound_run($pdo, 20);
+    $matched = (int)($stats['matched'] ?? 0);
+    header("Location: ?action=$redirect&msg=checked&matched=$matched"); exit;
 }
 
-// ─── GET: Step 2 form ────────────────────────────────────────
-if ($action == 'email_add_step2') {
-    if (!isset($_SESSION['user'])) { header("Location: index.php"); exit; }
-    if (!userNeedsEmailAdd($pdo)) {
-        header("Location: ?action=dashboard&msg=email_already_verified"); exit;
+/**
+ * Cron-callable endpoint. Auth = constant-time compare with
+ * inbound_cron_secret setting. Returns JSON stats.
+ *
+ * cPanel cron line:
+ *   * * * * * curl -fsS 'https://your.host/?action=inbound_cron&token=SECRET' > /dev/null 2>&1
+ */
+if ($action == 'inbound_cron') {
+    header('Content-Type: application/json; charset=utf-8');
+    $secret = getSetting($pdo, 'inbound_cron_secret', '');
+    $given  = $_GET['token'] ?? '';
+    if ($secret === '' || !hash_equals($secret, (string)$given)) {
+        http_response_code(403);
+        echo json_encode(['error' => 'forbidden']);
+        exit;
     }
-    if (empty($_SESSION['pending_email_add'])) {
-        header("Location: ?action=email_add_step1"); exit;
+    if (getSetting($pdo, 'inbound_enabled', '1') !== '1') {
+        echo json_encode(['skipped' => 'disabled']);
+        exit;
     }
-    $pending = $_SESSION['pending_email_add'];
-    $captcha = math_captcha_generate();
+    $stats = inbound_run($pdo);
+    if (!empty($stats['error']) && $stats['error'] === 'busy') {
+        // Another run is in progress — not an error from the cron's POV
+        echo json_encode(['skipped' => 'busy']);
+        exit;
+    }
+    echo json_encode($stats);
+    exit;
+}
+
+// ─── Admin: Save inbound settings ────────────────────────────
+if ($action == 'inbound_settings_save') {
+    if (!isset($_SESSION['user']) || $_SESSION['role'] !== 'admin') {
+        http_response_code(403); echo 'Forbidden'; exit;
+    }
+    verifyCsrf();
+    $fields = ['inbound_host','inbound_port','inbound_encryption','inbound_username',
+               'inbound_inbox_folder','inbound_processed_folder','inbound_rejected_folder',
+               'inbound_to_address','inbound_mta_hostname','inbound_max_messages_per_run'];
+    foreach ($fields as $f) {
+        if (isset($_POST[$f])) setSetting($pdo, $f, trim((string)$_POST[$f]));
+    }
+    setSetting($pdo, 'inbound_enabled', isset($_POST['inbound_enabled']) ? '1' : '0');
+    setSetting($pdo, 'inbound_require_spf_or_dkim', isset($_POST['inbound_require_spf_or_dkim']) ? '1' : '0');
+    if (!empty($_POST['inbound_password'])) {
+        setSetting($pdo, 'inbound_password', $_POST['inbound_password']);
+    }
+    if (!empty($_POST['inbound_cron_secret'])) {
+        setSetting($pdo, 'inbound_cron_secret', $_POST['inbound_cron_secret']);
+    }
+    if (!empty($_POST['generate_cron_secret'])) {
+        setSetting($pdo, 'inbound_cron_secret', bin2hex(random_bytes(20)));
+    }
+    logActivity($pdo, $_SESSION['user'], 'inbound_settings_save');
+    header("Location: ?action=inbound_settings&msg=saved"); exit;
+}
+
+// ─── Admin: Test IMAP connection (AJAX) ──────────────────────
+if ($action == 'inbound_test_connection') {
+    if (!isset($_SESSION['user']) || $_SESSION['role'] !== 'admin') {
+        http_response_code(403); echo 'Forbidden'; exit;
+    }
+    header('Content-Type: application/json; charset=utf-8');
+    $state = inbound_imap_connect($pdo);
+    if (isset($state['error'])) {
+        echo json_encode(['ok' => false, 'error' => $state['error']]);
+        exit;
+    }
+    inbound_ensure_folders($state);
+    $unread = inbound_list_unread($state, 5);
+    $mode = $state['mode'];
+    inbound_close($state);
+    echo json_encode([
+        'ok'        => true,
+        'mode'      => $mode,
+        'unread'    => count($unread),
+        'has_imap'  => function_exists('imap_open'),
+    ]);
+    exit;
+}
+
+// ─── Admin: Run inbound scan now (button on settings page) ───
+if ($action == 'inbound_run_now') {
+    if (!isset($_SESSION['user']) || $_SESSION['role'] !== 'admin') {
+        http_response_code(403); echo 'Forbidden'; exit;
+    }
+    verifyCsrf();
+    $stats = inbound_run($pdo);
+    $_SESSION['inbound_run_now_result'] = $stats;
+    header("Location: ?action=inbound_settings&msg=ran"); exit;
+}
+
+// ─── Admin: Settings page ────────────────────────────────────
+if ($action == 'inbound_settings') {
+    if (!isset($_SESSION['user']) || $_SESSION['role'] !== 'admin') {
+        header("Location: index.php"); exit;
+    }
     $csrf = generateCsrfToken();
-    $err = $_GET['error'] ?? '';
-    $msg = $_GET['msg'] ?? '';
-    $errMsg = [
-        'wrong_code'        => '⚠️ کد وارد شده اشتباه است.',
-        'expired'           => '⏰ کد منقضی شده.',
-        'too_many_attempts' => '⛔ تعداد تلاش‌های اشتباه از حد گذشت.',
-        'captcha_wrong'     => '⚠️ پاسخ کپچا اشتباه است.',
-        'send_failed'       => '⚠️ ارسال مجدد با خطا مواجه شد.',
-        'cooldown'          => '⏳ لطفاً صبر کنید.',
-        'not_found'         => '⛔ کد فعالی یافت نشد.',
-        'invalid_format'    => '⚠️ کد باید فقط شامل ارقام باشد.',
-    ][$err] ?? '';
-    $msgText = $msg === 'resent' ? '✅ کد جدید ارسال شد.' : '';
-    $expiresAtTs = strtotime($pending['expires_at']);
+    $cfg  = inbound_load_settings($pdo);
+    $msg  = $_GET['msg'] ?? '';
+    $passwordSet = $cfg['password'] !== '';
+    $secretSet   = $cfg['cron_secret'] !== '';
+    $lastRunAt   = getSetting($pdo, 'inbound_last_cron_run_at', '');
+    $lastResultJ = getSetting($pdo, 'inbound_last_cron_result', '');
+    $lastResult  = $lastResultJ ? json_decode($lastResultJ, true) : null;
+    $runNow      = $_SESSION['inbound_run_now_result'] ?? null;
+    unset($_SESSION['inbound_run_now_result']);
+
+    $pendingCount = (int)$pdo->query("SELECT COUNT(*) FROM email_otps WHERE consumed_at IS NULL AND expires_at > NOW()")->fetchColumn();
+    $todayCount   = (int)$pdo->query("SELECT COUNT(*) FROM email_inbound_processed WHERE processed_at > (NOW() - INTERVAL 1 DAY)")->fetchColumn();
+
+    $recent = $pdo->query("SELECT message_id, from_email, matched_otp_id, outcome, received_at, processed_at
+                           FROM email_inbound_processed ORDER BY id DESC LIMIT 20")->fetchAll();
 ?>
-<!DOCTYPE html><html lang="fa" dir="rtl"><head>
-<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>تأیید ایمیل — XCloud</title>
+<!DOCTYPE html><html lang="fa" dir="rtl"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>تنظیمات دریافت ایمیل — XCloud</title>
 <?= renderHeadAssets() ?>
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
-body{font-family:'Dana','JetBrains Mono',sans-serif;background:#0a0e1a;color:#e2e8f0;min-height:100vh}
+body{font-family:'Dana',Tahoma,sans-serif;background:#0a0e1a;color:#e2e8f0;min-height:100vh}
 .app-header{position:sticky;top:0;z-index:1000;background:rgba(10,14,26,.88);backdrop-filter:blur(16px);padding:12px 20px;display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid #1e293b}
-.app-header .back-link{color:#cbd5e1;text-decoration:none;font-weight:600;font-size:.9rem}
-.app-header .back-link:hover{color:#fff}
-.container{max-width:520px;margin:0 auto;padding:24px 16px}
-.form-card{background:#111827;border-radius:16px;padding:24px;border:1px solid #1e293b;margin-bottom:20px}
-.file-icon-big{font-size:3rem;text-align:center;margin-bottom:8px}
-.file-title{font-size:1.25rem;font-weight:800;color:#f1f5f9;text-align:center}
-.email-display{background:#0a0e1a;border:1px solid #1e293b;color:#fde68a;padding:10px;border-radius:8px;text-align:center;font-weight:600;margin:16px 0 20px;direction:ltr}
-.field{margin-bottom:16px}
-.field label{display:block;color:#cbd5e1;font-size:.85rem;margin-bottom:6px;font-weight:600}
-.field input{width:100%;background:#0a0e1a;border:1px solid #1e293b;color:#f1f5f9;padding:11px 12px;border-radius:8px;font-family:inherit;box-sizing:border-box}
-.field input:focus{outline:none;border-color:#3b82f6}
-.otp-input{font-size:1.6rem!important;text-align:center;letter-spacing:.5em;direction:ltr;font-family:'JetBrains Mono',Consolas,monospace;font-weight:700}
-.captcha-box{background:#0a0e1a;border:1px solid #1e293b;padding:8px;border-radius:8px;margin-bottom:8px;text-align:center}
-.captcha-box img{display:inline-block}
-.btn-primary{width:100%;background:linear-gradient(135deg,#3b82f6,#8b5cf6);color:#fff;border:none;padding:12px;border-radius:8px;font-weight:700;cursor:pointer;font-family:inherit;font-size:.95rem;margin-top:8px}
-.btn-primary:hover{filter:brightness(1.1)}
-.btn-secondary{width:100%;background:#1e293b;color:#cbd5e1;border:1px solid #334155;padding:12px;border-radius:8px;font-weight:700;cursor:pointer;font-family:inherit;font-size:.9rem}
-.btn-secondary:hover{background:#263349}
-.err-banner{background:#7f1d1d;color:#fee2e2;padding:10px 14px;border-radius:8px;margin-bottom:16px;font-size:.85rem;text-align:center}
-.ok-banner{background:#14532d;color:#bbf7d0;padding:10px 14px;border-radius:8px;margin-bottom:16px;font-size:.85rem;text-align:center}
-.timer{text-align:center;color:#94a3b8;font-size:.8rem;margin-top:8px}
-.links-row{text-align:center;margin-top:14px;font-size:.85rem;color:#94a3b8}
-.links-row a{color:#3b82f6;text-decoration:none;font-weight:600}
-</style></head><body>
-<?= renderInAppHeader('تأیید ایمیل') ?>
+.back-link{color:#3b82f6;text-decoration:none;font-size:.85rem;font-weight:600}
+.container{padding:20px;max-width:880px;margin:0 auto}
+.card{background:#111827;border-radius:14px;padding:18px;border:1px solid #1e293b;margin-bottom:16px}
+.card h3{font-size:.95rem;margin-bottom:14px;color:#f1f5f9}
+.field{margin-bottom:12px}
+.field label{display:block;color:#cbd5e1;font-size:.78rem;margin-bottom:4px;font-weight:600}
+.field input[type=text],.field input[type=password],.field input[type=number],.field select{width:100%;background:rgba(15,23,42,.5);border:1.5px solid #1e293b;padding:10px 12px;border-radius:10px;color:#e2e8f0;font-size:.85rem;font-family:inherit}
+.field input:focus,.field select:focus{outline:none;border-color:#3b82f6}
+.row{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.row3{display:grid;grid-template-columns:2fr 1fr 1fr;gap:10px}
+.check-row{display:flex;align-items:center;gap:8px;font-size:.85rem;color:#cbd5e1;margin-bottom:10px}
+.btn{padding:10px 16px;background:linear-gradient(135deg,#3b82f6,#6366f1);color:#fff;border:none;border-radius:10px;font-weight:700;font-family:inherit;cursor:pointer;font-size:.88rem}
+.btn-secondary{background:#334155}
+.btn-row{display:flex;gap:8px;flex-wrap:wrap;margin-top:6px}
+.badge{display:inline-block;padding:2px 8px;border-radius:6px;font-size:.7rem;background:#1e293b;color:#94a3b8;margin-right:6px}
+.badge-ok{background:#14532d;color:#bbf7d0}
+.badge-warn{background:#7c2d12;color:#fed7aa}
+.ok-banner{background:#14532d;color:#bbf7d0;padding:10px 14px;border-radius:8px;margin-bottom:14px;font-size:.82rem;text-align:center}
+.kv-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-top:8px}
+.kv{background:#1a2235;padding:10px;border-radius:8px;text-align:center}
+.kv .v{font-size:1.4rem;font-weight:700;color:#f1f5f9}
+.kv .k{font-size:.7rem;color:#94a3b8;margin-top:2px}
+pre.json{background:#0a0e1a;border:1px solid #1e293b;padding:10px;border-radius:8px;font-size:.75rem;color:#94a3b8;overflow:auto;direction:ltr;text-align:left;max-height:200px}
+table.hist{width:100%;border-collapse:collapse;font-size:.78rem;direction:ltr}
+table.hist th,table.hist td{padding:6px 8px;border-bottom:1px solid #1e293b;text-align:left}
+table.hist th{background:#0a0e1a;color:#94a3b8;font-weight:600}
+.outcome{padding:2px 6px;border-radius:4px;font-size:.7rem}
+.outcome.matched{background:#14532d;color:#bbf7d0}
+.outcome.auth_fail,.outcome.wrong_from{background:#7f1d1d;color:#fee2e2}
+.outcome.no_token,.outcome.malformed{background:#3f3f46;color:#d4d4d8}
+.outcome.expired{background:#7c2d12;color:#fed7aa}
+.testbox{margin-top:8px;padding:10px;background:#0a0e1a;border:1px solid #1e293b;border-radius:8px;font-size:.8rem;display:none}
+.testbox.show{display:block}
+.testbox.ok{border-color:#166534;color:#bbf7d0}
+.testbox.fail{border-color:#991b1b;color:#fee2e2}
+</style>
+</head><body>
+<header class="app-header">
+  <a href="?action=dashboard" class="back-link">← بازگشت</a>
+  <span style="font-weight:900;font-size:1rem;background:linear-gradient(135deg,#3b82f6,#8b5cf6);-webkit-background-clip:text;-webkit-text-fill-color:transparent;">دریافت ایمیل (IMAP)</span>
+</header>
 <div class="container">
-  <div class="form-card">
-    <div class="file-icon-big">📨</div>
-    <div class="file-title">تأیید ایمیل</div>
-    <p style="color:#94a3b8;font-size:.85rem;text-align:center;margin-top:8px">کد ارسال‌شده را وارد کنید</p>
-    <div class="email-display"><?= h($pending['email']) ?></div>
-    <?php if ($errMsg): ?><div class="err-banner"><?= $errMsg ?></div><?php endif; ?>
-    <?php if ($msgText): ?><div class="ok-banner"><?= $msgText ?></div><?php endif; ?>
-    <form method="POST" action="?action=email_add_step2_process">
+  <?php if ($msg === 'saved'): ?><div class="ok-banner">✅ تنظیمات ذخیره شد</div><?php endif; ?>
+  <?php if ($msg === 'ran' && $runNow): ?>
+    <div class="ok-banner">🔄 اجرای دستی انجام شد — <?= (int)$runNow['scanned'] ?> پیام بررسی شد، <?= (int)$runNow['matched'] ?> تطبیق</div>
+  <?php endif; ?>
+
+  <div class="card">
+    <h3>📊 وضعیت کرون</h3>
+    <div class="kv-grid">
+      <div class="kv"><div class="v"><?= $pendingCount ?></div><div class="k">OTP منتظر</div></div>
+      <div class="kv"><div class="v"><?= $todayCount ?></div><div class="k">پیام در ۲۴ ساعت</div></div>
+      <div class="kv"><div class="v" style="font-size:.85rem"><?= $lastRunAt ? h(to_jalali($lastRunAt)) : '—' ?></div><div class="k">آخرین اجرا</div></div>
+    </div>
+    <?php if ($lastResult): ?>
+      <pre class="json"><?= h(json_encode($lastResult, JSON_PRETTY_PRINT|JSON_UNESCAPED_UNICODE)) ?></pre>
+    <?php endif; ?>
+    <form method="POST" action="?action=inbound_run_now" style="margin-top:8px">
       <input type="hidden" name="csrf_token" value="<?= h($csrf) ?>">
-      <div class="field">
-        <label>کد تأیید</label>
-        <input type="text" name="otp_code" required inputmode="numeric" maxlength="8" pattern="\d{4,8}" class="otp-input" autocomplete="one-time-code">
-        <div class="timer" id="otpTimer"></div>
-      </div>
-      <div class="field">
-        <label>پاسخ این محاسبه چیست؟</label>
-        <div class="captcha-box"><img src="?action=captcha_image&amp;v=<?= time() ?>" alt="کپچا" width="160" height="50"></div>
-        <input type="text" name="captcha" required inputmode="numeric" autocomplete="off">
-      </div>
-      <button class="btn-primary">تأیید و افزودن ایمیل</button>
+      <button class="btn">▶ اجرای دستی</button>
     </form>
-    <form method="POST" action="?action=email_add_resend" style="margin-top:10px">
-      <input type="hidden" name="csrf_token" value="<?= h($csrf) ?>">
-      <button class="btn-secondary">ارسال مجدد کد</button>
-    </form>
-    <div class="links-row"><a href="?action=email_add_step1">تغییر ایمیل</a></div>
+  </div>
+
+  <form method="POST" action="?action=inbound_settings_save" class="card">
+    <input type="hidden" name="csrf_token" value="<?= h($csrf) ?>">
+    <h3>🔌 اتصال IMAP <?php if ($passwordSet): ?><span class="badge badge-ok">رمز تنظیم شده</span><?php endif; ?></h3>
+    <div class="check-row">
+      <label><input type="checkbox" name="inbound_enabled" value="1" <?= $cfg['enabled'] ? 'checked' : '' ?>> فعال</label>
+      <label style="margin-right:18px"><input type="checkbox" name="inbound_require_spf_or_dkim" value="1" <?= $cfg['require_spf_or_dkim'] ? 'checked' : '' ?>> الزام SPF/DKIM</label>
+    </div>
+    <div class="row3">
+      <div class="field"><label>Host</label><input type="text" name="inbound_host" value="<?= h($cfg['host']) ?>" required></div>
+      <div class="field"><label>Port</label><input type="number" name="inbound_port" value="<?= h((string)$cfg['port']) ?>" required></div>
+      <div class="field"><label>Encryption</label><select name="inbound_encryption">
+        <option value="ssl" <?= $cfg['encryption']==='ssl'?'selected':'' ?>>SSL (993)</option>
+        <option value="tls" <?= $cfg['encryption']==='tls'?'selected':'' ?>>STARTTLS (143)</option>
+      </select></div>
+    </div>
+    <div class="row">
+      <div class="field"><label>Username</label><input type="text" name="inbound_username" value="<?= h($cfg['username']) ?>" required></div>
+      <div class="field"><label>Password</label><input type="password" name="inbound_password" placeholder="<?= $passwordSet ? '••••••• (برای تغییر مقدار جدید بزن)' : 'وارد کنید' ?>" autocomplete="new-password"></div>
+    </div>
+    <div class="row3">
+      <div class="field"><label>پوشهٔ ورودی</label><input type="text" name="inbound_inbox_folder" value="<?= h($cfg['inbox_folder']) ?>"></div>
+      <div class="field"><label>پوشهٔ پردازش‌شده</label><input type="text" name="inbound_processed_folder" value="<?= h($cfg['processed_folder']) ?>"></div>
+      <div class="field"><label>پوشهٔ رد‌شده</label><input type="text" name="inbound_rejected_folder" value="<?= h($cfg['rejected_folder']) ?>"></div>
+    </div>
+    <div class="row">
+      <div class="field"><label>آدرس نمایش به کاربر</label><input type="text" name="inbound_to_address" value="<?= h($cfg['to_address']) ?>"></div>
+      <div class="field"><label>MTA hostname (برای اعتبارسنجی Auth-Results)</label><input type="text" name="inbound_mta_hostname" value="<?= h($cfg['mta_hostname']) ?>" placeholder="مثلاً cip18.mizbanfadns.net"></div>
+    </div>
+    <div class="row">
+      <div class="field"><label>حداکثر پیام در هر اجرا</label><input type="number" name="inbound_max_messages_per_run" value="<?= h((string)$cfg['max_per_run']) ?>" min="1" max="500"></div>
+      <div class="field"><label>Cron secret <?php if ($secretSet): ?><span class="badge badge-ok">تنظیم شده</span><?php endif; ?></label>
+        <input type="text" name="inbound_cron_secret" placeholder="<?= $secretSet ? 'بدون تغییر؛ برای تولید جدید چک‌باکس زیر' : 'یک رشتهٔ تصادفی ۳۲+ کاراکتری' ?>" autocomplete="off">
+      </div>
+    </div>
+    <label class="check-row"><input type="checkbox" name="generate_cron_secret" value="1"> تولید خودکار secret جدید (۴۰ کاراکتر هگزا)</label>
+    <div class="btn-row">
+      <button type="submit" class="btn">ذخیره</button>
+      <button type="button" class="btn btn-secondary" id="testBtn">آزمایش اتصال</button>
+    </div>
+    <div class="testbox" id="testBox"></div>
+  </form>
+
+  <div class="card">
+    <h3>📜 آخرین ۲۰ پیام دریافتی</h3>
+    <?php if (empty($recent)): ?>
+      <div style="color:#64748b;font-size:.85rem;text-align:center;padding:20px">هنوز پیامی پردازش نشده.</div>
+    <?php else: ?>
+      <div style="overflow-x:auto">
+        <table class="hist">
+          <thead><tr><th>زمان</th><th>از</th><th>نتیجه</th><th>OTP</th><th>Message-ID</th></tr></thead>
+          <tbody>
+            <?php foreach ($recent as $r): ?>
+            <tr>
+              <td><?= h(to_jalali($r['processed_at'])) ?></td>
+              <td><?= h($r['from_email'] ?? '—') ?></td>
+              <td><span class="outcome <?= h($r['outcome']) ?>"><?= h($r['outcome']) ?></span></td>
+              <td><?= $r['matched_otp_id'] ? (int)$r['matched_otp_id'] : '—' ?></td>
+              <td style="font-family:Consolas,monospace;font-size:.7rem;color:#64748b"><?= h(mb_substr((string)$r['message_id'], 0, 50)) ?></td>
+            </tr>
+            <?php endforeach; ?>
+          </tbody>
+        </table>
+      </div>
+    <?php endif; ?>
+  </div>
+
+  <div class="card">
+    <h3>⚙️ راه‌اندازی Cron در cPanel</h3>
+    <div style="font-size:.82rem;color:#cbd5e1;line-height:1.9">
+      هر دقیقه این آدرس را با curl صدا بزن (یکبار <code>inbound_cron_secret</code> را در همین صفحه تنظیم کن):
+      <pre class="json">* * * * * curl -fsS '<?= h((!empty($_SERVER['HTTPS'])?'https':'http') . '://' . ($_SERVER['HTTP_HOST'] ?? 'your.host')) ?>/?action=inbound_cron&amp;token=YOUR_SECRET' &gt; /dev/null 2&gt;&amp;1</pre>
+      <div style="color:#94a3b8;font-size:.78rem">برای جزئیات و عیب‌یابی به <code>docs/inbound-cron-setup.md</code> مراجعه کن.</div>
+    </div>
   </div>
 </div>
 <script>
-(function(){
-  var expires = <?= (int)$expiresAtTs ?>;
-  var t = document.getElementById('otpTimer');
-  function tick(){
-    var s = expires - Math.floor(Date.now()/1000);
-    if (s <= 0){ t.textContent='کد منقضی شده.'; t.style.color='#fca5a5'; return; }
-    var m = Math.floor(s/60), r = s%60;
-    t.textContent = 'اعتبار کد: ' + m + ':' + (r<10?'0':'') + r;
-    setTimeout(tick, 1000);
-  } tick();
-})();
+document.getElementById('testBtn').addEventListener('click', async function(){
+  var box = document.getElementById('testBox');
+  box.className = 'testbox show';
+  box.textContent = 'در حال آزمایش...';
+  try {
+    var r = await fetch('?action=inbound_test_connection', {credentials:'same-origin', headers:{'Accept':'application/json'}});
+    var j = await r.json();
+    if (j.ok) {
+      box.className = 'testbox show ok';
+      box.textContent = '✓ اتصال برقرار شد — حالت: ' + j.mode + ' — پیام‌های جدید: ' + j.unread + (j.has_imap ? ' — ext/imap فعال' : ' — ext/imap غایب، socket fallback');
+    } else {
+      box.className = 'testbox show fail';
+      box.textContent = '✗ ' + (j.error || 'خطای ناشناخته');
+    }
+  } catch (e) {
+    box.className = 'testbox show fail';
+    box.textContent = '✗ خطای شبکه: ' + e.message;
+  }
+});
 </script>
 </body></html>
 <?php
     exit;
-}
-
-// ─── POST: Step 2 process ────────────────────────────────────
-if ($action == 'email_add_step2_process') {
-    if (!isset($_SESSION['user'])) { header("Location: index.php"); exit; }
-    if (!userNeedsEmailAdd($pdo)) {
-        header("Location: ?action=dashboard&msg=email_already_verified"); exit;
-    }
-    verifyCsrf();
-    if (empty($_SESSION['pending_email_add'])) {
-        header("Location: ?action=email_add_step1"); exit;
-    }
-    $pending = $_SESSION['pending_email_add'];
-
-    $code = trim($_POST['otp_code'] ?? '');
-    $captchaAnswer = $_POST['captcha'] ?? '';
-
-    if (!math_captcha_verify($captchaAnswer)) {
-        header("Location: ?action=email_add_step2&error=captcha_wrong"); exit;
-    }
-
-    $verify = verify_email_otp($pdo, $pending['email'], $code, 'email_add');
-    if (!$verify['ok']) {
-        header("Location: ?action=email_add_step2&error=" . urlencode($verify['reason'])); exit;
-    }
-
-    // Race-check: email might have been claimed during step 2
-    $st = $pdo->prepare("SELECT id FROM users WHERE email = ? AND id != ?");
-    $st->execute([$pending['email'], $pending['user_id']]);
-    if ($st->fetch()) {
-        unset($_SESSION['pending_email_add']);
-        header("Location: ?action=email_add_step1&error=email_taken"); exit;
-    }
-
-    $pdo->prepare("UPDATE users SET email = ?, email_verified = 1, email_verified_at = NOW() WHERE id = ?")
-        ->execute([$pending['email'], $pending['user_id']]);
-
-    unset($_SESSION['pending_email_add']);
-    unset($_SESSION['email_banner_dismissed']);
-
-    logActivity($pdo, $_SESSION['user'], 'email_add_completed', $pending['email']);
-    header("Location: ?action=dashboard&msg=email_added"); exit;
-}
-
-// ─── POST: Resend OTP ────────────────────────────────────────
-if ($action == 'email_add_resend') {
-    if (!isset($_SESSION['user'])) { header("Location: index.php"); exit; }
-    if (!userNeedsEmailAdd($pdo)) {
-        header("Location: ?action=dashboard&msg=email_already_verified"); exit;
-    }
-    verifyCsrf();
-    if (empty($_SESSION['pending_email_add'])) {
-        header("Location: ?action=email_add_step1"); exit;
-    }
-    $pending = $_SESSION['pending_email_add'];
-    $payload = json_encode(['user_id' => $pending['user_id'], 'username' => $_SESSION['user']]);
-    $result = request_email_otp($pdo, $pending['email'], 'email_add', $payload);
-    if ($result['ok']) {
-        $_SESSION['pending_email_add']['expires_at'] = $result['expires_at'];
-        header("Location: ?action=email_add_step2&msg=resent"); exit;
-    }
-    header("Location: ?action=email_add_step2&error=" . urlencode($result['reason'] ?? 'send_failed')); exit;
 }
 
 // ================================================================
@@ -4537,6 +5012,7 @@ elseif($action=='dashboard'){
                 </a>
                 <a href="?action=activity_log" class="nav-btn nb-log" title="لاگ"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg><span class="btn-text">لاگ</span></a>
                 <a href="?action=users" class="nav-btn nb-users" title="کاربران"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/></svg><span class="btn-text">کاربران</span></a>
+                <a href="?action=inbound_settings" class="nav-btn nb-users" title="دریافت ایمیل"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22,6 12,13 2,6"/></svg><span class="btn-text">📨</span></a>
                 <?php endif;?>
                 <a href="?action=logout" class="nav-btn nb-logout" title="خروج"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg><span class="btn-text">خروج</span></a>
             </div>
@@ -5955,10 +6431,11 @@ elseif($action=='trash'){
 elseif($action=='users'){
     if(!isset($_SESSION['user'])||$_SESSION['role']!=='admin'){header("Location: index.php");exit;}
     $csrf=generateCsrfToken();
-    $users=$pdo->query("SELECT id,username,role,can_download,can_change_password,can_delete,can_share,created_at FROM users ORDER BY id ASC")->fetchAll();
+    $users=$pdo->query("SELECT id,username,role,can_download,can_change_password,can_delete,can_share,created_at,email,email_verified FROM users ORDER BY id ASC")->fetchAll();
     $umsgs=['user_added'=>['✅','کاربر اضافه شد'],'user_deleted'=>['🗑️','کاربر حذف شد'],'user_exists'=>['⚠️','نام کاربری موجود است'],
         'invalid_input'=>['❌','اطلاعات نامعتبر'],'delete_error'=>['❌','خطا در حذف'],'perms_updated'=>['✅','دسترسی به‌روز شد'],
-        'perms_error'=>['❌','خطا در تغییر دسترسی'],'password_changed'=>['✅','رمز تغییر کرد'],'password_error'=>['❌','خطا در تغییر رمز']];
+        'perms_error'=>['❌','خطا در تغییر دسترسی'],'password_changed'=>['✅','رمز تغییر کرد'],'password_error'=>['❌','خطا در تغییر رمز'],
+        'email_set'=>['✅','ایمیل به‌روز شد'],'email_invalid'=>['❌','فرمت ایمیل نامعتبر'],'email_taken'=>['⚠️','این ایمیل برای کاربر دیگری ثبت شده'],'email_error'=>['❌','خطا در ثبت ایمیل']];
     $msg=$_GET['msg']??'';
     ?><!DOCTYPE html><html lang="fa" dir="rtl"><head>
     <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
@@ -6120,6 +6597,26 @@ elseif($action=='users'){
                     <?php else:?><span style="font-size:.7rem;color:#64748b">شما</span><?php endif;?>
                 </div>
                 <div class="user-storage">💾 <?php echo $uf;?> فایل — <?php echo formatBytes($us);?></div>
+                <div class="email-section" style="margin:8px 0;padding:8px;background:rgba(15,23,42,.4);border-radius:8px;border:1px solid #1e293b">
+                    <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap">
+                        <div style="font-size:.78rem">
+                            <span style="color:#94a3b8">ایمیل:</span>
+                            <?php if (!empty($u['email'])): ?>
+                                <span style="color:#fde68a;direction:ltr;font-family:Consolas,monospace"><?php echo h($u['email']); ?></span>
+                                <?php if ((int)$u['email_verified'] === 1): ?>
+                                    <span class="badge badge-ok" style="background:#14532d;color:#bbf7d0;padding:1px 6px;border-radius:4px;font-size:.65rem;margin-right:4px">تایید شده</span>
+                                <?php else: ?>
+                                    <span class="badge" style="background:#7c2d12;color:#fed7aa;padding:1px 6px;border-radius:4px;font-size:.65rem;margin-right:4px">تایید نشده</span>
+                                <?php endif; ?>
+                            <?php else: ?>
+                                <span style="color:#64748b">ثبت نشده</span>
+                            <?php endif; ?>
+                        </div>
+                        <?php if ($u['username'] !== $_SESSION['user']): ?>
+                        <button type="button" class="ub ub-pass" style="background:#1e3a8a;color:#bfdbfe" onclick="openEmailModal(<?php echo $u['id']; ?>,'<?php echo h(addslashes($u['username'])); ?>','<?php echo h(addslashes($u['email'] ?? '')); ?>')">📧 تنظیم ایمیل</button>
+                        <?php endif; ?>
+                    </div>
+                </div>
                 <?php if($u['role']==='admin'):?>
                 <div class="admin-note">مدیر — دسترسی کامل</div>
                 <?php else:?>
@@ -6159,11 +6656,37 @@ elseif($action=='users'){
         </div>
     </div>
 
+    <div class="modal-overlay" id="emailModal">
+        <div class="modal-box">
+            <h3>📧 تنظیم ایمیل برای <span id="emailUsername" style="color:#a78bfa"></span></h3>
+            <form action="?action=admin_set_email" method="POST">
+                <input type="hidden" name="csrf_token" value="<?php echo $csrf;?>">
+                <input type="hidden" name="user_id" id="emailUserId">
+                <input type="email" name="email" id="emailInputField" placeholder="user@example.com" autocomplete="off" style="direction:ltr">
+                <label style="display:flex;align-items:center;gap:8px;margin-top:10px;font-size:.85rem;color:#cbd5e1">
+                    <input type="checkbox" name="email_verified" value="1" checked>
+                    این ایمیل تایید شده محسوب شود
+                </label>
+                <label style="display:flex;align-items:center;gap:8px;margin-top:6px;font-size:.78rem;color:#94a3b8">
+                    <input type="checkbox" name="clear_email" value="1">
+                    حذف ایمیل کاربر (نادیده گرفتن فیلد بالا)
+                </label>
+                <div class="modal-actions">
+                    <button type="button" class="btn-cancel" onclick="closeEmailModal()">انصراف</button>
+                    <button type="submit" class="btn-confirm">ذخیره</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
     <div class="toast" id="toast"></div>
     <script>
     function openPassModal(id,name){document.getElementById('passUserId').value=id;document.getElementById('passUsername').textContent=name;var m=document.getElementById('passModal');m.classList.add('open');setTimeout(()=>m.querySelector('input[name="new_password"]').focus(),100);}
     function closePassModal(){document.getElementById('passModal').classList.remove('open');}
     document.getElementById('passModal').addEventListener('click',function(e){if(e.target===this)closePassModal();});
+    function openEmailModal(id,name,curEmail){document.getElementById('emailUserId').value=id;document.getElementById('emailUsername').textContent=name;document.getElementById('emailInputField').value=curEmail||'';var m=document.getElementById('emailModal');m.classList.add('open');setTimeout(()=>document.getElementById('emailInputField').focus(),100);}
+    function closeEmailModal(){document.getElementById('emailModal').classList.remove('open');}
+    document.getElementById('emailModal').addEventListener('click',function(e){if(e.target===this)closeEmailModal();});
     (function(){const msgs=<?php echo json_encode($umsgs);?>;const msg='<?php echo h($msg);?>';
         if(msg&&msgs[msg]){const t=document.getElementById('toast');t.innerHTML='<span>'+msgs[msg][0]+'</span><span>'+msgs[msg][1]+'</span>';
             setTimeout(()=>t.classList.add('show'),80);setTimeout(()=>t.classList.remove('show'),3200);}

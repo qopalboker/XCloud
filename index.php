@@ -251,14 +251,19 @@ function inbound_ensure_folders(&$state) {
 }
 
 function inbound_list_unread(&$state, $limit) {
+    // Scan ALL messages in INBOX (not just UNSEEN). UNSEEN was unreliable
+    // because anyone previewing the inbox in webmail marks messages \Seen,
+    // which would cause cron to silently skip them. Dedup by Message-ID
+    // ensures already-processed messages are no-ops, and successful matches
+    // are moved out of INBOX so they aren't re-scanned indefinitely.
     if ($state['mode'] === 'native') {
-        $ids = @imap_search($state['conn'], 'UNSEEN', SE_UID);
+        $ids = @imap_search($state['conn'], 'ALL', SE_UID);
         if (!is_array($ids)) return [];
-        sort($ids);
+        rsort($ids); // newest UIDs first; cap at $limit keeps the most recent
         return array_slice($ids, 0, $limit);
     }
-    // Socket: UID SEARCH UNSEEN
-    $r = inbound_socket_cmd($state, 'UID SEARCH UNSEEN');
+    // Socket fallback
+    $r = inbound_socket_cmd($state, 'UID SEARCH ALL');
     if (!$r['ok']) return [];
     $uids = [];
     foreach ($r['lines'] as $line) {
@@ -268,7 +273,7 @@ function inbound_list_unread(&$state, $limit) {
             }
         }
     }
-    sort($uids);
+    rsort($uids);
     return array_slice($uids, 0, $limit);
 }
 

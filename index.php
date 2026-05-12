@@ -365,40 +365,77 @@ function inbound_decode_mime_words($s) {
 }
 
 /**
- * Parse Authentication-Results header(s). Only trusts lines stamped by the
- * configured MTA hostname (first token before the semicolon). This is the
- * key anti-spoofing gate: an attacker could include their own
- * "Authentication-Results: ..." line in the email body, but it would be
- * stamped with a different hostname.
+ * Parse SPF/DKIM result from inbound headers. Trust hierarchy:
+ *   1) Authentication-Results stamped by our configured MTA hostname.
+ *   2) Received-SPF — the FIRST (top-most) one is added by our MTA.
+ *   3) SpamAssassin X-Ham-Report / X-Spam-Report — used by cPanel Exim by
+ *      default (it doesn't add Authentication-Results). Trusted only when
+ *      the "running on the system" hostname inside the report matches our
+ *      MTA AND X-Spam-Flag: NO is also present (proves SA ran fresh and
+ *      didn't merely pass through an attacker-forged report header).
  *
- * Returns ['spf' => 'pass'|'fail'|'none', 'dkim' => same, 'trusted' => bool].
+ * Returns ['spf'=>..., 'dkim'=>..., 'trusted'=>bool].
  */
 function inbound_parse_auth_results($raw, $expectedMta) {
     $expectedMta = trim(strtolower((string)$expectedMta));
     $result = ['spf' => 'none', 'dkim' => 'none', 'trusted' => false];
-    if ($expectedMta === '') return $result;
 
-    // Unfold then grab each Authentication-Results: line
+    // Unfold continuation lines (RFC 5322 header folding)
     $unfold = preg_replace("/\r?\n[ \t]+/", ' ', $raw);
-    if (!preg_match_all('/^Authentication-Results:\s*(.+)$/im', $unfold, $matches)) {
+
+    // --- Pass 1: Authentication-Results stamped by our MTA ---
+    if ($expectedMta !== '' && preg_match_all('/^Authentication-Results:\s*(.+)$/im', $unfold, $matches)) {
+        foreach ($matches[1] as $line) {
+            $parts = explode(';', $line);
+            $stampedBy = trim(strtolower(array_shift($parts)));
+            $stampedBy = preg_replace('/\s+.*$/', '', $stampedBy);
+            if ($stampedBy !== $expectedMta) continue;
+            $result['trusted'] = true;
+            foreach ($parts as $kv) {
+                $kv = trim($kv);
+                if (preg_match('/^spf\s*=\s*([a-z]+)/i', $kv, $m)) {
+                    $result['spf'] = strtolower($m[1]);
+                } elseif (preg_match('/^dkim\s*=\s*([a-z]+)/i', $kv, $m)) {
+                    $result['dkim'] = strtolower($m[1]);
+                }
+            }
+        }
+        if ($result['trusted']) return $result;
+    }
+
+    // --- Pass 2: First Received-SPF (top-most = added by our MTA) ---
+    if (preg_match('/^Received-SPF:\s*([a-z]+)/im', $unfold, $m)) {
+        $result['spf']     = strtolower($m[1]);
+        $result['trusted'] = true;
         return $result;
     }
-    foreach ($matches[1] as $line) {
-        $parts = explode(';', $line);
-        $stampedBy = trim(strtolower(array_shift($parts)));
-        // Some servers add "i=..." after the hostname; strip
-        $stampedBy = preg_replace('/\s+.*$/', '', $stampedBy);
-        if ($stampedBy !== $expectedMta) continue;
-        $result['trusted'] = true;
-        foreach ($parts as $kv) {
-            $kv = trim($kv);
-            if (preg_match('/^spf\s*=\s*([a-z]+)/i', $kv, $m)) {
-                $result['spf'] = strtolower($m[1]);
-            } elseif (preg_match('/^dkim\s*=\s*([a-z]+)/i', $kv, $m)) {
-                $result['dkim'] = strtolower($m[1]);
+
+    // --- Pass 3: SpamAssassin report header (cPanel Exim default) ---
+    if ($expectedMta !== '' && preg_match('/^X-(?:Ham|Spam)-Report:\s*(.+)$/im', $unfold, $m)) {
+        $report = $m[1];
+        $hostMatch = preg_match('/running on the system\s+"([^"]+)"/i', $report, $sm);
+        $flagMatch = preg_match('/^X-Spam-Flag:\s*(YES|NO)/im', $unfold, $fm);
+        if ($hostMatch && $flagMatch) {
+            $reportMta = trim(strtolower($sm[1]));
+            $spamFlag  = strtoupper(trim($fm[1]));
+            if ($reportMta === $expectedMta && $spamFlag === 'NO') {
+                $result['trusted'] = true;
+                // Trailing \b intentionally omitted so DKIM_VALID also captures
+                // DKIM_VALID_AU and DKIM_VALID_EF variants.
+                if (preg_match('/\bSPF_(?:PASS|HELO_PASS)\b/', $report)) {
+                    $result['spf'] = 'pass';
+                } elseif (preg_match('/\bSPF_(?:FAIL|SOFTFAIL)\b/', $report)) {
+                    $result['spf'] = 'fail';
+                }
+                if (preg_match('/\bDKIM_VALID/', $report)) {
+                    $result['dkim'] = 'pass';
+                } elseif (preg_match('/\bDKIM_INVALID/', $report)) {
+                    $result['dkim'] = 'fail';
+                }
             }
         }
     }
+
     return $result;
 }
 

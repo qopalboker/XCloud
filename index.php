@@ -440,21 +440,25 @@ function inbound_parse_auth_results($raw, $expectedMta) {
 }
 
 /**
- * Extract an XV-XXXXXXXX token from a subject. Strips common forward/reply
- * prefixes and decodes MIME-encoded words. Returns uppercase token or null.
+ * Extract a 6-char Base32 token from a subject. Strips common forward/reply
+ * prefixes. Returns uppercase token or null.
  */
 function inbound_extract_token($subject) {
     if ($subject === '' || $subject === null) return null;
-    // Strip Re:/Fwd:/[Tag] prefixes iteratively
     $s = trim($subject);
+    // Strip Re:/Fwd:/[Tag] prefixes iteratively
     for ($i = 0; $i < 8; $i++) {
         $before = $s;
         $s = preg_replace('/^\s*(re|fw|fwd|پاسخ|ارجاع)\s*:\s*/iu', '', $s);
         $s = preg_replace('/^\s*\[[^\]]{1,40}\]\s*/u', '', $s);
         if ($s === $before) break;
     }
-    if (preg_match('/\bXV-([A-Z2-9]{8})\b/i', $s, $m)) {
-        return 'XV-' . strtoupper($m[1]);
+    // Match exactly 6 Base32 chars (no 0/O/1/I/L) — case insensitive
+    if (preg_match('/\b([A-Z2-9]{6})\b/i', $s, $m)) {
+        $token = strtoupper($m[1]);
+        // Reject if it contains forbidden chars (defensive — shouldn't match anyway)
+        if (preg_match('/[01OIL]/', $token)) return null;
+        return $token;
     }
     return null;
 }
@@ -545,15 +549,24 @@ function inbound_apply_payload($pdo, array $otpRow) {
         $st = $pdo->prepare("SELECT id FROM users WHERE username = ? OR email = ?");
         $st->execute([$username, $email]);
         if ($st->fetch()) return;
-        $cd   = (int)getSetting($pdo, 'default_user_can_download', 1);
-        $ccp  = (int)getSetting($pdo, 'default_user_can_change_password', 1);
-        $cdel = (int)getSetting($pdo, 'default_user_can_delete', 0);
-        $csh  = (int)getSetting($pdo, 'default_user_can_share', 0);
+        // Email-verified self-registered users get full permissions by design.
+        // Admin-created users continue to use default_user_can_* settings.
         $ins = $pdo->prepare("INSERT INTO users
             (username, password, email, email_verified, email_verified_at, role,
              can_download, can_change_password, can_delete, can_share)
-            VALUES (?, ?, ?, 1, NOW(), 'user', ?, ?, ?, ?)");
-        $ins->execute([$username, $payload['password_hash'], $email, $cd, $ccp, $cdel, $csh]);
+            VALUES (?, ?, ?, 1, NOW(), 'user', 1, 1, 1, 1)");
+        $ins->execute([$username, $payload['password_hash'], $email]);
+        // Record referral use if the request carried a validated code id.
+        if (!empty($payload['referral_code_id'])) {
+            $rid = (int)$payload['referral_code_id'];
+            $ip  = $payload['referral_ip'] ?? null;
+            try {
+                $pdo->prepare("INSERT INTO referral_uses (referral_code_id, used_by_username, used_by_email, ip_address) VALUES (?,?,?,?)")
+                    ->execute([$rid, $username, $email, $ip]);
+                $pdo->prepare("UPDATE referral_codes SET use_count = use_count + 1 WHERE id = ?")
+                    ->execute([$rid]);
+            } catch (Exception $e) { /* code may have been revoked between issue and verify */ }
+        }
         logActivity($pdo, $username, 'inbound_register_completed', $email);
     } elseif ($purpose === 'email_add') {
         // Admin-only flow in Phase 10; supports legacy email_add OTPs too.
@@ -729,18 +742,55 @@ function inbound_run($pdo, $maxOverride = null) {
 // ================================================================
 
 /**
- * Generate an inbound-verification token in the form XV-XXXXXXXX.
+ * Generate an inbound-verification token (6 chars, Base32-style).
  * Alphabet drops ambiguous chars (0/O/1/I/L) so users can hand-copy
- * the token if they need to.
+ * the token if they need to. The subject is just the 6 chars — no prefix.
  */
-function generate_otp_code($length = 8) {
-    $alphabet = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789'; // 31 chars
+function generate_otp_code($length = 6) {
+    $alphabet = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789'; // 31 chars, no 0/O/1/I/L
+    $out = '';
     $max = strlen($alphabet) - 1;
-    $body = '';
     for ($i = 0; $i < $length; $i++) {
-        $body .= $alphabet[random_int(0, $max)];
+        $out .= $alphabet[random_int(0, $max)];
     }
-    return 'XV-' . $body;
+    return $out;
+}
+
+/**
+ * Generate a fresh 8-char referral code from the same Base32-style alphabet.
+ * Caller is responsible for collision check on insert.
+ */
+function generate_referral_code() {
+    $alphabet = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
+    $max = strlen($alphabet) - 1;
+    $out = '';
+    for ($i = 0; $i < 8; $i++) {
+        $out .= $alphabet[random_int(0, $max)];
+    }
+    return $out;
+}
+
+/**
+ * Validate a user-submitted referral code. Returns ['ok'=>true,'id'=>...] on
+ * success, or ['ok'=>false,'reason'=>...] (empty|invalid|expired|used).
+ */
+function validate_referral_code($pdo, $code) {
+    $code = strtoupper(trim((string)$code));
+    if ($code === '') return ['ok' => false, 'reason' => 'empty'];
+    $st = $pdo->prepare("SELECT * FROM referral_codes WHERE code = ? AND revoked_at IS NULL");
+    $st->execute([$code]);
+    $row = $st->fetch();
+    if (!$row) return ['ok' => false, 'reason' => 'invalid'];
+    if (!empty($row['expires_at']) && strtotime($row['expires_at']) < time()) {
+        return ['ok' => false, 'reason' => 'expired'];
+    }
+    if ($row['code_type'] === 'single' && (int)$row['use_count'] >= 1) {
+        return ['ok' => false, 'reason' => 'used'];
+    }
+    if ($row['code_type'] === 'multi' && (int)$row['use_count'] >= (int)$row['max_uses']) {
+        return ['ok' => false, 'reason' => 'used'];
+    }
+    return ['ok' => true, 'id' => (int)$row['id'], 'code' => $row['code']];
 }
 
 function hash_otp($pdo, $code) {
@@ -849,7 +899,7 @@ function request_email_otp($pdo, $email, $purpose = 'register', $payload = null)
 
     $ttlMin     = max(1, min(120, (int)getSetting($pdo, 'otp_ttl_minutes', 30)));
     $maxAttempt = max(3, min(10, (int)getSetting($pdo, 'otp_max_attempts', 5)));
-    $token      = generate_otp_code(8);
+    $token      = generate_otp_code();
     $hash       = hash_otp($pdo, $token);
     $expiresAt  = date('Y-m-d H:i:s', time() + $ttlMin * 60);
 
@@ -884,8 +934,8 @@ function verify_email_otp($pdo, $email, $code, $purpose = 'register') {
     $email = trim(mb_strtolower($email));
     $code  = strtoupper(trim($code));
 
-    // Accept XV- inbound tokens (post-Phase 3) only.
-    if (!preg_match('/^XV-[A-Z2-9]{8}$/', $code)) {
+    // Accept 6-char Base32 inbound tokens only (no 0/O/1/I/L).
+    if (!preg_match('/^[A-Z2-9]{6}$/', $code)) {
         return ['ok' => false, 'reason' => 'invalid_format'];
     }
 
@@ -1020,7 +1070,8 @@ catch(PDOException $e){die("خطا در ارتباط با دیتابیس");}
 // Create tables
 $pdo->exec("CREATE TABLE IF NOT EXISTS users (id INT AUTO_INCREMENT PRIMARY KEY,username VARCHAR(50) UNIQUE NOT NULL,password VARCHAR(255) NOT NULL,role VARCHAR(20) DEFAULT 'user',can_download TINYINT(1) NOT NULL DEFAULT 0,can_change_password TINYINT(1) NOT NULL DEFAULT 0,can_delete TINYINT(1) NOT NULL DEFAULT 0,created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)");
 $pdo->exec("CREATE TABLE IF NOT EXISTS activity_log (id INT AUTO_INCREMENT PRIMARY KEY,username VARCHAR(50) NOT NULL,action_type VARCHAR(30) NOT NULL,target VARCHAR(500) DEFAULT NULL,details TEXT DEFAULT NULL,ip_address VARCHAR(45) DEFAULT NULL,created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,INDEX idx_username(username),INDEX idx_action(action_type),INDEX idx_created(created_at))");
-$pdo->exec("CREATE TABLE IF NOT EXISTS trash_items (id INT AUTO_INCREMENT PRIMARY KEY,original_owner VARCHAR(50) NOT NULL,original_filename VARCHAR(500) NOT NULL,trash_filename VARCHAR(600) NOT NULL,deleted_by VARCHAR(50) NOT NULL,file_size BIGINT DEFAULT 0,deleted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,INDEX idx_owner(original_owner),INDEX idx_deleted(deleted_at))");
+$pdo->exec("CREATE TABLE IF NOT EXISTS trash_items (id INT AUTO_INCREMENT PRIMARY KEY,original_owner VARCHAR(50) NOT NULL,original_filename VARCHAR(500) NOT NULL,trash_filename VARCHAR(600) NOT NULL,deleted_by VARCHAR(50) NOT NULL,file_size BIGINT DEFAULT 0,is_public TINYINT(1) NOT NULL DEFAULT 0,deleted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,INDEX idx_owner(original_owner),INDEX idx_deleted(deleted_at))");
+try{$pdo->exec("ALTER TABLE trash_items ADD COLUMN is_public TINYINT(1) NOT NULL DEFAULT 0");}catch(Exception $e){}
 $pdo->exec("CREATE TABLE IF NOT EXISTS settings (id INT AUTO_INCREMENT PRIMARY KEY,setting_key VARCHAR(100) UNIQUE NOT NULL,setting_value TEXT,updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP)");
 
 $pdo->exec("CREATE TABLE IF NOT EXISTS passkeys (
@@ -1087,6 +1138,16 @@ $pdo->exec("CREATE TABLE IF NOT EXISTS email_otps (
     INDEX idx_expires (expires_at)
 )");
 
+// One-time migration: existing pending OTPs use the legacy XV-XXXXXXXX hash
+// format. After switching to 6-char tokens those rows can never be matched, so
+// mark them consumed and force a fresh OTP issuance.
+try {
+    if (getSetting($pdo, 'otp_format_v2_migrated', '0') !== '1') {
+        $pdo->exec("UPDATE email_otps SET consumed_at = NOW() WHERE consumed_at IS NULL");
+        setSetting($pdo, 'otp_format_v2_migrated', '1');
+    }
+} catch (Exception $e) {}
+
 $pdo->exec("CREATE TABLE IF NOT EXISTS email_send_log (
     id INT AUTO_INCREMENT PRIMARY KEY,
     email VARCHAR(255) NOT NULL,
@@ -1111,6 +1172,32 @@ $pdo->exec("CREATE TABLE IF NOT EXISTS email_inbound_processed (
     UNIQUE KEY uq_message_id (message_id),
     INDEX idx_processed_at (processed_at),
     INDEX idx_outcome (outcome)
+)");
+
+// Referral / invite codes
+$pdo->exec("CREATE TABLE IF NOT EXISTS referral_codes (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    code VARCHAR(20) UNIQUE NOT NULL,
+    code_type ENUM('single','multi','unlimited') NOT NULL DEFAULT 'single',
+    max_uses INT DEFAULT NULL,
+    use_count INT NOT NULL DEFAULT 0,
+    expires_at TIMESTAMP NULL DEFAULT NULL,
+    label VARCHAR(100) DEFAULT NULL,
+    created_by VARCHAR(50) NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    revoked_at TIMESTAMP NULL DEFAULT NULL,
+    INDEX idx_code (code),
+    INDEX idx_created_by (created_by)
+)");
+$pdo->exec("CREATE TABLE IF NOT EXISTS referral_uses (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    referral_code_id INT NOT NULL,
+    used_by_username VARCHAR(50) NOT NULL,
+    used_by_email VARCHAR(255) NOT NULL,
+    used_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    ip_address VARCHAR(45) DEFAULT NULL,
+    INDEX idx_code_id (referral_code_id),
+    FOREIGN KEY (referral_code_id) REFERENCES referral_codes(id) ON DELETE CASCADE
 )");
 
 // Add can_share permission for users
@@ -1355,6 +1442,403 @@ function renderSharePageStyles(): string {
         .err-icon { font-size: 4rem; text-align: center; margin-bottom: 16px; color: #ef4444; }
         .err-msg { text-align: center; font-size: 1rem; color: #fca5a5; }
     ";
+}
+
+/**
+ * Returns true when the caller asked for application/json (SPA fetch path).
+ * Process handlers branch on this to emit JSON instead of 302 redirects so
+ * the SPA can swap views without a full reload.
+ */
+function wants_json(): bool {
+    $accept = $_SERVER['HTTP_ACCEPT'] ?? '';
+    return stripos($accept, 'application/json') !== false;
+}
+
+function auth_json_err(string $error, array $extra = []): void {
+    header('Content-Type: application/json');
+    echo json_encode(array_merge(['ok' => false, 'error' => $error], $extra));
+    exit;
+}
+
+function auth_json_ok(array $data = []): void {
+    header('Content-Type: application/json');
+    echo json_encode(array_merge(['ok' => true], $data));
+    exit;
+}
+
+/**
+ * Snapshot of the live verify-view state for the SPA. Returns null when
+ * there is no pending verification for either flow.
+ */
+function spa_verify_snapshot(): ?array {
+    if (!empty($_SESSION['pending_password_reset'])) {
+        $p = $_SESSION['pending_password_reset'];
+        return [
+            'flow'        => 'reset',
+            'token'       => $p['token'] ?? '',
+            'user_email'  => $p['email'] ?? '',
+            'expires_at'  => isset($p['expires_at']) ? strtotime($p['expires_at']) : null,
+            'next_redirect' => '?action=auth_shell&view=newpass',
+        ];
+    }
+    if (!empty($_SESSION['pending_registration'])) {
+        $p = $_SESSION['pending_registration'];
+        return [
+            'flow'        => 'register',
+            'token'       => $p['token'] ?? '',
+            'user_email'  => $p['email'] ?? '',
+            'expires_at'  => isset($p['expires_at']) ? strtotime($p['expires_at']) : null,
+            'next_redirect' => '?action=dashboard',
+        ];
+    }
+    return null;
+}
+
+function getAuthSharedCss(): string {
+    return getDanaFontFaceCss() . <<<'CSS'
+body {
+    margin: 0;
+    font-family: 'Dana', -apple-system, system-ui, Tahoma, sans-serif;
+    background: #0a0e1a;
+    color: #e2e8f0;
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 20px;
+    position: relative;
+    overflow-x: hidden;
+}
+*, *::before, *::after { box-sizing: border-box; }
+.bg-glow {
+    position: fixed;
+    border-radius: 50%;
+    filter: blur(80px);
+    z-index: 0;
+    pointer-events: none;
+}
+.bg-glow-1 {
+    width: 400px; height: 400px;
+    background: radial-gradient(circle, rgba(59,130,246,.25), transparent);
+    top: -100px; right: -100px;
+}
+.bg-glow-2 {
+    width: 350px; height: 350px;
+    background: radial-gradient(circle, rgba(139,92,246,.2), transparent);
+    bottom: -100px; left: -100px;
+}
+.auth-card {
+    position: relative;
+    z-index: 1;
+    max-width: 440px;
+    width: 100%;
+    background: rgba(17,24,39,.85);
+    backdrop-filter: blur(12px);
+    border: 1.5px solid rgba(255,255,255,.06);
+    border-radius: 20px;
+    padding: 36px 32px;
+    box-shadow: 0 20px 60px rgba(0,0,0,.4);
+}
+.auth-card h1 {
+    font-size: 1.5rem;
+    margin: 0 0 10px;
+    background: linear-gradient(135deg,#3b82f6,#8b5cf6);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+    text-align: center;
+    font-weight: 900;
+}
+.auth-subtitle {
+    color: #94a3b8;
+    font-size: .85rem;
+    text-align: center;
+    margin-bottom: 24px;
+    line-height: 1.7;
+}
+.field { margin-bottom: 14px; }
+.field label {
+    display: block;
+    color: #cbd5e1;
+    font-size: .82rem;
+    margin-bottom: 6px;
+    font-weight: 600;
+}
+.field input {
+    width: 100%;
+    background: rgba(15,23,42,.6);
+    border: 1.5px solid rgba(255,255,255,.06);
+    color: #f1f5f9;
+    padding: 11px 14px;
+    border-radius: 12px;
+    font-family: inherit;
+    font-size: .9rem;
+    box-sizing: border-box;
+    transition: border-color .2s, background .2s;
+}
+.field input:focus {
+    outline: none;
+    border-color: #3b82f6;
+    background: rgba(15,23,42,.9);
+}
+.field .hint { color: #64748b; font-size: .72rem; margin-top: 4px; }
+.btn-primary {
+    width: 100%;
+    background: linear-gradient(135deg,#3b82f6,#6366f1);
+    color: #fff;
+    border: none;
+    padding: 13px;
+    border-radius: 12px;
+    font-weight: 700;
+    font-size: .95rem;
+    cursor: pointer;
+    font-family: inherit;
+    margin-top: 8px;
+    transition: transform .1s, box-shadow .2s;
+    display: block;
+    text-decoration: none;
+    text-align: center;
+    box-sizing: border-box;
+}
+.btn-primary:hover { box-shadow: 0 10px 30px rgba(59,130,246,.3); }
+.btn-primary:active { transform: scale(.98); }
+.btn-secondary {
+    width: 100%;
+    background: rgba(51,65,85,.5);
+    color: #e2e8f0;
+    border: 1.5px solid rgba(255,255,255,.06);
+    padding: 12px;
+    border-radius: 12px;
+    font-weight: 600;
+    font-family: inherit;
+    cursor: pointer;
+    margin-top: 8px;
+    font-size: .9rem;
+    transition: background .15s;
+}
+.btn-secondary:hover { background: rgba(51,65,85,.8); }
+.alert-err {
+    background: rgba(127,29,29,.4);
+    border: 1px solid rgba(239,68,68,.3);
+    color: #fee2e2;
+    padding: 10px 14px;
+    border-radius: 10px;
+    margin-bottom: 16px;
+    font-size: .85rem;
+    text-align: center;
+}
+.alert-ok {
+    background: rgba(20,83,45,.4);
+    border: 1px solid rgba(34,197,94,.3);
+    color: #bbf7d0;
+    padding: 10px 14px;
+    border-radius: 10px;
+    margin-bottom: 16px;
+    font-size: .85rem;
+    text-align: center;
+}
+.alert-info {
+    background: rgba(30,58,138,.3);
+    border: 1px solid rgba(59,130,246,.3);
+    color: #bfdbfe;
+    padding: 10px 14px;
+    border-radius: 10px;
+    margin-bottom: 16px;
+    font-size: .8rem;
+    line-height: 1.6;
+}
+.alert-info b { color: #93c5fd; }
+.links-row {
+    display: flex;
+    justify-content: space-between;
+    margin-top: 16px;
+    font-size: .82rem;
+    color: #94a3b8;
+    gap: 10px;
+    flex-wrap: wrap;
+}
+.links-row a {
+    color: #3b82f6;
+    text-decoration: none;
+    font-weight: 600;
+}
+.text-link {
+    background: none;
+    border: none;
+    color: #3b82f6;
+    font-weight: 600;
+    cursor: pointer;
+    font-family: inherit;
+    font-size: inherit;
+    padding: 0;
+}
+.captcha-box {
+    background: rgba(15,23,42,.6);
+    border: 1.5px solid rgba(255,255,255,.06);
+    padding: 8px;
+    border-radius: 12px;
+    margin-bottom: 8px;
+    text-align: center;
+}
+.captcha-box img {
+    display: inline-block;
+    border-radius: 6px;
+    max-width: 100%;
+}
+.verify-block {
+    background: rgba(15,23,42,.4);
+    border: 1px solid rgba(255,255,255,.05);
+    border-radius: 12px;
+    padding: 12px 14px;
+    margin-bottom: 10px;
+}
+.verify-block.center {
+    background: linear-gradient(135deg, rgba(59,130,246,.08), rgba(139,92,246,.08));
+    border-color: rgba(59,130,246,.2);
+    padding: 18px 14px;
+    text-align: center;
+}
+.block-label {
+    display: block;
+    color: #64748b;
+    font-size: .7rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: .08em;
+    margin-bottom: 6px;
+}
+.block-value-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.block-value {
+    flex: 1;
+    color: #fde68a;
+    font-family: 'JetBrains Mono', Consolas, monospace;
+    font-size: .95rem;
+    direction: ltr;
+    text-align: left;
+    overflow-wrap: anywhere;
+}
+.block-value-plain {
+    color: #cbd5e1;
+    font-family: 'JetBrains Mono', Consolas, monospace;
+    font-size: .88rem;
+    direction: ltr;
+    display: block;
+    text-align: center;
+}
+.code-display {
+    font-family: 'JetBrains Mono', Consolas, monospace;
+    font-size: 2.6rem;
+    font-weight: 700;
+    color: #a5b4fc;
+    letter-spacing: .15em;
+    margin: 8px 0;
+    padding: 8px;
+    direction: ltr;
+    user-select: all;
+    cursor: pointer;
+}
+.copy-btn {
+    background: rgba(51,65,85,.6);
+    color: #e2e8f0;
+    border: 1px solid rgba(255,255,255,.06);
+    border-radius: 8px;
+    padding: 6px 10px;
+    cursor: pointer;
+    font-size: .9rem;
+    font-family: inherit;
+    transition: background .15s;
+}
+.copy-btn:hover { background: rgba(71,85,105,.8); }
+.copy-btn.copied { background: rgba(20,83,45,.6); color: #bbf7d0; }
+.copy-btn-wide {
+    width: 100%;
+    background: rgba(51,65,85,.5);
+    color: #cbd5e1;
+    border: 1px solid rgba(255,255,255,.06);
+    border-radius: 10px;
+    padding: 10px;
+    cursor: pointer;
+    font-family: inherit;
+    font-size: .85rem;
+    font-weight: 600;
+    margin-top: 8px;
+}
+.copy-btn-wide.copied { background: rgba(20,83,45,.5); color: #bbf7d0; }
+.check-btn { position: relative; display: flex; align-items: center; justify-content: center; gap: 8px; }
+.check-btn[disabled] { opacity: .6; cursor: not-allowed; }
+.spinner-sm {
+    width: 14px; height: 14px;
+    border: 2px solid rgba(255,255,255,.2);
+    border-top-color: #cbd5e1;
+    border-radius: 50%;
+    animation: spin .7s linear infinite;
+    display: inline-block;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+.status-line {
+    margin-top: 16px;
+    padding: 12px;
+    background: rgba(15,23,42,.4);
+    border: 1px solid rgba(255,255,255,.06);
+    border-radius: 12px;
+    text-align: center;
+    font-size: .85rem;
+    color: #cbd5e1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
+}
+.status-line.ok {
+    background: rgba(20,83,45,.4);
+    color: #bbf7d0;
+    border-color: rgba(34,197,94,.3);
+}
+.status-line.fail {
+    background: rgba(127,29,29,.4);
+    color: #fee2e2;
+    border-color: rgba(239,68,68,.3);
+}
+.spinner {
+    width: 16px; height: 16px;
+    border: 2px solid rgba(255,255,255,.1);
+    border-top-color: #3b82f6;
+    border-radius: 50%;
+    animation: spin .8s linear infinite;
+}
+.timer-wrap {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    margin-top: 14px;
+    position: relative;
+}
+.timer-ring { transform: rotate(-90deg); }
+.timer-track {
+    fill: none;
+    stroke: rgba(255,255,255,.08);
+    stroke-width: 6;
+}
+.timer-progress {
+    fill: none;
+    stroke: url(#timerGrad);
+    stroke-width: 6;
+    stroke-linecap: round;
+    stroke-dasharray: 264;
+    stroke-dashoffset: 0;
+    transition: stroke-dashoffset 1s linear;
+}
+.timer-text {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    font-family: 'JetBrains Mono', Consolas, monospace;
+    font-size: .85rem;
+    color: #a5b4fc;
+    font-weight: 700;
+}
+CSS;
 }
 
 function renderSharePublicPage(array $share): void {
@@ -1752,6 +2236,8 @@ $defaultSettings = [
     'inbound_max_messages_per_run'    => '50',
     'inbound_last_cron_run_at'        => '',
     'inbound_last_cron_result'        => '',
+    // Referral / invite codes
+    'registration_requires_referral'  => '0',
 ];
 foreach($defaultSettings as $k=>$v){
     $pdo->prepare("INSERT IGNORE INTO settings (setting_key,setting_value) VALUES(?,?)")
@@ -2159,12 +2645,579 @@ if($action==='passkey_delete'){
     exit;
 }
 
+// ================================================================
+// AUTH SPA SHELL — single document with all 5 views
+// ================================================================
+if ($action == 'auth_shell') {
+    if (isset($_SESSION['user'])) { header("Location: ?action=dashboard"); exit; }
+    $allowedViews = ['login','register','forgot','verify','newpass'];
+    $view = $_GET['view'] ?? 'login';
+    if (!in_array($view, $allowedViews, true)) $view = 'login';
+
+    $csrf = generateCsrfToken();
+    $regEnabled = registrationEnabled($pdo);
+    $requiresReferral = getSetting($pdo, 'registration_requires_referral', '0') === '1';
+    $toAddr = getSetting($pdo, 'inbound_to_address', 'xcloud@retrivo.ir');
+    $verifyData = spa_verify_snapshot();
+    $hasResetAuth = !empty($_SESSION['reset_authorized_otp_id']) &&
+                    !empty($_SESSION['reset_authorized_at']) &&
+                    (time() - (int)$_SESSION['reset_authorized_at']) <= 300;
+
+    // Force valid initial view based on session state
+    if ($view === 'verify'  && !$verifyData)    $view = 'login';
+    if ($view === 'newpass' && !$hasResetAuth)  $view = 'login';
+    if ($view === 'register' && !$regEnabled)   $view = 'login';
+
+    $loginError = isset($_GET['error']) ? '⚠️ نام کاربری یا رمز عبور اشتباه است.' : '';
+    $loginMsg = ($_GET['msg'] ?? '') === 'password_reset_success' ? '✅ رمز عبور با موفقیت تغییر کرد. وارد شوید.' : '';
+
+    $verifyTokenJs   = $verifyData['token']      ?? '';
+    $verifyEmailJs   = $verifyData['user_email'] ?? '';
+    $verifyExpiresJs = $verifyData['expires_at'] ?? 0;
+    $verifyFlowJs    = $verifyData['flow']       ?? 'register';
+    $verifyNextJs    = $verifyData['next_redirect'] ?? '?action=dashboard';
+?>
+<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>XCloud — احراز هویت</title>
+<?= renderHeadAssets() ?>
+<style>
+<?= getAuthSharedCss() ?>
+section[data-view]{transition:opacity .25s ease;opacity:1}
+section[data-view].is-hidden{opacity:0;pointer-events:none;position:absolute;visibility:hidden;left:-9999px;top:-9999px}
+.auth-link-row{margin-top:14px;text-align:center;font-size:.82rem;color:#94a3b8}
+.auth-link-row a,.auth-link-row button.text-link{color:#3b82f6;text-decoration:none;font-weight:600;background:none;border:none;font-family:inherit;font-size:inherit;cursor:pointer;padding:0}
+.spa-noscript{background:rgba(127,29,29,.4);border:1px solid rgba(239,68,68,.3);color:#fee2e2;padding:10px 14px;border-radius:10px;margin-bottom:16px;font-size:.85rem;text-align:center}
+</style>
+</head>
+<body data-initial-view="<?= h($view) ?>">
+<div class="bg-glow bg-glow-1"></div>
+<div class="bg-glow bg-glow-2"></div>
+
+<noscript>
+  <div class="auth-card spa-noscript">
+    جاوااسکریپت غیرفعال است. لطفاً از این لینک‌های جایگزین استفاده کنید:
+    <div style="margin-top:8px"><a href="index.php">ورود</a> · <a href="?action=register_step1">ثبت‌نام</a> · <a href="?action=forgot_password_step1">فراموشی رمز</a></div>
+  </div>
+</noscript>
+
+<!-- ─── LOGIN ─────────────────────────────────────── -->
+<section data-view="login" class="<?= $view==='login'?'':'is-hidden' ?>">
+  <div class="auth-card">
+    <h1>🔐 ورود به XCloud</h1>
+    <div class="auth-subtitle">با نام کاربری یا ایمیل وارد شوید</div>
+    <div class="alert-err" data-err-slot hidden></div>
+    <?php if ($loginError): ?><div class="alert-err"><?= $loginError ?></div><?php endif; ?>
+    <?php if ($loginMsg): ?><div class="alert-ok"><?= $loginMsg ?></div><?php endif; ?>
+    <form method="POST" action="?action=login_process" data-spa-form>
+      <input type="hidden" name="csrf_token" value="<?= h($csrf) ?>">
+      <div class="field">
+        <label for="li_user">نام کاربری یا ایمیل</label>
+        <input type="text" id="li_user" name="username" required autocomplete="username">
+      </div>
+      <div class="field">
+        <label for="li_pass">رمز عبور</label>
+        <input type="password" id="li_pass" name="password" required autocomplete="current-password">
+      </div>
+      <button type="submit" class="btn-primary">ورود</button>
+    </form>
+    <div class="auth-link-row">
+      <a href="?action=auth_shell&view=forgot" data-spa-link="forgot">رمز عبور را فراموش کرده‌اید؟</a>
+    </div>
+    <?php if ($regEnabled): ?>
+    <div class="auth-link-row">
+      حساب ندارید؟ <a href="?action=auth_shell&view=register" data-spa-link="register">ثبت‌نام</a>
+    </div>
+    <?php endif; ?>
+  </div>
+</section>
+
+<!-- ─── REGISTER ──────────────────────────────────── -->
+<section data-view="register" class="<?= $view==='register'?'':'is-hidden' ?>">
+  <div class="auth-card">
+    <h1>📝 ثبت‌نام در XCloud</h1>
+    <div class="auth-subtitle">با تأیید ایمیل، حساب جدید بسازید</div>
+    <div class="alert-err" data-err-slot hidden></div>
+    <div class="alert-info">
+      💡 <b>توصیه می‌شود</b> از ایمیل‌های ایرانی (mail.ir، chmail.ir، mailfa.com) استفاده کنید. تأیید آن‌ها سریع‌تر است.
+    </div>
+    <?php if (!$regEnabled): ?>
+    <div class="alert-err">ثبت‌نام عمومی در حال حاضر غیرفعال است.</div>
+    <?php else: ?>
+    <form method="POST" action="?action=register_step1_process" data-spa-form>
+      <input type="hidden" name="csrf_token" value="<?= h($csrf) ?>">
+      <div class="field">
+        <label for="rg_email">ایمیل</label>
+        <input type="email" id="rg_email" name="email" required autocomplete="email">
+      </div>
+      <div class="field">
+        <label for="rg_user">نام کاربری</label>
+        <input type="text" id="rg_user" name="username" required autocomplete="username">
+        <div class="hint">شروع با حرف انگلیسی، ۳ تا ۳۰ کاراکتر، شامل حروف/اعداد/_/-</div>
+      </div>
+      <div class="field">
+        <label for="rg_pass">رمز عبور</label>
+        <input type="password" id="rg_pass" name="password" required autocomplete="new-password" minlength="8">
+        <div class="hint">حداقل ۸ کاراکتر، شامل حروف و اعداد</div>
+      </div>
+      <div class="field">
+        <label for="rg_pass2">تکرار رمز عبور</label>
+        <input type="password" id="rg_pass2" name="password_confirm" required autocomplete="new-password" minlength="8">
+      </div>
+      <?php if ($requiresReferral): ?>
+      <div class="field">
+        <label for="rg_ref">کد معرف</label>
+        <input type="text" id="rg_ref" name="referral_code" required autocomplete="off" style="direction:ltr;text-transform:uppercase;letter-spacing:.08em">
+        <div class="hint">برای ثبت‌نام به یک کد معرف معتبر نیاز دارید.</div>
+      </div>
+      <?php endif; ?>
+      <div class="field">
+        <label>پاسخ این محاسبه چیست؟</label>
+        <div class="captcha-box"><img src="?action=captcha_image&amp;v=<?= time() ?>" alt="کپچا" width="160" height="50" data-captcha-img></div>
+        <input type="text" name="captcha" required inputmode="numeric" autocomplete="off">
+      </div>
+      <button type="submit" class="btn-primary">ارسال کد تأیید</button>
+    </form>
+    <?php endif; ?>
+    <div class="auth-link-row">
+      قبلاً ثبت‌نام کرده‌اید؟ <a href="?action=auth_shell&view=login" data-spa-link="login">ورود</a>
+    </div>
+  </div>
+</section>
+
+<!-- ─── FORGOT ────────────────────────────────────── -->
+<section data-view="forgot" class="<?= $view==='forgot'?'':'is-hidden' ?>">
+  <div class="auth-card">
+    <h1>🔑 بازیابی رمز عبور</h1>
+    <div class="auth-subtitle">ایمیل خود را وارد کنید تا کد بازیابی صادر شود</div>
+    <div class="alert-err" data-err-slot hidden></div>
+    <form method="POST" action="?action=forgot_password_step1_process" data-spa-form>
+      <input type="hidden" name="csrf_token" value="<?= h($csrf) ?>">
+      <div class="field">
+        <label for="fp_email">ایمیل</label>
+        <input type="email" id="fp_email" name="email" required autocomplete="email">
+      </div>
+      <div class="field">
+        <label>پاسخ این محاسبه چیست؟</label>
+        <div class="captcha-box"><img src="?action=captcha_image&amp;v=<?= time() ?>" alt="کپچا" width="160" height="50" data-captcha-img></div>
+        <input type="text" name="captcha" required inputmode="numeric" autocomplete="off">
+      </div>
+      <button type="submit" class="btn-primary">ارسال کد بازیابی</button>
+    </form>
+    <div class="auth-link-row">
+      <a href="?action=auth_shell&view=login" data-spa-link="login">بازگشت به ورود</a>
+    </div>
+  </div>
+</section>
+
+<!-- ─── VERIFY ────────────────────────────────────── -->
+<section data-view="verify" class="<?= $view==='verify'?'':'is-hidden' ?>">
+  <div class="auth-card verify-card">
+    <h1>📨 تأیید ایمیل</h1>
+    <div class="auth-subtitle">یک ایمیل از آدرس خود به کد زیر بفرستید.</div>
+    <div class="alert-err" data-err-slot hidden></div>
+    <div class="alert-ok" data-ok-slot hidden></div>
+
+    <div class="verify-block top">
+      <span class="block-label">📬 ایمیل ما (گیرنده)</span>
+      <div class="block-value-row">
+        <span class="block-value" id="vfTo"><?= h($toAddr) ?></span>
+        <button type="button" class="copy-btn" data-target="vfTo">📋</button>
+      </div>
+    </div>
+
+    <div class="verify-block center">
+      <span class="block-label">🔑 کد تأیید (موضوع ایمیل)</span>
+      <div class="code-display" id="vfCode"><?= h($verifyTokenJs) ?></div>
+      <button type="button" class="copy-btn-wide" data-target="vfCode">📋 کپی کد</button>
+    </div>
+
+    <div class="verify-block bottom">
+      <span class="block-label">از</span>
+      <span class="block-value-plain" id="vfEmail"><?= h($verifyEmailJs) ?></span>
+    </div>
+
+    <div class="alert-info" style="margin-top:14px">
+      💡 توصیه: از ایمیل‌های ایرانی (mail.ir، chmail.ir، mailfa.com) استفاده کنید — تأییدشان سریع‌تر است.
+    </div>
+
+    <a class="btn-primary" id="vfMailto" href="mailto:<?= h($toAddr) ?>?subject=<?= h($verifyTokenJs) ?>">📧 باز کردن برنامهٔ ایمیل</a>
+
+    <form method="POST" action="?action=inbound_check_now" id="vfCheckForm" data-spa-form-check style="margin:0">
+      <input type="hidden" name="csrf_token" value="<?= h($csrf) ?>">
+      <input type="hidden" name="redirect" value="register_step2" id="vfCheckRedirect">
+      <button type="submit" class="btn-secondary check-btn" id="vfCheckBtn">
+        <span class="check-btn-default">🔄 چک کردن دستی</span>
+        <span class="check-btn-loading" hidden><span class="spinner-sm"></span> در حال بررسی...</span>
+        <span class="check-btn-cooldown" hidden>⏳ <span id="vfCooldownNum">10</span> ثانیه...</span>
+      </button>
+    </form>
+
+    <div class="status-line" id="vfStatusLine">
+      <span class="spinner" id="vfStatusSpin"></span>
+      <span id="vfStatusText">منتظر دریافت ایمیلت هستیم...</span>
+    </div>
+
+    <div class="timer-wrap">
+      <svg class="timer-ring" viewBox="0 0 100 100" width="80" height="80">
+        <defs>
+          <linearGradient id="timerGrad" x1="0" y1="0" x2="1" y2="1">
+            <stop offset="0%" stop-color="#3b82f6"/>
+            <stop offset="100%" stop-color="#8b5cf6"/>
+          </linearGradient>
+        </defs>
+        <circle class="timer-track" cx="50" cy="50" r="42" />
+        <circle class="timer-progress" cx="50" cy="50" r="42" id="vfTimerCircle"/>
+      </svg>
+      <div class="timer-text" id="vfTimerText">--:--</div>
+    </div>
+
+    <div class="links-row">
+      <a href="?action=auth_shell&view=login" data-spa-link="login">انصراف / ورود</a>
+      <form method="POST" action="?action=register_resend_otp" id="vfResendForm" data-spa-form-resend style="display:inline;margin:0">
+        <input type="hidden" name="csrf_token" value="<?= h($csrf) ?>">
+        <button type="submit" class="text-link">صدور کد جدید</button>
+      </form>
+    </div>
+  </div>
+</section>
+
+<!-- ─── NEWPASS ───────────────────────────────────── -->
+<section data-view="newpass" class="<?= $view==='newpass'?'':'is-hidden' ?>">
+  <div class="auth-card">
+    <h1>✅ ایمیل تأیید شد</h1>
+    <div class="auth-subtitle">حالا رمز عبور جدید را وارد کنید</div>
+    <div class="alert-ok">مالکیت ایمیل تأیید شده. این فرم ۵ دقیقه اعتبار دارد.</div>
+    <div class="alert-err" data-err-slot hidden></div>
+    <form method="POST" action="?action=forgot_password_step3_process" data-spa-form>
+      <input type="hidden" name="csrf_token" value="<?= h($csrf) ?>">
+      <div class="field">
+        <label for="np_pass">رمز عبور جدید</label>
+        <input type="password" id="np_pass" name="new_password" required autocomplete="new-password" minlength="8">
+        <div class="hint">حداقل ۸ کاراکتر، شامل حروف و اعداد</div>
+      </div>
+      <div class="field">
+        <label for="np_pass2">تکرار رمز عبور جدید</label>
+        <input type="password" id="np_pass2" name="password_confirm" required autocomplete="new-password" minlength="8">
+      </div>
+      <div class="field">
+        <label>پاسخ این محاسبه چیست؟</label>
+        <div class="captcha-box"><img src="?action=captcha_image&amp;v=<?= time() ?>" alt="کپچا" width="160" height="50" data-captcha-img></div>
+        <input type="text" name="captcha" required inputmode="numeric" autocomplete="off">
+      </div>
+      <button type="submit" class="btn-primary">تغییر رمز عبور</button>
+    </form>
+  </div>
+</section>
+
+<script>
+(function(){
+    var ERR_MESSAGES = {
+        invalid: '⚠️ نام کاربری یا رمز عبور اشتباه است.',
+        captcha_wrong: '⚠️ پاسخ کپچا اشتباه است.',
+        invalid_email: '⚠️ فرمت ایمیل نامعتبر است.',
+        invalid_username: '⚠️ نام کاربری معتبر نیست.',
+        weak_password: '⚠️ رمز عبور باید حداقل ۸ کاراکتر و شامل حروف و اعداد باشد.',
+        password_mismatch: '⚠️ تکرار رمز با رمز اصلی مطابقت ندارد.',
+        username_taken: '⚠️ این نام کاربری قبلاً انتخاب شده است.',
+        send_failed: '⚠️ ارسال ایمیل با مشکل مواجه شد.',
+        cooldown: '⏳ کمی صبر کنید و دوباره تلاش کنید.',
+        rate_limit: '⏳ کمی صبر کن — یک بررسی به‌تازگی اجرا شده است.',
+        check_disabled: '⚠️ سامانهٔ دریافت ایمیل خاموش است.',
+        email_quota: '⛔ تعداد درخواست‌ها برای این ایمیل پر شده است.',
+        ip_quota: '⛔ تعداد درخواست‌ها از این IP پر شده است.',
+        referral_required: '⚠️ کد معرف لازم است.',
+        referral_invalid: '⚠️ کد معرف معتبر نیست.',
+        referral_expired: '⚠️ کد معرف منقضی شده است.',
+        referral_used: '⚠️ کد معرف قبلاً استفاده شده یا به سقف رسیده است.',
+        registration_disabled: '⚠️ ثبت‌نام عمومی غیرفعال است.',
+        no_session: '⚠️ نشست منقضی شد. لطفاً از ابتدا شروع کنید.',
+        expired: '⏰ پنجرهٔ زمانی منقضی شد.'
+    };
+
+    var AuthSPA = {
+        current: document.body.dataset.initialView || 'login',
+        verify: {
+            token:   <?= json_encode($verifyTokenJs) ?>,
+            email:   <?= json_encode($verifyEmailJs) ?>,
+            toAddr:  <?= json_encode($toAddr) ?>,
+            expires: <?= (int)$verifyExpiresJs ?>,
+            flow:    <?= json_encode($verifyFlowJs) ?>,
+            next:    <?= json_encode($verifyNextJs) ?>
+        },
+        sections: function(){ return document.querySelectorAll('section[data-view]'); },
+        sectionFor: function(view){ return document.querySelector('section[data-view="' + view + '"]'); },
+        clearError: function(section){
+            if (!section) return;
+            var slot = section.querySelector('[data-err-slot]');
+            if (slot) { slot.hidden = true; slot.textContent = ''; }
+        },
+        showError: function(section, err){
+            if (!section) return;
+            var slot = section.querySelector('[data-err-slot]');
+            if (!slot) { alert(err); return; }
+            slot.textContent = ERR_MESSAGES[err] || err;
+            slot.hidden = false;
+        },
+        refreshCaptchas: function(section){
+            section.querySelectorAll('[data-captcha-img]').forEach(function(img){
+                img.src = '?action=captcha_image&v=' + Date.now();
+            });
+        },
+        show: function(view, opts){
+            opts = opts || {};
+            if (!this.sectionFor(view)) return;
+            if (this.current === view && !opts.force) return;
+            var prev = this.sectionFor(this.current);
+            var next = this.sectionFor(view);
+            if (prev && prev !== next) {
+                prev.style.opacity = '0';
+                setTimeout(function(){ prev.classList.add('is-hidden'); prev.style.opacity = ''; }, 250);
+            }
+            next.classList.remove('is-hidden');
+            next.style.opacity = '0';
+            requestAnimationFrame(function(){ next.style.opacity = '1'; });
+            this.refreshCaptchas(next);
+            this.clearError(next);
+            this.current = view;
+            if (!opts.fromPop) {
+                history.pushState({view: view}, '', '?action=auth_shell&view=' + view);
+            }
+            if (view === 'verify') this.initVerify();
+        },
+        applyVerify: function(data){
+            if (!data) return;
+            this.verify.token   = data.token       || this.verify.token;
+            this.verify.email   = data.user_email  || this.verify.email;
+            this.verify.expires = data.expires_at  || this.verify.expires;
+            this.verify.flow    = data.flow        || this.verify.flow;
+            this.verify.next    = data.next_redirect || this.verify.next;
+            var codeEl = document.getElementById('vfCode');
+            if (codeEl) codeEl.textContent = this.verify.token;
+            var emailEl = document.getElementById('vfEmail');
+            if (emailEl) emailEl.textContent = this.verify.email;
+            var mailto = document.getElementById('vfMailto');
+            if (mailto) mailto.href = 'mailto:' + encodeURIComponent(this.verify.toAddr) +
+                '?subject=' + encodeURIComponent(this.verify.token);
+            var redirInput = document.getElementById('vfCheckRedirect');
+            if (redirInput) redirInput.value = this.verify.flow === 'reset' ? 'forgot_password_step2' : 'register_step2';
+        },
+        submit: async function(form){
+            var section = form.closest('section[data-view]');
+            this.clearError(section);
+            var btn = form.querySelector('button[type="submit"]');
+            if (btn) btn.disabled = true;
+            try {
+                var fd = new FormData(form);
+                var r = await fetch(form.action, {
+                    method: 'POST',
+                    headers: {'Accept': 'application/json'},
+                    body: fd,
+                    credentials: 'same-origin'
+                });
+                var j;
+                try { j = await r.json(); }
+                catch (e) {
+                    // Server didn't return JSON — fall back to native submission
+                    form.removeAttribute('data-spa-form');
+                    form.submit();
+                    return;
+                }
+                if (j.ok) {
+                    if (j.verify) this.applyVerify(j.verify);
+                    if (j.next_view) this.show(j.next_view);
+                    else if (j.redirect) window.location = j.redirect;
+                    else if (j.resent) this.flashOk(section, '✅ کد جدید صادر شد.');
+                } else {
+                    this.showError(section, j.error || 'send_failed');
+                    this.refreshCaptchas(section);
+                }
+            } catch (e) {
+                this.showError(section, 'send_failed');
+            } finally {
+                if (btn) btn.disabled = false;
+            }
+        },
+        flashOk: function(section, msg){
+            if (!section) return;
+            var ok = section.querySelector('[data-ok-slot]');
+            if (!ok) return;
+            ok.textContent = msg;
+            ok.hidden = false;
+            setTimeout(function(){ ok.hidden = true; }, 2800);
+        },
+        _verifyInit: false,
+        initVerify: function(){
+            this.applyVerify({
+                token: this.verify.token,
+                user_email: this.verify.email,
+                expires_at: this.verify.expires,
+                flow: this.verify.flow,
+                next_redirect: this.verify.next
+            });
+            if (this._verifyInit) return;
+            this._verifyInit = true;
+            this.startTimer();
+            this.startPolling();
+            this.bindCopyButtons();
+            this.bindCheckCooldown();
+        },
+        startTimer: function(){
+            var self = this;
+            var totalSec = 30 * 60;
+            (function tick(){
+                var now = Math.floor(Date.now()/1000);
+                var left = Math.max(0, (self.verify.expires || 0) - now);
+                var tt = document.getElementById('vfTimerText');
+                var tc = document.getElementById('vfTimerCircle');
+                if (!tt) return;
+                if (left <= 0) {
+                    tt.textContent = 'منقضی';
+                    tt.style.color = '#fca5a5';
+                    if (tc) tc.style.strokeDashoffset = 264;
+                    return;
+                }
+                var m = Math.floor(left/60), r = left%60;
+                tt.textContent = m + ':' + (r<10?'0':'') + r;
+                if (tc) tc.style.strokeDashoffset = (264 - 264 * (left / totalSec));
+                setTimeout(tick, 1000);
+            })();
+        },
+        startPolling: function(){
+            var self = this;
+            var line = document.getElementById('vfStatusLine');
+            var spin = document.getElementById('vfStatusSpin');
+            var txt  = document.getElementById('vfStatusText');
+            var stopped = false;
+            function setState(state, message){
+                if (!line) return;
+                line.classList.remove('ok','fail');
+                if (state === 'ok') { line.classList.add('ok'); if (spin) spin.style.display='none'; }
+                else if (state === 'fail') { line.classList.add('fail'); if (spin) spin.style.display='none'; }
+                if (txt) txt.textContent = message;
+            }
+            async function poll(){
+                if (stopped) return;
+                try {
+                    var r = await fetch('?action=inbound_status', {credentials:'same-origin', headers:{'Accept':'application/json'}});
+                    var j = await r.json();
+                    if (j.status === 'verified') {
+                        stopped = true;
+                        setState('ok', '✓ تایید شد — در حال انتقال...');
+                        setTimeout(function(){
+                            if (self.verify.flow === 'reset') self.show('newpass');
+                            else window.location = j.redirect || self.verify.next || '?action=dashboard';
+                        }, 700);
+                        return;
+                    }
+                    if (j.status === 'expired') { stopped = true; setState('fail', '⏰ کد منقضی شد.'); return; }
+                    if (j.status === 'race_error') { stopped = true; setState('fail', j.message || 'خطا در پردازش.'); return; }
+                    if (j.status === 'no_session') { stopped = true; setState('fail', 'نشست منقضی شد.'); return; }
+                    setTimeout(poll, 5000);
+                } catch (e) { setTimeout(poll, 8000); }
+            }
+            poll();
+        },
+        bindCopyButtons: function(){
+            document.querySelectorAll('section[data-view="verify"] .copy-btn, section[data-view="verify"] .copy-btn-wide').forEach(function(btn){
+                btn.addEventListener('click', function(){
+                    var t = document.getElementById(btn.getAttribute('data-target'));
+                    if (!t) return;
+                    var txt = t.textContent.trim();
+                    var done = function(){
+                        var o = btn.innerHTML;
+                        btn.classList.add('copied');
+                        btn.innerHTML = btn.classList.contains('copy-btn-wide') ? '✓ کپی شد' : '✓';
+                        setTimeout(function(){ btn.classList.remove('copied'); btn.innerHTML = o; }, 1200);
+                    };
+                    if (navigator.clipboard && window.isSecureContext) navigator.clipboard.writeText(txt).then(done, done);
+                    else { var ta = document.createElement('textarea'); ta.value = txt; ta.style.position='fixed'; ta.style.opacity=0;
+                        document.body.appendChild(ta); ta.select(); try { document.execCommand('copy'); } catch(e){}
+                        document.body.removeChild(ta); done(); }
+                });
+            });
+        },
+        bindCheckCooldown: function(){
+            var btn = document.getElementById('vfCheckBtn');
+            var form = document.getElementById('vfCheckForm');
+            if (!btn || !form) return;
+            var cooldownMs = 10000;
+            var lastClick = parseInt(localStorage.getItem('xc_last_check') || '0', 10);
+            function showCooldown(){
+                btn.disabled = true;
+                btn.querySelector('.check-btn-default').hidden = true;
+                btn.querySelector('.check-btn-loading').hidden = true;
+                var cd = btn.querySelector('.check-btn-cooldown');
+                cd.hidden = false;
+                var num = document.getElementById('vfCooldownNum');
+                var timer = setInterval(function(){
+                    var left = Math.ceil((cooldownMs - (Date.now() - lastClick)) / 1000);
+                    if (left <= 0) {
+                        clearInterval(timer);
+                        btn.disabled = false;
+                        cd.hidden = true;
+                        btn.querySelector('.check-btn-default').hidden = false;
+                    } else { num.textContent = left; }
+                }, 250);
+            }
+            if (Date.now() - lastClick < cooldownMs) showCooldown();
+        }
+    };
+
+    window.AuthSPA = AuthSPA;
+
+    // Submit interception
+    document.addEventListener('submit', function(e){
+        var form = e.target;
+        if (form.matches('[data-spa-form], [data-spa-form-check], [data-spa-form-resend]')) {
+            e.preventDefault();
+            if (form.matches('[data-spa-form-check]')) {
+                var lastClick = parseInt(localStorage.getItem('xc_last_check') || '0', 10);
+                if (Date.now() - lastClick < 10000) return;
+                localStorage.setItem('xc_last_check', String(Date.now()));
+                var btn = document.getElementById('vfCheckBtn');
+                if (btn) {
+                    btn.querySelector('.check-btn-default').hidden = true;
+                    btn.querySelector('.check-btn-loading').hidden = false;
+                }
+            }
+            AuthSPA.submit(form);
+        }
+    });
+
+    // SPA link navigation
+    document.addEventListener('click', function(e){
+        var a = e.target.closest('a[data-spa-link]');
+        if (a) { e.preventDefault(); AuthSPA.show(a.dataset.spaLink); }
+    });
+
+    // Browser back/forward
+    window.addEventListener('popstate', function(e){
+        var v = (e.state && e.state.view) || (new URLSearchParams(location.search).get('view')) || 'login';
+        AuthSPA.show(v, {fromPop: true});
+    });
+
+    // Set initial history state and init verify view if visible
+    history.replaceState({view: AuthSPA.current}, '', '?action=auth_shell&view=' + AuthSPA.current);
+    if (AuthSPA.current === 'verify') AuthSPA.initVerify();
+})();
+</script>
+</body></html>
+<?php
+    exit;
+}
+
 if ($action == 'login_process') {
     verifyCsrf();
     $identifier = trim($_POST['username'] ?? '');
     $p = $_POST['password'] ?? '';
+    $json = wants_json();
 
     if ($identifier === '' || $p === '') {
+        if ($json) auth_json_err('invalid');
         header("Location: index.php?error=1"); exit;
     }
 
@@ -2179,10 +3232,12 @@ if ($action == 'login_process') {
         $_SESSION['user'] = $ud['username'];
         $_SESSION['role'] = $ud['role'];
         logActivity($pdo, $ud['username'], 'login', null, 'ورود موفق');
+        if ($json) auth_json_ok(['redirect' => '?action=dashboard']);
         header("Location: ?action=dashboard"); exit;
     }
 
     logActivity($pdo, $identifier ?: 'unknown', 'login_failed', null, 'تلاش ناموفق');
+    if ($json) auth_json_err('invalid');
     header("Location: index.php?error=1"); exit;
 }
 
@@ -2278,12 +3333,6 @@ if($action=='public_upload_process'){
         if(move_uploaded_file($f["tmp_name"],$tf)){
             $st=$pdo->prepare("INSERT INTO public_files (filename,uploaded_by,file_size) VALUES(?,?,?)");
             $st->execute([$finalName,$_SESSION['user'],$f["size"]]);
-            $fileId=$pdo->lastInsertId();
-            foreach($selectedUsers as $su){
-                $su=trim($su);if(empty($su))continue;
-                $ins=$pdo->prepare("INSERT IGNORE INTO public_file_access (file_id,username) VALUES(?,?)");
-                $ins->execute([$fileId,$su]);
-            }
             logActivity($pdo,$_SESSION['user'],'public_upload',$finalName,"حجم: ".formatBytes($f["size"]));
             $ok++;
         }else{$fail++;}
@@ -2291,35 +3340,28 @@ if($action=='public_upload_process'){
     header("Location: ?action=dashboard&tab=public&".buildUploadStatusQuery($ok,$fail,$tooLarge,0));exit;
 }
 
-// ── Update public file access ──
+// ── Update public file access (deprecated: public files are now visible to all users) ──
 if($action=='update_public_access'){
     if(!isset($_SESSION['user'])||$_SESSION['role']!=='admin')die("دسترسی غیرمجاز!");verifyCsrf();
-    $fileId=(int)($_POST['file_id']??0);
-    if($fileId>0){
-        $pdo->prepare("DELETE FROM public_file_access WHERE file_id=?")->execute([$fileId]);
-        $selectedUsers=$_POST['access_users']??[];
-        if(is_array($selectedUsers)){
-            foreach($selectedUsers as $su){
-                $su=trim($su);if(empty($su))continue;
-                $ins=$pdo->prepare("INSERT IGNORE INTO public_file_access (file_id,username) VALUES(?,?)");
-                $ins->execute([$fileId,$su]);
-            }
-        }
-        logActivity($pdo,$_SESSION['user'],'update_public_access',"file_id=$fileId");
-    }
     header("Location: ?action=dashboard&tab=public&msg=access_updated");exit;
 }
 
 // ── Delete public file (admin only) ──
 if($action=='delete_public_file'){
     if(!isset($_SESSION['user'])||$_SESSION['role']!=='admin')die("دسترسی غیرمجاز!");
-    global $public_base;
+    global $public_base,$trash_base;
     $fid=(int)($_GET['file_id']??0);
     $st=$pdo->prepare("SELECT * FROM public_files WHERE id=?");$st->execute([$fid]);$pf=$st->fetch();
     if($pf){
         $fp=$public_base.$pf['filename'];
-        if(file_exists($fp))@unlink($fp);
-        $pdo->prepare("DELETE FROM public_file_access WHERE file_id=?")->execute([$fid]);
+        if(file_exists($fp)){
+            $trashFn=time().'_PUBLIC_'.preg_replace('/[^a-zA-Z0-9_-]/','_',$pf['filename']);
+            $tp=$trash_base.$trashFn;
+            if(rename($fp,$tp)){
+                $st=$pdo->prepare("INSERT INTO trash_items (original_owner,original_filename,trash_filename,deleted_by,file_size,is_public) VALUES('__public__',?,?,?,?,1)");
+                $st->execute([$pf['filename'],$trashFn,$_SESSION['user'],filesize($tp)]);
+            }
+        }
         $pdo->prepare("DELETE FROM public_files WHERE id=?")->execute([$fid]);
         logActivity($pdo,$_SESSION['user'],'delete_public',$pf['filename']);
     }
@@ -2605,11 +3647,9 @@ if($action=='unshare_file'){
     header("Location: ?action=dashboard&msg=unshared");exit;
 }
 
-// ── Remove self from public file access ──
+// ── Remove self from public file access (deprecated: public files are now visible to all users) ──
 if($action=='remove_public_access'){
     if(!isset($_SESSION['user']))die("خطای امنیتی!");
-    $fid=(int)($_GET['file_id']??0);
-    $pdo->prepare("DELETE FROM public_file_access WHERE file_id=? AND username=?")->execute([$fid,$_SESSION['user']]);
     header("Location: ?action=dashboard&tab=public&msg=removed");exit;
 }
 
@@ -2623,13 +3663,10 @@ if($action=='get_shares'){
     echo json_encode(['shares'=>$st->fetchAll(PDO::FETCH_ASSOC)]);exit;
 }
 
-// ── Get public file access list (AJAX) ──
+// ── Get public file access list (AJAX, deprecated: public files are visible to all users) ──
 if($action=='get_public_access'){
     header('Content-Type: application/json');
-    if(!isset($_SESSION['user'])||$_SESSION['role']!=='admin'){echo json_encode(['users'=>[]]);exit;}
-    $fid=(int)($_GET['file_id']??0);
-    $st=$pdo->prepare("SELECT username FROM public_file_access WHERE file_id=?");$st->execute([$fid]);
-    echo json_encode(['users'=>$st->fetchAll(PDO::FETCH_COLUMN)]);exit;
+    echo json_encode(['users'=>[]]);exit;
 }
 
 if($action=='download'){
@@ -2644,15 +3681,11 @@ if($action=='download'){
         $pfid=(int)$_GET['public_file_id'];
         $pfs=$pdo->prepare("SELECT * FROM public_files WHERE id=?");$pfs->execute([$pfid]);$pf=$pfs->fetch();
         if($pf){
-            $hasAccess=$_SESSION['role']==='admin';
-            if(!$hasAccess){$ac=$pdo->prepare("SELECT id FROM public_file_access WHERE file_id=? AND username=?");$ac->execute([$pfid,$_SESSION['user']]);$hasAccess=(bool)$ac->fetch();}
-            if($hasAccess){
-                $fp=$public_base.$pf['filename'];
-                if(file_exists($fp)){
-                    logActivity($pdo,$_SESSION['user'],'download',$pf['filename'],'فایل عمومی');
-                    header('Content-Type: application/octet-stream');header('Content-Disposition: attachment; filename="'.$pf['filename'].'"');
-                    header('Content-Length: '.filesize($fp));readfile($fp);exit;
-                }
+            $fp=$public_base.$pf['filename'];
+            if(file_exists($fp)){
+                logActivity($pdo,$_SESSION['user'],'download',$pf['filename'],'فایل عمومی');
+                header('Content-Type: application/octet-stream');header('Content-Disposition: attachment; filename="'.$pf['filename'].'"');
+                header('Content-Length: '.filesize($fp));readfile($fp);exit;
             }
         }
         header("Location: ?action=dashboard&tab=public&msg=not_found");exit;
@@ -3301,12 +4334,28 @@ if($action=='trash_restore'){
     $s=$pdo->prepare("SELECT * FROM trash_items WHERE id=?");$s->execute([$tid]);$item=$s->fetch();
     if($item){
         $tp=$trash_base.$item['trash_filename'];
-        $rp=getUserUploadPath($item['original_owner']).$item['original_filename'];
-        if(file_exists($rp)){$ext=pathinfo($item['original_filename'],PATHINFO_EXTENSION);$nm=pathinfo($item['original_filename'],PATHINFO_FILENAME);$rp=getUserUploadPath($item['original_owner']).$nm.'_restored_'.time().($ext?".$ext":'');}
-        if(file_exists($tp)&&rename($tp,$rp)){
-            $pdo->prepare("DELETE FROM trash_items WHERE id=?")->execute([$tid]);
-            logActivity($pdo,$_SESSION['user'],'trash_restore',$item['original_filename'],"به: ".$item['original_owner']);
-            header("Location: ?action=trash&msg=restored");exit;}}
+        $isPublic=!empty($item['is_public'])||$item['original_owner']==='__public__';
+        if($isPublic){
+            $rp=$public_base.$item['original_filename'];
+            if(file_exists($rp)){$ext=pathinfo($item['original_filename'],PATHINFO_EXTENSION);$nm=pathinfo($item['original_filename'],PATHINFO_FILENAME);$rp=$public_base.$nm.'_restored_'.time().($ext?".$ext":'');}
+            if(file_exists($tp)&&rename($tp,$rp)){
+                $restoredName=basename($rp);
+                $ins=$pdo->prepare("INSERT INTO public_files (filename,uploaded_by,file_size) VALUES(?,?,?)");
+                $ins->execute([$restoredName,$_SESSION['user'],filesize($rp)]);
+                $pdo->prepare("DELETE FROM trash_items WHERE id=?")->execute([$tid]);
+                logActivity($pdo,$_SESSION['user'],'trash_restore',$item['original_filename'],'فایل عمومی');
+                header("Location: ?action=trash&msg=restored");exit;
+            }
+        }else{
+            $rp=getUserUploadPath($item['original_owner']).$item['original_filename'];
+            if(file_exists($rp)){$ext=pathinfo($item['original_filename'],PATHINFO_EXTENSION);$nm=pathinfo($item['original_filename'],PATHINFO_FILENAME);$rp=getUserUploadPath($item['original_owner']).$nm.'_restored_'.time().($ext?".$ext":'');}
+            if(file_exists($tp)&&rename($tp,$rp)){
+                $pdo->prepare("DELETE FROM trash_items WHERE id=?")->execute([$tid]);
+                logActivity($pdo,$_SESSION['user'],'trash_restore',$item['original_filename'],"به: ".$item['original_owner']);
+                header("Location: ?action=trash&msg=restored");exit;
+            }
+        }
+    }
     header("Location: ?action=trash&msg=restore_error");exit;
 }
 
@@ -3357,6 +4406,75 @@ if ($action == 'admin_unlock_setup') {
     setSetting($pdo, 'setup_completed', '0');
     logActivity($pdo, $_SESSION['user'], 'admin_setup_unlocked');
     header("Location: ?action=setup_wizard"); exit;
+}
+
+if ($action == 'referral_create') {
+    if (!isset($_SESSION['user']) || $_SESSION['role'] !== 'admin') { header("Location: ?action=dashboard"); exit; }
+    verifyCsrf();
+    $type = $_POST['code_type'] ?? 'single';
+    if (!in_array($type, ['single','multi','unlimited'], true)) $type = 'single';
+    $label = trim($_POST['label'] ?? '');
+    $maxUses = null;
+    if ($type === 'multi') {
+        $maxUses = (int)($_POST['max_uses'] ?? 0);
+        if ($maxUses < 2) $maxUses = 2;
+    }
+    $expiresAt = null;
+    $exp = trim($_POST['expires_at'] ?? '');
+    if ($exp !== '') {
+        $ts = strtotime($exp);
+        if ($ts) $expiresAt = date('Y-m-d H:i:s', $ts);
+    }
+    // Generate with collision retry
+    $code = null;
+    for ($i = 0; $i < 5; $i++) {
+        $candidate = generate_referral_code();
+        $st = $pdo->prepare("SELECT id FROM referral_codes WHERE code = ?");
+        $st->execute([$candidate]);
+        if (!$st->fetch()) { $code = $candidate; break; }
+    }
+    if ($code === null) {
+        header("Location: ?action=referrals&msg=create_error"); exit;
+    }
+    $ins = $pdo->prepare("INSERT INTO referral_codes (code, code_type, max_uses, expires_at, label, created_by) VALUES (?,?,?,?,?,?)");
+    $ins->execute([$code, $type, $maxUses, $expiresAt, $label !== '' ? $label : null, $_SESSION['user']]);
+    logActivity($pdo, $_SESSION['user'], 'referral_create', $code, "type=$type");
+    header("Location: ?action=referrals&msg=created&new=" . urlencode($code)); exit;
+}
+
+if ($action == 'referral_revoke') {
+    if (!isset($_SESSION['user']) || $_SESSION['role'] !== 'admin') { header("Location: ?action=dashboard"); exit; }
+    verifyCsrf();
+    $rid = (int)($_POST['referral_id'] ?? 0);
+    if ($rid > 0) {
+        $pdo->prepare("UPDATE referral_codes SET revoked_at = NOW() WHERE id = ? AND revoked_at IS NULL")->execute([$rid]);
+        logActivity($pdo, $_SESSION['user'], 'referral_revoke', "id=$rid");
+    }
+    header("Location: ?action=referrals&msg=revoked"); exit;
+}
+
+if ($action == 'referral_delete') {
+    if (!isset($_SESSION['user']) || $_SESSION['role'] !== 'admin') { header("Location: ?action=dashboard"); exit; }
+    verifyCsrf();
+    $rid = (int)($_POST['referral_id'] ?? 0);
+    if ($rid > 0) {
+        $pdo->prepare("DELETE FROM referral_codes WHERE id = ?")->execute([$rid]);
+        logActivity($pdo, $_SESSION['user'], 'referral_delete', "id=$rid");
+    }
+    header("Location: ?action=referrals&msg=deleted"); exit;
+}
+
+if ($action == 'admin_toggle_referral_required') {
+    if (!isset($_SESSION['user']) || $_SESSION['role'] !== 'admin') {
+        header("Location: ?action=dashboard"); exit;
+    }
+    verifyCsrf();
+    $current = getSetting($pdo, 'registration_requires_referral', '0');
+    $new = $current === '1' ? '0' : '1';
+    setSetting($pdo, 'registration_requires_referral', $new);
+    logActivity($pdo, $_SESSION['user'], 'admin_toggle_referral_required', null,
+                "Set to: " . ($new === '1' ? 'required' : 'optional'));
+    header("Location: ?action=referrals&msg=" . ($new === '1' ? 'required_on' : 'required_off')); exit;
 }
 
 // ================================================================
@@ -3483,7 +4601,12 @@ if ($action == 'register_step1') {
         'cooldown'           => '⏳ اخیراً درخواست داده‌اید. لطفاً چند ثانیه صبر کنید.',
         'email_quota'        => '⛔ تعداد درخواست‌های شما برای این ایمیل از حد مجاز بیشتر شده.',
         'ip_quota'           => '⛔ تعداد درخواست‌ها از این IP از حد مجاز بیشتر شده.',
+        'referral_required'  => '⚠️ کد معرف لازم است.',
+        'referral_invalid'   => '⚠️ کد معرف معتبر نیست.',
+        'referral_expired'   => '⚠️ کد معرف منقضی شده است.',
+        'referral_used'      => '⚠️ کد معرف قبلاً استفاده شده یا به سقف رسیده است.',
     ][$err] ?? '';
+    $requiresReferral = getSetting($pdo, 'registration_requires_referral', '0') === '1';
 ?>
 <!DOCTYPE html>
 <html lang="fa" dir="rtl">
@@ -3491,29 +4614,22 @@ if ($action == 'register_step1') {
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>ثبت‌نام در XCloud</title>
+<?= renderHeadAssets() ?>
 <style>
-body{margin:0;font-family:Tahoma,system-ui,sans-serif;background:#0f172a;color:#e2e8f0;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:20px}
-.card{max-width:440px;width:100%;background:#1e293b;border:1px solid #334155;border-radius:14px;padding:32px;box-shadow:0 10px 40px rgba(0,0,0,.3)}
-h1{font-size:1.4rem;margin:0 0 8px;color:#f1f5f9;text-align:center}
-.subtitle{color:#94a3b8;font-size:.85rem;text-align:center;margin-bottom:24px}
-.field{margin-bottom:16px}
-label{display:block;color:#cbd5e1;font-size:.85rem;margin-bottom:6px;font-weight:600}
-input{width:100%;background:#0f172a;border:1px solid #334155;color:#f1f5f9;padding:11px 12px;border-radius:8px;font-size:.9rem;font-family:inherit;box-sizing:border-box}
-input:focus{outline:none;border-color:#3b82f6;background:#1e293b}
-.hint{color:#64748b;font-size:.75rem;margin-top:4px}
-.captcha{background:#0f172a;border:1px dashed #475569;padding:10px 14px;border-radius:8px;color:#fde68a;font-weight:700;text-align:center;margin-bottom:8px;font-size:1rem}
-.btn{width:100%;background:#3b82f6;color:#fff;border:none;padding:12px;border-radius:8px;font-weight:700;font-size:.95rem;cursor:pointer;font-family:inherit;margin-top:8px}
-.btn:hover{background:#2563eb}
-.err{background:#7f1d1d;color:#fee2e2;padding:10px 14px;border-radius:8px;margin-bottom:16px;font-size:.85rem;text-align:center}
-.links{text-align:center;margin-top:18px;font-size:.85rem;color:#94a3b8}
-.links a{color:#3b82f6;text-decoration:none;font-weight:600}
+<?= getAuthSharedCss() ?>
 </style>
 </head>
 <body>
-<div class="card">
+<div class="bg-glow bg-glow-1"></div>
+<div class="bg-glow bg-glow-2"></div>
+<div class="auth-card">
   <h1>📝 ثبت‌نام در XCloud</h1>
-  <div class="subtitle">با تأیید ایمیل، حساب جدید بسازید</div>
-  <?php if ($errMsg): ?><div class="err"><?= $errMsg ?></div><?php endif; ?>
+  <div class="auth-subtitle">با تأیید ایمیل، حساب جدید بسازید</div>
+  <?php if ($errMsg): ?><div class="alert-err"><?= $errMsg ?></div><?php endif; ?>
+  <div class="alert-info">
+    💡 <b>توصیه می‌شود</b> از ایمیل‌های ایرانی استفاده کنید (mail.ir، chmail.ir، mailfa.com).
+    تأیید این ایمیل‌ها سریع‌تر و قابل‌اعتمادتر است. سایر ایمیل‌ها هم پذیرفته می‌شوند.
+  </div>
   <form method="POST" action="?action=register_step1_process">
     <input type="hidden" name="csrf_token" value="<?= h($csrf) ?>">
     <div class="field">
@@ -3534,15 +4650,23 @@ input:focus{outline:none;border-color:#3b82f6;background:#1e293b}
       <label for="password_confirm">تکرار رمز عبور</label>
       <input type="password" id="password_confirm" name="password_confirm" required autocomplete="new-password" minlength="8">
     </div>
+    <?php if ($requiresReferral): ?>
+    <div class="field">
+      <label for="referral_code">کد معرف</label>
+      <input type="text" id="referral_code" name="referral_code" required autocomplete="off" style="direction:ltr;text-transform:uppercase;letter-spacing:.08em" value="<?= h($_GET['ref'] ?? '') ?>">
+      <div class="hint">برای ثبت‌نام به یک کد معرف معتبر نیاز دارید.</div>
+    </div>
+    <?php endif; ?>
     <div class="field">
       <label>پاسخ این محاسبه چیست؟</label>
-      <div class="captcha-box" style="background:#0f172a;border:1px solid #334155;padding:8px;border-radius:8px;margin-bottom:8px;text-align:center"><img src="?action=captcha_image&amp;v=<?= time() ?>" alt="کپچا" width="160" height="50" style="display:inline-block"></div>
+      <div class="captcha-box"><img src="?action=captcha_image&amp;v=<?= time() ?>" alt="کپچا" width="160" height="50"></div>
       <input type="text" name="captcha" required inputmode="numeric" autocomplete="off">
     </div>
-    <button type="submit" class="btn">ارسال کد تأیید</button>
+    <button type="submit" class="btn-primary">ارسال کد تأیید</button>
   </form>
-  <div class="links">
-    قبلاً ثبت‌نام کرده‌اید؟ <a href="index.php">ورود</a>
+  <div class="links-row" style="justify-content:center">
+    <span style="color:#94a3b8">قبلاً ثبت‌نام کرده‌اید؟</span>
+    <a href="index.php">ورود</a>
   </div>
 </div>
 </body>
@@ -3553,8 +4677,12 @@ input:focus{outline:none;border-color:#3b82f6;background:#1e293b}
 
 // ─── POST: Step 1 process ────────────────────────────────────
 if ($action == 'register_step1_process') {
-    if (!registrationEnabled($pdo)) { header("Location: index.php"); exit; }
+    if (!registrationEnabled($pdo)) {
+        if (wants_json()) auth_json_err('registration_disabled');
+        header("Location: index.php"); exit;
+    }
     verifyCsrf();
+    $json = wants_json();
 
     $email           = trim(mb_strtolower($_POST['email'] ?? ''));
     $username        = trim($_POST['username'] ?? '');
@@ -3562,29 +4690,36 @@ if ($action == 'register_step1_process') {
     $passwordConfirm = $_POST['password_confirm'] ?? '';
     $captchaAnswer   = $_POST['captcha'] ?? '';
 
+    $regErr = function(string $err, string $extra = '') use ($email, $username, $json) {
+        if ($json) auth_json_err($err);
+        header("Location: ?action=register_step1&error={$err}&email=" . urlencode($email) . "&username=" . urlencode($username) . $extra); exit;
+    };
+
     // Captcha first (always invalidates regardless of outcome)
-    if (!math_captcha_verify($captchaAnswer)) {
-        header("Location: ?action=register_step1&error=captcha_wrong&email=" . urlencode($email) . "&username=" . urlencode($username)); exit;
-    }
-    if (!validate_email_address($email)) {
-        header("Location: ?action=register_step1&error=invalid_email&username=" . urlencode($username)); exit;
-    }
-    if (!validate_username($username)) {
-        header("Location: ?action=register_step1&error=invalid_username&email=" . urlencode($email)); exit;
-    }
-    if ($password !== $passwordConfirm) {
-        header("Location: ?action=register_step1&error=password_mismatch&email=" . urlencode($email) . "&username=" . urlencode($username)); exit;
-    }
-    if (!validate_password_strength($password)) {
-        header("Location: ?action=register_step1&error=weak_password&email=" . urlencode($email) . "&username=" . urlencode($username)); exit;
+    if (!math_captcha_verify($captchaAnswer)) { $regErr('captcha_wrong'); }
+    if (!validate_email_address($email))      { $regErr('invalid_email'); }
+    if (!validate_username($username))        { $regErr('invalid_username'); }
+    if ($password !== $passwordConfirm)       { $regErr('password_mismatch'); }
+    if (!validate_password_strength($password)) { $regErr('weak_password'); }
+
+    // Referral code (if globally required)
+    $referralId = null;
+    if (getSetting($pdo, 'registration_requires_referral', '0') === '1') {
+        $code = strtoupper(trim($_POST['referral_code'] ?? ''));
+        if ($code === '') { $regErr('referral_required'); }
+        $rv = validate_referral_code($pdo, $code);
+        if (!$rv['ok']) {
+            $reason = $rv['reason'];
+            $err = $reason === 'invalid' ? 'referral_invalid' : ($reason === 'expired' ? 'referral_expired' : 'referral_used');
+            $regErr($err, '&ref=' . urlencode($code));
+        }
+        $referralId = $rv['id'];
     }
 
     // Username availability
     $st = $pdo->prepare("SELECT id FROM users WHERE username = ?");
     $st->execute([$username]);
-    if ($st->fetch()) {
-        header("Location: ?action=register_step1&error=username_taken&email=" . urlencode($email)); exit;
-    }
+    if ($st->fetch()) { $regErr('username_taken'); }
 
     // Email availability — anti-enumeration: if email exists, send a notification email
     // and pretend to step 2 anyway so attackers can't tell if email is registered
@@ -3595,7 +4730,7 @@ if ($action == 'register_step1_process') {
     if ($existing) {
         // Anti-enumeration: show step 2 with a fake token. The user will never
         // be able to verify it because the OTP table has no matching row.
-        $fakeToken = generate_otp_code(8);
+        $fakeToken = generate_otp_code();
         $_SESSION['pending_registration'] = [
             'email'         => $email,
             'username'      => $username,
@@ -3610,21 +4745,24 @@ if ($action == 'register_step1_process') {
         $_SESSION['pending_register_otp_id'] = -1;
         $_SESSION['pending_fake_expires_at'] = time() + 1800;
         usleep(random_int(200000, 500000));
+        if ($json) auth_json_ok(['next_view' => 'verify', 'verify' => spa_verify_snapshot()]);
         header("Location: ?action=register_step2"); exit;
     }
 
     // Issue inbound-verification token. The OTP payload carries the future
     // user record so the inbound cron can create the account on match.
     $passwordHash = password_hash($password, PASSWORD_DEFAULT);
-    $payload = json_encode([
+    $payloadArr = [
         'username'      => $username,
         'password_hash' => $passwordHash,
-    ]);
-    $result = request_email_otp($pdo, $email, 'register', $payload);
-    if (!$result['ok']) {
-        $err = $result['reason'] ?? 'send_failed';
-        header("Location: ?action=register_step1&error=" . urlencode($err) . "&email=" . urlencode($email) . "&username=" . urlencode($username)); exit;
+    ];
+    if ($referralId !== null) {
+        $payloadArr['referral_code_id'] = $referralId;
+        $payloadArr['referral_ip'] = $_SERVER['REMOTE_ADDR'] ?? null;
     }
+    $payload = json_encode($payloadArr);
+    $result = request_email_otp($pdo, $email, 'register', $payload);
+    if (!$result['ok']) { $regErr($result['reason'] ?? 'send_failed'); }
 
     $_SESSION['pending_registration'] = [
         'email'         => $email,
@@ -3638,6 +4776,7 @@ if ($action == 'register_step1_process') {
     $_SESSION['pending_register_otp_id'] = (int)$result['otp_id'];
     unset($_SESSION['pending_fake_expires_at']);
     logActivity($pdo, $username, 'register_otp_requested', $email);
+    if ($json) auth_json_ok(['next_view' => 'verify', 'verify' => spa_verify_snapshot()]);
     header("Location: ?action=register_step2"); exit;
 }
 
@@ -3682,102 +4821,119 @@ if ($action == 'register_step2') {
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>تأیید ایمیل — XCloud</title>
+<?= renderHeadAssets() ?>
 <style>
-body{margin:0;font-family:Tahoma,system-ui,sans-serif;background:#0f172a;color:#e2e8f0;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:20px}
-.card{max-width:520px;width:100%;background:#1e293b;border:1px solid #334155;border-radius:14px;padding:28px;box-shadow:0 10px 40px rgba(0,0,0,.3)}
-h1{font-size:1.35rem;margin:0 0 8px;color:#f1f5f9;text-align:center}
-.subtitle{color:#94a3b8;font-size:.85rem;text-align:center;margin-bottom:18px;line-height:1.8}
-.info-block{background:#0f172a;border:1px solid #334155;border-radius:10px;padding:12px 14px;margin-bottom:10px;display:flex;align-items:center;justify-content:space-between;gap:10px}
-.info-label{color:#94a3b8;font-size:.75rem;font-weight:600;min-width:48px}
-.info-value{flex:1;color:#fde68a;font-family:Consolas,monospace;font-size:.95rem;direction:ltr;text-align:left;overflow-wrap:anywhere}
-.info-value.token{color:#a5b4fc;font-weight:700;font-size:1.05rem;letter-spacing:.05em}
-.copy-btn{background:#334155;color:#e2e8f0;border:none;border-radius:6px;padding:6px 10px;font-size:.72rem;cursor:pointer;font-family:inherit;flex-shrink:0}
-.copy-btn:hover{background:#475569}
-.copy-btn.copied{background:#14532d;color:#bbf7d0}
-.btn{display:block;width:100%;background:#3b82f6;color:#fff;border:none;padding:12px;border-radius:8px;font-weight:700;font-size:.95rem;cursor:pointer;font-family:inherit;margin-top:12px;text-decoration:none;text-align:center;box-sizing:border-box}
-.btn:hover{background:#2563eb}
-.btn-secondary{background:#475569;margin-top:8px}
-.btn-secondary:hover{background:#334155}
-.status{margin-top:16px;padding:12px;background:#0f172a;border:1px solid #334155;border-radius:8px;text-align:center;font-size:.88rem;color:#cbd5e1;display:flex;align-items:center;justify-content:center;gap:10px}
-.spinner{width:14px;height:14px;border:2px solid #334155;border-top-color:#3b82f6;border-radius:50%;animation:spin .8s linear infinite}
-@keyframes spin{to{transform:rotate(360deg)}}
-.status.ok{background:#14532d;color:#bbf7d0;border-color:#166534}
-.status.fail{background:#7f1d1d;color:#fee2e2;border-color:#991b1b}
-.err{background:#7f1d1d;color:#fee2e2;padding:10px 14px;border-radius:8px;margin-bottom:16px;font-size:.85rem;text-align:center}
-.ok{background:#14532d;color:#bbf7d0;padding:10px 14px;border-radius:8px;margin-bottom:16px;font-size:.85rem;text-align:center}
-.timer{text-align:center;color:#94a3b8;font-size:.78rem;margin-top:8px}
-.links-row{display:flex;justify-content:space-between;margin-top:14px;font-size:.82rem;color:#94a3b8}
-.links-row a{color:#3b82f6;text-decoration:none;font-weight:600}
-.hint{color:#64748b;font-size:.78rem;text-align:center;margin-top:14px;line-height:1.7}
+<?= getAuthSharedCss() ?>
 </style>
 </head>
 <body>
-<div class="card">
+<div class="bg-glow bg-glow-1"></div>
+<div class="bg-glow bg-glow-2"></div>
+<div class="auth-card verify-card">
   <h1>📨 تأیید ایمیل</h1>
-  <div class="subtitle">برای تایید ایمیلت، یک پیام از همان آدرس به ما بفرست — موضوع و گیرنده را از کادرهای زیر بردار.</div>
-  <?php if ($errMsg): ?><div class="err"><?= $errMsg ?></div><?php endif; ?>
-  <?php if ($msgText): ?><div class="ok"><?= $msgText ?></div><?php endif; ?>
+  <div class="auth-subtitle">یک ایمیل از آدرس زیر به ما بفرست — موضوع همان کد تأیید است.</div>
+  <?php if ($errMsg): ?><div class="alert-err"><?= $errMsg ?></div><?php endif; ?>
+  <?php if ($msgText): ?><div class="alert-ok"><?= $msgText ?></div><?php endif; ?>
 
-  <div class="info-block">
-    <span class="info-label">به:</span>
-    <span class="info-value" id="infoTo"><?= h($toAddr) ?></span>
-    <button type="button" class="copy-btn" data-target="infoTo">کپی</button>
-  </div>
-  <div class="info-block">
-    <span class="info-label">موضوع:</span>
-    <span class="info-value token" id="infoSubject"><?= h($token) ?></span>
-    <button type="button" class="copy-btn" data-target="infoSubject">کپی</button>
-  </div>
-  <div class="info-block">
-    <span class="info-label">از:</span>
-    <span class="info-value" id="infoFrom"><?= h($pending['email']) ?></span>
-    <button type="button" class="copy-btn" data-target="infoFrom">کپی</button>
+  <!-- TOP: XCloud email -->
+  <div class="verify-block top">
+    <span class="block-label">📬 ایمیل ما (گیرنده)</span>
+    <div class="block-value-row">
+      <span class="block-value" id="xcloudEmail"><?= h($toAddr) ?></span>
+      <button type="button" class="copy-btn" data-target="xcloudEmail" aria-label="کپی">📋</button>
+    </div>
   </div>
 
-  <a class="btn" href="<?= h($mailtoHref) ?>">📧 باز کردن برنامهٔ ایمیل</a>
+  <!-- CENTER: Big code -->
+  <div class="verify-block center">
+    <span class="block-label">🔑 کد تأیید (موضوع ایمیل)</span>
+    <div class="code-display" id="verifyCode"><?= h($token) ?></div>
+    <button type="button" class="copy-btn-wide" data-target="verifyCode">📋 کپی کد</button>
+  </div>
 
-  <form method="POST" action="?action=inbound_check_now" style="margin:0">
+  <!-- BOTTOM: User email -->
+  <div class="verify-block bottom">
+    <span class="block-label">از</span>
+    <span class="block-value-plain"><?= h($pending['email']) ?></span>
+  </div>
+
+  <!-- Internal email hint -->
+  <div class="alert-info" style="margin-top:14px">
+    💡 توصیه: از ایمیل‌های ایرانی (mail.ir، chmail.ir، mailfa.com) استفاده کنید — تأییدشان سریع‌تر است.
+  </div>
+
+  <a class="btn-primary" href="<?= h($mailtoHref) ?>">📧 باز کردن برنامهٔ ایمیل</a>
+
+  <form method="POST" action="?action=inbound_check_now" id="manualCheckForm" style="margin:0">
     <input type="hidden" name="csrf_token" value="<?= h($csrf) ?>">
     <input type="hidden" name="redirect" value="register_step2">
-    <button type="submit" class="btn btn-secondary">🔄 چک کردن دستی</button>
+    <button type="submit" class="btn-secondary check-btn" id="manualCheckBtn">
+      <span class="check-btn-default">🔄 چک کردن دستی</span>
+      <span class="check-btn-loading" hidden><span class="spinner-sm"></span> در حال بررسی...</span>
+      <span class="check-btn-cooldown" hidden>⏳ <span id="cooldownNum">10</span> ثانیه...</span>
+    </button>
   </form>
 
-  <div class="status" id="statusLine">
+  <div class="status-line" id="statusLine">
     <span class="spinner" id="statusSpin"></span>
     <span id="statusText">منتظر دریافت ایمیلت هستیم...</span>
   </div>
-  <div class="timer" id="otpTimer"></div>
+
+  <div class="timer-wrap">
+    <svg class="timer-ring" viewBox="0 0 100 100" width="80" height="80">
+      <defs>
+        <linearGradient id="timerGrad" x1="0" y1="0" x2="1" y2="1">
+          <stop offset="0%" stop-color="#3b82f6"/>
+          <stop offset="100%" stop-color="#8b5cf6"/>
+        </linearGradient>
+      </defs>
+      <circle class="timer-track" cx="50" cy="50" r="42" />
+      <circle class="timer-progress" cx="50" cy="50" r="42" id="timerCircle"/>
+    </svg>
+    <div class="timer-text" id="timerText">--:--</div>
+  </div>
 
   <div class="links-row">
     <a href="?action=register_step1">تغییر ایمیل</a>
     <form method="POST" action="?action=register_resend_otp" style="display:inline;margin:0">
       <input type="hidden" name="csrf_token" value="<?= h($csrf) ?>">
-      <button type="submit" style="background:none;border:none;color:#3b82f6;font-weight:600;cursor:pointer;font-family:inherit;font-size:inherit;padding:0">صدور توکن جدید</button>
+      <button type="submit" class="text-link">صدور کد جدید</button>
     </form>
   </div>
-
-  <div class="hint">پیام را از همان آدرسی که بالا نشان داده شده بفرست. تا ۱ دقیقه بعد از رسیدن، حسابت ساخته می‌شود.</div>
 </div>
 <script>
 (function(){
   var expires = <?= (int)$expiresAtTs ?>;
-  var timerEl = document.getElementById('otpTimer');
-  function tick(){
-    var s = expires - Math.floor(Date.now()/1000);
-    if (s <= 0){ timerEl.textContent = '⏰ توکن منقضی شد — صدور توکن جدید لازم است.'; timerEl.style.color='#fca5a5'; return; }
-    var m = Math.floor(s/60), r = s%60;
-    timerEl.textContent = 'اعتبار توکن: ' + m + ':' + (r<10?'0':'') + r;
-    setTimeout(tick, 1000);
-  } tick();
+  var totalSec = 30 * 60;
+
+  // Timer ring
+  function tickTimer(){
+    var nowSec = Math.floor(Date.now()/1000);
+    var leftSec = Math.max(0, expires - nowSec);
+    var m = Math.floor(leftSec/60), r = leftSec%60;
+    var timerText = document.getElementById('timerText');
+    var timerCircle = document.getElementById('timerCircle');
+    if (leftSec <= 0) {
+      timerText.textContent = 'منقضی';
+      timerText.style.color = '#fca5a5';
+      if (timerCircle) timerCircle.style.strokeDashoffset = 264;
+      return;
+    }
+    timerText.textContent = m + ':' + (r<10?'0':'') + r;
+    var pct = leftSec / totalSec;
+    if (timerCircle) timerCircle.style.strokeDashoffset = (264 - 264 * pct);
+    setTimeout(tickTimer, 1000);
+  }
+  tickTimer();
 
   // Copy buttons
-  document.querySelectorAll('.copy-btn').forEach(function(btn){
+  document.querySelectorAll('.copy-btn, .copy-btn-wide').forEach(function(btn){
     btn.addEventListener('click', function(){
       var t = document.getElementById(btn.getAttribute('data-target'));
       if (!t) return;
       var txt = t.textContent.trim();
       if (navigator.clipboard && window.isSecureContext) {
-        navigator.clipboard.writeText(txt).then(showCopied);
+        navigator.clipboard.writeText(txt).then(showCopied, showCopied);
       } else {
         var ta = document.createElement('textarea');
         ta.value = txt; ta.style.position='fixed'; ta.style.opacity=0;
@@ -3787,15 +4943,52 @@ h1{font-size:1.35rem;margin:0 0 8px;color:#f1f5f9;text-align:center}
         showCopied();
       }
       function showCopied(){
-        var orig = btn.textContent;
-        btn.classList.add('copied'); btn.textContent = '✓';
-        setTimeout(function(){ btn.classList.remove('copied'); btn.textContent = orig; }, 1200);
+        var orig = btn.innerHTML;
+        btn.classList.add('copied');
+        btn.innerHTML = btn.classList.contains('copy-btn-wide') ? '✓ کپی شد' : '✓';
+        setTimeout(function(){ btn.classList.remove('copied'); btn.innerHTML = orig; }, 1200);
       }
     });
   });
 
+  // Manual check button with 10s rate limit + animated states
+  var checkForm = document.getElementById('manualCheckForm');
+  var checkBtn = document.getElementById('manualCheckBtn');
+  var lastClick = parseInt(localStorage.getItem('xc_last_check') || '0', 10);
+  var cooldownMs = 10000;
+
+  function showCooldown(){
+    checkBtn.disabled = true;
+    checkBtn.querySelector('.check-btn-default').hidden = true;
+    checkBtn.querySelector('.check-btn-loading').hidden = true;
+    var cd = checkBtn.querySelector('.check-btn-cooldown');
+    cd.hidden = false;
+    var num = document.getElementById('cooldownNum');
+    var timer = setInterval(function(){
+      var left = Math.ceil((cooldownMs - (Date.now() - lastClick)) / 1000);
+      if (left <= 0) {
+        clearInterval(timer);
+        checkBtn.disabled = false;
+        cd.hidden = true;
+        checkBtn.querySelector('.check-btn-default').hidden = false;
+      } else {
+        num.textContent = left;
+      }
+    }, 250);
+  }
+  if (Date.now() - lastClick < cooldownMs) showCooldown();
+
+  if (checkForm) {
+    checkForm.addEventListener('submit', function(e){
+      if (Date.now() - lastClick < cooldownMs) { e.preventDefault(); return; }
+      lastClick = Date.now();
+      localStorage.setItem('xc_last_check', lastClick.toString());
+      checkBtn.querySelector('.check-btn-default').hidden = true;
+      checkBtn.querySelector('.check-btn-loading').hidden = false;
+    });
+  }
+
   // Status polling
-  var pollTimer = null;
   var spin = document.getElementById('statusSpin');
   var txt  = document.getElementById('statusText');
   var line = document.getElementById('statusLine');
@@ -3817,12 +5010,12 @@ h1{font-size:1.35rem;margin:0 0 8px;color:#f1f5f9;text-align:center}
         setTimeout(function(){ window.location = j.redirect || '?action=dashboard'; }, 800);
         return;
       }
-      if (j.status === 'expired') { stopped = true; setState('fail', '⏰ توکن منقضی شده است.'); return; }
+      if (j.status === 'expired') { stopped = true; setState('fail', '⏰ کد منقضی شده است.'); return; }
       if (j.status === 'race_error') { stopped = true; setState('fail', j.message || 'خطا در ساخت حساب — لطفاً دوباره تلاش کن.'); return; }
       if (j.status === 'no_session') { stopped = true; setState('fail', 'نشست منقضی شد.'); return; }
-      pollTimer = setTimeout(poll, 5000);
+      setTimeout(poll, 5000);
     } catch (e) {
-      pollTimer = setTimeout(poll, 8000);
+      setTimeout(poll, 8000);
     }
   }
   poll();
@@ -3836,9 +5029,14 @@ h1{font-size:1.35rem;margin:0 0 8px;color:#f1f5f9;text-align:center}
 
 // ─── POST: Resend / regenerate token (rate-limited) ──────────
 if ($action == 'register_resend_otp') {
-    if (!registrationEnabled($pdo)) { header("Location: index.php"); exit; }
+    if (!registrationEnabled($pdo)) {
+        if (wants_json()) auth_json_err('registration_disabled');
+        header("Location: index.php"); exit;
+    }
     verifyCsrf();
+    $json = wants_json();
     if (empty($_SESSION['pending_registration'])) {
+        if ($json) auth_json_err('no_session');
         header("Location: ?action=register_step1"); exit;
     }
     $pending = $_SESSION['pending_registration'];
@@ -3846,16 +5044,18 @@ if ($action == 'register_resend_otp') {
     // Session-level resend cap (3 per session)
     $count = (int)($_SESSION['register_resend_count'] ?? 0);
     if ($count >= 3) {
+        if ($json) auth_json_err('cooldown');
         header("Location: ?action=register_step2&error=cooldown"); exit;
     }
 
     if (!empty($pending['fake'])) {
         // Anti-enumeration: pretend success, rotate the displayed fake token
-        $_SESSION['pending_registration']['token']      = generate_otp_code(8);
+        $_SESSION['pending_registration']['token']      = generate_otp_code();
         $_SESSION['pending_registration']['expires_at'] = date('Y-m-d H:i:s', time() + 1800);
         $_SESSION['pending_register_otp_id']            = -1;
         $_SESSION['pending_fake_expires_at']            = time() + 1800;
         $_SESSION['register_resend_count'] = $count + 1;
+        if ($json) auth_json_ok(['resent' => true, 'verify' => spa_verify_snapshot()]);
         header("Location: ?action=register_step2&msg=resent"); exit;
     }
 
@@ -3877,8 +5077,10 @@ if ($action == 'register_resend_otp') {
         $_SESSION['pending_register_otp_id'] = (int)$result['otp_id'];
         unset($_SESSION['pending_fake_expires_at']);
         $_SESSION['register_resend_count'] = $count + 1;
+        if ($json) auth_json_ok(['resent' => true, 'verify' => spa_verify_snapshot()]);
         header("Location: ?action=register_step2&msg=resent"); exit;
     }
+    if ($json) auth_json_err($result['reason'] ?? 'send_failed');
     header("Location: ?action=register_step2&error=" . urlencode($result['reason'] ?? 'send_failed')); exit;
 }
 
@@ -3903,24 +5105,16 @@ if ($action == 'forgot_password_step1') {
     ][$err] ?? '';
 ?>
 <!DOCTYPE html><html lang="fa" dir="rtl"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>بازیابی رمز عبور — XCloud</title>
+<?= renderHeadAssets() ?>
 <style>
-body{margin:0;font-family:Tahoma,sans-serif;background:#0f172a;color:#e2e8f0;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:20px}
-.card{max-width:440px;width:100%;background:#1e293b;border:1px solid #334155;border-radius:14px;padding:32px}
-h1{font-size:1.4rem;margin:0 0 8px;color:#f1f5f9;text-align:center}
-.subtitle{color:#94a3b8;font-size:.85rem;text-align:center;margin-bottom:24px}
-.field{margin-bottom:16px}
-label{display:block;color:#cbd5e1;font-size:.85rem;margin-bottom:6px;font-weight:600}
-input{width:100%;background:#0f172a;border:1px solid #334155;color:#f1f5f9;padding:11px 12px;border-radius:8px;font-size:.9rem;font-family:inherit;box-sizing:border-box}
-.captcha{background:#0f172a;border:1px dashed #475569;padding:10px 14px;border-radius:8px;color:#fde68a;font-weight:700;text-align:center;margin-bottom:8px}
-.btn{width:100%;background:#3b82f6;color:#fff;border:none;padding:12px;border-radius:8px;font-weight:700;cursor:pointer;font-family:inherit}
-.err{background:#7f1d1d;color:#fee2e2;padding:10px 14px;border-radius:8px;margin-bottom:16px;font-size:.85rem;text-align:center}
-.links{text-align:center;margin-top:18px;font-size:.85rem;color:#94a3b8}
-.links a{color:#3b82f6;text-decoration:none;font-weight:600}
+<?= getAuthSharedCss() ?>
 </style></head><body>
-<div class="card">
+<div class="bg-glow bg-glow-1"></div>
+<div class="bg-glow bg-glow-2"></div>
+<div class="auth-card">
   <h1>🔑 بازیابی رمز عبور</h1>
-  <div class="subtitle">ایمیل خود را وارد کنید تا کد بازیابی برایتان ارسال شود</div>
-  <?php if ($errMsg): ?><div class="err"><?= $errMsg ?></div><?php endif; ?>
+  <div class="auth-subtitle">ایمیل خود را وارد کنید تا کد بازیابی برایتان ارسال شود</div>
+  <?php if ($errMsg): ?><div class="alert-err"><?= $errMsg ?></div><?php endif; ?>
   <form method="POST" action="?action=forgot_password_step1_process">
     <input type="hidden" name="csrf_token" value="<?= h($csrf) ?>">
     <div class="field">
@@ -3929,12 +5123,12 @@ input{width:100%;background:#0f172a;border:1px solid #334155;color:#f1f5f9;paddi
     </div>
     <div class="field">
       <label>پاسخ این محاسبه چیست؟</label>
-      <div class="captcha-box" style="background:#0f172a;border:1px solid #334155;padding:8px;border-radius:8px;margin-bottom:8px;text-align:center"><img src="?action=captcha_image&amp;v=<?= time() ?>" alt="کپچا" width="160" height="50" style="display:inline-block"></div>
+      <div class="captcha-box"><img src="?action=captcha_image&amp;v=<?= time() ?>" alt="کپچا" width="160" height="50"></div>
       <input type="text" name="captcha" required inputmode="numeric" autocomplete="off">
     </div>
-    <button class="btn">ارسال کد بازیابی</button>
+    <button class="btn-primary">ارسال کد بازیابی</button>
   </form>
-  <div class="links"><a href="index.php">بازگشت به ورود</a></div>
+  <div class="links-row" style="justify-content:center"><a href="index.php">بازگشت به ورود</a></div>
 </div></body></html>
 <?php
     exit;
@@ -3943,13 +5137,16 @@ input{width:100%;background:#0f172a;border:1px solid #334155;color:#f1f5f9;paddi
 // ─── POST: Step 1 process ────────────────────────────────────
 if ($action == 'forgot_password_step1_process') {
     verifyCsrf();
+    $json = wants_json();
     $email = trim(mb_strtolower($_POST['email'] ?? ''));
     $captchaAnswer = $_POST['captcha'] ?? '';
 
     if (!math_captcha_verify($captchaAnswer)) {
+        if ($json) auth_json_err('captcha_wrong');
         header("Location: ?action=forgot_password_step1&error=captcha_wrong"); exit;
     }
     if (!validate_email_address($email)) {
+        if ($json) auth_json_err('invalid_email');
         header("Location: ?action=forgot_password_step1&error=invalid_email"); exit;
     }
 
@@ -3978,6 +5175,7 @@ if ($action == 'forgot_password_step1_process') {
             // honestly — the user already knows they have an account, so leaking
             // the rate-limit is acceptable and necessary for UX.
             $err = $result['reason'] ?? 'send_failed';
+            if ($json) auth_json_err($err);
             header("Location: ?action=forgot_password_step1&error=" . urlencode($err) . "&email=" . urlencode($email));
             exit;
         }
@@ -3986,7 +5184,7 @@ if ($action == 'forgot_password_step1_process') {
         // status poller keeps reporting "pending" until the fake expiry.
         $_SESSION['pending_password_reset'] = [
             'email' => $email, 'fake' => true,
-            'token' => generate_otp_code(8),
+            'token' => generate_otp_code(),
             'expires_at' => date('Y-m-d H:i:s', time() + 1800),
         ];
         $_SESSION['pending_reset_otp_id'] = -1;
@@ -3994,6 +5192,7 @@ if ($action == 'forgot_password_step1_process') {
         usleep(random_int(300000, 700000));
     }
 
+    if ($json) auth_json_ok(['next_view' => 'verify', 'verify' => spa_verify_snapshot()]);
     header("Location: ?action=forgot_password_step2&msg=sent"); exit;
 }
 
@@ -4031,117 +5230,173 @@ if ($action == 'forgot_password_step2') {
         . '&body=' . rawurlencode('بازیابی رمز عبور XCloud');
 ?>
 <!DOCTYPE html><html lang="fa" dir="rtl"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>بازیابی رمز — XCloud</title>
+<?= renderHeadAssets() ?>
 <style>
-body{margin:0;font-family:Tahoma,sans-serif;background:#0f172a;color:#e2e8f0;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:20px}
-.card{max-width:520px;width:100%;background:#1e293b;border:1px solid #334155;border-radius:14px;padding:28px}
-h1{font-size:1.35rem;margin:0 0 8px;color:#f1f5f9;text-align:center}
-.subtitle{color:#94a3b8;font-size:.85rem;text-align:center;margin-bottom:18px;line-height:1.8}
-.info-block{background:#0f172a;border:1px solid #334155;border-radius:10px;padding:12px 14px;margin-bottom:10px;display:flex;align-items:center;justify-content:space-between;gap:10px}
-.info-label{color:#94a3b8;font-size:.75rem;font-weight:600;min-width:48px}
-.info-value{flex:1;color:#fde68a;font-family:Consolas,monospace;font-size:.95rem;direction:ltr;text-align:left;overflow-wrap:anywhere}
-.info-value.token{color:#a5b4fc;font-weight:700;font-size:1.05rem;letter-spacing:.05em}
-.copy-btn{background:#334155;color:#e2e8f0;border:none;border-radius:6px;padding:6px 10px;font-size:.72rem;cursor:pointer;font-family:inherit;flex-shrink:0}
-.copy-btn.copied{background:#14532d;color:#bbf7d0}
-.btn{display:block;width:100%;background:#3b82f6;color:#fff;border:none;padding:12px;border-radius:8px;font-weight:700;font-size:.95rem;cursor:pointer;font-family:inherit;margin-top:12px;text-decoration:none;text-align:center;box-sizing:border-box}
-.btn-secondary{background:#475569;margin-top:8px}
-.status{margin-top:16px;padding:12px;background:#0f172a;border:1px solid #334155;border-radius:8px;text-align:center;font-size:.88rem;color:#cbd5e1;display:flex;align-items:center;justify-content:center;gap:10px}
-.spinner{width:14px;height:14px;border:2px solid #334155;border-top-color:#3b82f6;border-radius:50%;animation:spin .8s linear infinite}
-@keyframes spin{to{transform:rotate(360deg)}}
-.status.ok{background:#14532d;color:#bbf7d0;border-color:#166534}
-.status.fail{background:#7f1d1d;color:#fee2e2;border-color:#991b1b}
-.err{background:#7f1d1d;color:#fee2e2;padding:10px 14px;border-radius:8px;margin-bottom:16px;font-size:.85rem;text-align:center}
-.ok{background:#14532d;color:#bbf7d0;padding:10px 14px;border-radius:8px;margin-bottom:16px;font-size:.85rem;text-align:center}
-.timer{text-align:center;color:#94a3b8;font-size:.78rem;margin-top:8px}
-.links-row{display:flex;justify-content:space-between;margin-top:14px;font-size:.82rem;color:#94a3b8}
-.links-row a{color:#3b82f6;text-decoration:none;font-weight:600}
-.hint{color:#64748b;font-size:.78rem;text-align:center;margin-top:14px;line-height:1.7}
+<?= getAuthSharedCss() ?>
 </style></head><body>
-<div class="card">
+<div class="bg-glow bg-glow-1"></div>
+<div class="bg-glow bg-glow-2"></div>
+<div class="auth-card verify-card">
   <h1>🔑 بازیابی رمز عبور</h1>
-  <div class="subtitle">برای تایید مالکیت ایمیلت، یک پیام از همان آدرس به ما بفرست.</div>
-  <?php if ($errMsg): ?><div class="err"><?= $errMsg ?></div><?php endif; ?>
-  <?php if ($msgText): ?><div class="ok"><?= $msgText ?></div><?php endif; ?>
+  <div class="auth-subtitle">برای تأیید مالکیت ایمیلت، یک پیام با همین کد به ما بفرست.</div>
+  <?php if ($errMsg): ?><div class="alert-err"><?= $errMsg ?></div><?php endif; ?>
+  <?php if ($msgText): ?><div class="alert-ok"><?= $msgText ?></div><?php endif; ?>
 
-  <div class="info-block">
-    <span class="info-label">به:</span>
-    <span class="info-value" id="infoTo"><?= h($toAddr) ?></span>
-    <button type="button" class="copy-btn" data-target="infoTo">کپی</button>
-  </div>
-  <div class="info-block">
-    <span class="info-label">موضوع:</span>
-    <span class="info-value token" id="infoSubject"><?= h($token) ?></span>
-    <button type="button" class="copy-btn" data-target="infoSubject">کپی</button>
-  </div>
-  <div class="info-block">
-    <span class="info-label">از:</span>
-    <span class="info-value" id="infoFrom"><?= h($pending['email']) ?></span>
-    <button type="button" class="copy-btn" data-target="infoFrom">کپی</button>
+  <div class="verify-block top">
+    <span class="block-label">📬 ایمیل ما (گیرنده)</span>
+    <div class="block-value-row">
+      <span class="block-value" id="xcloudEmail"><?= h($toAddr) ?></span>
+      <button type="button" class="copy-btn" data-target="xcloudEmail" aria-label="کپی">📋</button>
+    </div>
   </div>
 
-  <a class="btn" href="<?= h($mailtoHref) ?>">📧 باز کردن برنامهٔ ایمیل</a>
+  <div class="verify-block center">
+    <span class="block-label">🔑 کد بازیابی (موضوع ایمیل)</span>
+    <div class="code-display" id="verifyCode"><?= h($token) ?></div>
+    <button type="button" class="copy-btn-wide" data-target="verifyCode">📋 کپی کد</button>
+  </div>
 
-  <form method="POST" action="?action=inbound_check_now" style="margin:0">
+  <div class="verify-block bottom">
+    <span class="block-label">از</span>
+    <span class="block-value-plain"><?= h($pending['email']) ?></span>
+  </div>
+
+  <div class="alert-info" style="margin-top:14px">
+    💡 توصیه: از ایمیل‌های ایرانی (mail.ir، chmail.ir، mailfa.com) استفاده کنید — تأییدشان سریع‌تر است.
+  </div>
+
+  <a class="btn-primary" href="<?= h($mailtoHref) ?>">📧 باز کردن برنامهٔ ایمیل</a>
+
+  <form method="POST" action="?action=inbound_check_now" id="manualCheckForm" style="margin:0">
     <input type="hidden" name="csrf_token" value="<?= h($csrf) ?>">
     <input type="hidden" name="redirect" value="forgot_password_step2">
-    <button type="submit" class="btn btn-secondary">🔄 چک کردن دستی</button>
+    <button type="submit" class="btn-secondary check-btn" id="manualCheckBtn">
+      <span class="check-btn-default">🔄 چک کردن دستی</span>
+      <span class="check-btn-loading" hidden><span class="spinner-sm"></span> در حال بررسی...</span>
+      <span class="check-btn-cooldown" hidden>⏳ <span id="cooldownNum">10</span> ثانیه...</span>
+    </button>
   </form>
 
-  <div class="status" id="statusLine">
+  <div class="status-line" id="statusLine">
     <span class="spinner" id="statusSpin"></span>
     <span id="statusText">منتظر دریافت ایمیلت هستیم...</span>
   </div>
-  <div class="timer" id="otpTimer"></div>
+
+  <div class="timer-wrap">
+    <svg class="timer-ring" viewBox="0 0 100 100" width="80" height="80">
+      <defs>
+        <linearGradient id="timerGrad" x1="0" y1="0" x2="1" y2="1">
+          <stop offset="0%" stop-color="#3b82f6"/>
+          <stop offset="100%" stop-color="#8b5cf6"/>
+        </linearGradient>
+      </defs>
+      <circle class="timer-track" cx="50" cy="50" r="42" />
+      <circle class="timer-progress" cx="50" cy="50" r="42" id="timerCircle"/>
+    </svg>
+    <div class="timer-text" id="timerText">--:--</div>
+  </div>
 
   <div class="links-row">
     <a href="?action=forgot_password_step1">تغییر ایمیل</a>
     <form method="POST" action="?action=forgot_password_resend" style="display:inline;margin:0">
       <input type="hidden" name="csrf_token" value="<?= h($csrf) ?>">
-      <button type="submit" style="background:none;border:none;color:#3b82f6;font-weight:600;cursor:pointer;font-family:inherit;font-size:inherit;padding:0">صدور توکن جدید</button>
+      <button type="submit" class="text-link">صدور کد جدید</button>
     </form>
   </div>
-
-  <div class="hint">پیام را از همان آدرس بالا بفرست. بعد از دریافت، صفحهٔ تنظیم رمز جدید برایت باز می‌شود.</div>
 </div>
 <script>
 (function(){
   var expires = <?= (int)$expiresAtTs ?>;
-  var t = document.getElementById('otpTimer');
-  function tick(){
-    var s = expires - Math.floor(Date.now()/1000);
-    if (s <= 0){ t.textContent = '⏰ توکن منقضی شد.'; t.style.color='#fca5a5'; return; }
-    var m = Math.floor(s/60), r = s%60;
-    t.textContent = 'اعتبار توکن: ' + m + ':' + (r<10?'0':'') + r;
-    setTimeout(tick, 1000);
-  } tick();
+  var totalSec = 30 * 60;
 
-  document.querySelectorAll('.copy-btn').forEach(function(btn){
+  function tickTimer(){
+    var nowSec = Math.floor(Date.now()/1000);
+    var leftSec = Math.max(0, expires - nowSec);
+    var m = Math.floor(leftSec/60), r = leftSec%60;
+    var timerText = document.getElementById('timerText');
+    var timerCircle = document.getElementById('timerCircle');
+    if (leftSec <= 0) {
+      timerText.textContent = 'منقضی';
+      timerText.style.color = '#fca5a5';
+      if (timerCircle) timerCircle.style.strokeDashoffset = 264;
+      return;
+    }
+    timerText.textContent = m + ':' + (r<10?'0':'') + r;
+    var pct = leftSec / totalSec;
+    if (timerCircle) timerCircle.style.strokeDashoffset = (264 - 264 * pct);
+    setTimeout(tickTimer, 1000);
+  }
+  tickTimer();
+
+  document.querySelectorAll('.copy-btn, .copy-btn-wide').forEach(function(btn){
     btn.addEventListener('click', function(){
       var el = document.getElementById(btn.getAttribute('data-target'));
       if (!el) return;
       var txt = el.textContent.trim();
-      var done = function(){ var o=btn.textContent; btn.classList.add('copied'); btn.textContent='✓';
-        setTimeout(function(){ btn.classList.remove('copied'); btn.textContent=o; }, 1200); };
-      if (navigator.clipboard && window.isSecureContext) navigator.clipboard.writeText(txt).then(done);
-      else { var ta=document.createElement('textarea'); ta.value=txt; ta.style.position='fixed'; ta.style.opacity=0;
-        document.body.appendChild(ta); ta.select(); try{document.execCommand('copy');}catch(e){}
+      var done = function(){
+        var o = btn.innerHTML;
+        btn.classList.add('copied');
+        btn.innerHTML = btn.classList.contains('copy-btn-wide') ? '✓ کپی شد' : '✓';
+        setTimeout(function(){ btn.classList.remove('copied'); btn.innerHTML = o; }, 1200);
+      };
+      if (navigator.clipboard && window.isSecureContext) navigator.clipboard.writeText(txt).then(done, done);
+      else { var ta = document.createElement('textarea'); ta.value = txt; ta.style.position = 'fixed'; ta.style.opacity = 0;
+        document.body.appendChild(ta); ta.select(); try { document.execCommand('copy'); } catch(e){}
         document.body.removeChild(ta); done(); }
     });
   });
 
-  var spin=document.getElementById('statusSpin'), txt=document.getElementById('statusText'), line=document.getElementById('statusLine'), stopped=false, pt=null;
-  function setState(s,m){ line.classList.remove('ok','fail'); if(s==='ok'){line.classList.add('ok'); if(spin)spin.style.display='none';} else if(s==='fail'){line.classList.add('fail'); if(spin)spin.style.display='none';} txt.textContent=m; }
+  // Manual check button with 10s rate limit + animated states
+  var checkForm = document.getElementById('manualCheckForm');
+  var checkBtn = document.getElementById('manualCheckBtn');
+  var lastClick = parseInt(localStorage.getItem('xc_last_check') || '0', 10);
+  var cooldownMs = 10000;
+
+  function showCooldown(){
+    checkBtn.disabled = true;
+    checkBtn.querySelector('.check-btn-default').hidden = true;
+    checkBtn.querySelector('.check-btn-loading').hidden = true;
+    var cd = checkBtn.querySelector('.check-btn-cooldown');
+    cd.hidden = false;
+    var num = document.getElementById('cooldownNum');
+    var timer = setInterval(function(){
+      var left = Math.ceil((cooldownMs - (Date.now() - lastClick)) / 1000);
+      if (left <= 0) {
+        clearInterval(timer);
+        checkBtn.disabled = false;
+        cd.hidden = true;
+        checkBtn.querySelector('.check-btn-default').hidden = false;
+      } else {
+        num.textContent = left;
+      }
+    }, 250);
+  }
+  if (Date.now() - lastClick < cooldownMs) showCooldown();
+
+  if (checkForm) {
+    checkForm.addEventListener('submit', function(e){
+      if (Date.now() - lastClick < cooldownMs) { e.preventDefault(); return; }
+      lastClick = Date.now();
+      localStorage.setItem('xc_last_check', lastClick.toString());
+      checkBtn.querySelector('.check-btn-default').hidden = true;
+      checkBtn.querySelector('.check-btn-loading').hidden = false;
+    });
+  }
+
+  var spin = document.getElementById('statusSpin'), txt = document.getElementById('statusText'), line = document.getElementById('statusLine'), stopped = false;
+  function setState(s, m){ line.classList.remove('ok','fail'); if (s === 'ok') { line.classList.add('ok'); if (spin) spin.style.display='none'; } else if (s === 'fail') { line.classList.add('fail'); if (spin) spin.style.display='none'; } txt.textContent = m; }
   async function poll(){
     if (stopped) return;
     try {
-      var r=await fetch('?action=inbound_status',{credentials:'same-origin',headers:{'Accept':'application/json'}});
-      var j=await r.json();
-      if(j.status==='verified'){ stopped=true; setState('ok','✓ تایید شد — در حال انتقال به صفحهٔ تنظیم رمز جدید...');
+      var r = await fetch('?action=inbound_status', {credentials:'same-origin', headers:{'Accept':'application/json'}});
+      var j = await r.json();
+      if (j.status === 'verified') { stopped = true; setState('ok', '✓ تایید شد — در حال انتقال به صفحهٔ تنظیم رمز جدید...');
         setTimeout(function(){ window.location = j.redirect || '?action=forgot_password_step3'; }, 800); return; }
-      if(j.status==='expired'){ stopped=true; setState('fail','⏰ توکن منقضی شده است.'); return; }
-      if(j.status==='race_error'){ stopped=true; setState('fail', j.message || 'خطا در پردازش — لطفاً دوباره تلاش کن.'); return; }
-      if(j.status==='no_session'){ stopped=true; setState('fail','نشست منقضی شد.'); return; }
-      pt=setTimeout(poll,5000);
-    } catch(e){ pt=setTimeout(poll,8000); }
+      if (j.status === 'expired') { stopped = true; setState('fail', '⏰ کد منقضی شده است.'); return; }
+      if (j.status === 'race_error') { stopped = true; setState('fail', j.message || 'خطا در پردازش — لطفاً دوباره تلاش کن.'); return; }
+      if (j.status === 'no_session') { stopped = true; setState('fail', 'نشست منقضی شد.'); return; }
+      setTimeout(poll, 5000);
+    } catch (e) { setTimeout(poll, 8000); }
   }
   poll();
 })();
@@ -4170,24 +5425,17 @@ if ($action == 'forgot_password_step3') {
     ][$err] ?? '';
 ?>
 <!DOCTYPE html><html lang="fa" dir="rtl"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>تنظیم رمز جدید — XCloud</title>
+<?= renderHeadAssets() ?>
 <style>
-body{margin:0;font-family:Tahoma,sans-serif;background:#0f172a;color:#e2e8f0;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:20px}
-.card{max-width:440px;width:100%;background:#1e293b;border:1px solid #334155;border-radius:14px;padding:32px}
-h1{font-size:1.35rem;margin:0 0 8px;color:#f1f5f9;text-align:center}
-.subtitle{color:#94a3b8;font-size:.85rem;text-align:center;margin-bottom:18px}
-.field{margin-bottom:14px}
-label{display:block;color:#cbd5e1;font-size:.85rem;margin-bottom:6px;font-weight:600}
-input{width:100%;background:#0f172a;border:1px solid #334155;color:#f1f5f9;padding:11px 12px;border-radius:8px;font-family:inherit;box-sizing:border-box}
-.btn{width:100%;background:#3b82f6;color:#fff;border:none;padding:12px;border-radius:8px;font-weight:700;cursor:pointer;font-family:inherit;margin-top:8px}
-.err{background:#7f1d1d;color:#fee2e2;padding:10px 14px;border-radius:8px;margin-bottom:16px;font-size:.85rem;text-align:center}
-.hint{color:#64748b;font-size:.75rem;margin-top:4px}
-.ok-banner{background:#14532d;color:#bbf7d0;padding:10px 14px;border-radius:8px;margin-bottom:16px;font-size:.85rem;text-align:center}
+<?= getAuthSharedCss() ?>
 </style></head><body>
-<div class="card">
-  <h1>✅ ایمیل تایید شد</h1>
-  <div class="subtitle">حالا رمز عبور جدید را وارد کن</div>
-  <div class="ok-banner">مالکیت ایمیل تایید شده. این فرم ۵ دقیقه اعتبار دارد.</div>
-  <?php if ($errMsg): ?><div class="err"><?= $errMsg ?></div><?php endif; ?>
+<div class="bg-glow bg-glow-1"></div>
+<div class="bg-glow bg-glow-2"></div>
+<div class="auth-card">
+  <h1>✅ ایمیل تأیید شد</h1>
+  <div class="auth-subtitle">حالا رمز عبور جدید را وارد کن</div>
+  <div class="alert-ok">مالکیت ایمیل تأیید شده. این فرم ۵ دقیقه اعتبار دارد.</div>
+  <?php if ($errMsg): ?><div class="alert-err"><?= $errMsg ?></div><?php endif; ?>
   <form method="POST" action="?action=forgot_password_step3_process">
     <input type="hidden" name="csrf_token" value="<?= h($csrf) ?>">
     <div class="field">
@@ -4201,10 +5449,10 @@ input{width:100%;background:#0f172a;border:1px solid #334155;color:#f1f5f9;paddi
     </div>
     <div class="field">
       <label>پاسخ این محاسبه چیست؟</label>
-      <div class="captcha-box" style="background:#0f172a;border:1px solid #334155;padding:8px;border-radius:8px;margin-bottom:8px;text-align:center"><img src="?action=captcha_image&amp;v=<?= time() ?>" alt="کپچا" width="160" height="50" style="display:inline-block"></div>
+      <div class="captcha-box"><img src="?action=captcha_image&amp;v=<?= time() ?>" alt="کپچا" width="160" height="50"></div>
       <input type="text" name="captcha" required inputmode="numeric" autocomplete="off">
     </div>
-    <button class="btn">تغییر رمز عبور</button>
+    <button class="btn-primary">تغییر رمز عبور</button>
   </form>
 </div></body></html>
 <?php
@@ -4214,11 +5462,14 @@ input{width:100%;background:#0f172a;border:1px solid #334155;color:#f1f5f9;paddi
 // ─── POST: Step 3 process ────────────────────────────────────
 if ($action == 'forgot_password_step3_process') {
     verifyCsrf();
+    $json = wants_json();
     if (empty($_SESSION['reset_authorized_otp_id']) || empty($_SESSION['reset_authorized_at'])) {
+        if ($json) auth_json_err('no_session');
         header("Location: ?action=forgot_password_step1"); exit;
     }
     if (time() - (int)$_SESSION['reset_authorized_at'] > 300) {
         unset($_SESSION['reset_authorized_otp_id'], $_SESSION['reset_authorized_at']);
+        if ($json) auth_json_err('expired');
         header("Location: ?action=forgot_password_step1&error=expired"); exit;
     }
 
@@ -4227,12 +5478,15 @@ if ($action == 'forgot_password_step3_process') {
     $captchaAnswer = $_POST['captcha'] ?? '';
 
     if (!math_captcha_verify($captchaAnswer)) {
+        if ($json) auth_json_err('captcha_wrong');
         header("Location: ?action=forgot_password_step3&error=captcha_wrong"); exit;
     }
     if ($newPass !== $newPassConfirm) {
+        if ($json) auth_json_err('password_mismatch');
         header("Location: ?action=forgot_password_step3&error=password_mismatch"); exit;
     }
     if (!validate_password_strength($newPass)) {
+        if ($json) auth_json_err('weak_password');
         header("Location: ?action=forgot_password_step3&error=weak_password"); exit;
     }
 
@@ -4242,12 +5496,14 @@ if ($action == 'forgot_password_step3_process') {
     $otp = $st->fetch();
     if (!$otp) {
         unset($_SESSION['reset_authorized_otp_id'], $_SESSION['reset_authorized_at']);
+        if ($json) auth_json_err('no_session');
         header("Location: ?action=forgot_password_step1"); exit;
     }
     $payload = $otp['payload'] ? json_decode($otp['payload'], true) : [];
     $userId  = isset($payload['user_id']) ? (int)$payload['user_id'] : 0;
     if (!$userId) {
         unset($_SESSION['reset_authorized_otp_id'], $_SESSION['reset_authorized_at']);
+        if ($json) auth_json_err('no_session');
         header("Location: ?action=forgot_password_step1"); exit;
     }
 
@@ -4259,28 +5515,33 @@ if ($action == 'forgot_password_step3_process') {
     unset($_SESSION['reset_authorized_otp_id'], $_SESSION['reset_authorized_at'],
           $_SESSION['pending_password_reset'], $_SESSION['pending_reset_otp_id']);
 
+    if ($json) auth_json_ok(['redirect' => 'index.php?msg=password_reset_success']);
     header("Location: index.php?msg=password_reset_success"); exit;
 }
 
 // ─── POST: Resend reset token ────────────────────────────────
 if ($action == 'forgot_password_resend') {
     verifyCsrf();
+    $json = wants_json();
     if (empty($_SESSION['pending_password_reset'])) {
+        if ($json) auth_json_err('no_session');
         header("Location: ?action=forgot_password_step1"); exit;
     }
     $pending = $_SESSION['pending_password_reset'];
 
     $count = (int)($_SESSION['reset_resend_count'] ?? 0);
     if ($count >= 3) {
+        if ($json) auth_json_err('cooldown');
         header("Location: ?action=forgot_password_step2&error=cooldown"); exit;
     }
 
     if (!empty($pending['fake'])) {
-        $_SESSION['pending_password_reset']['token']      = generate_otp_code(8);
+        $_SESSION['pending_password_reset']['token']      = generate_otp_code();
         $_SESSION['pending_password_reset']['expires_at'] = date('Y-m-d H:i:s', time() + 1800);
         $_SESSION['pending_reset_otp_id']                 = -1;
         $_SESSION['pending_fake_expires_at']              = time() + 1800;
         $_SESSION['reset_resend_count'] = $count + 1;
+        if ($json) auth_json_ok(['resent' => true, 'verify' => spa_verify_snapshot()]);
         header("Location: ?action=forgot_password_step2&msg=resent"); exit;
     }
 
@@ -4298,8 +5559,10 @@ if ($action == 'forgot_password_resend') {
         $_SESSION['pending_reset_otp_id'] = (int)$result['otp_id'];
         unset($_SESSION['pending_fake_expires_at']);
         $_SESSION['reset_resend_count'] = $count + 1;
+        if ($json) auth_json_ok(['resent' => true, 'verify' => spa_verify_snapshot()]);
         header("Location: ?action=forgot_password_step2&msg=resent"); exit;
     }
+    if ($json) auth_json_err($result['reason'] ?? 'send_failed');
     header("Location: ?action=forgot_password_step2&error=" . urlencode($result['reason'] ?? 'send_failed')); exit;
 }
 
@@ -4411,23 +5674,27 @@ if ($action == 'inbound_status') {
  */
 if ($action == 'inbound_check_now') {
     verifyCsrf();
+    $json = wants_json();
     $redirect = $_POST['redirect'] ?? 'register_step2';
     $allowedRedirects = ['register_step2', 'forgot_password_step2', 'inbound_settings'];
     if (!in_array($redirect, $allowedRedirects, true)) $redirect = 'register_step2';
 
     $last = (int)($_SESSION['inbound_check_last'] ?? 0);
-    if (time() - $last < 15) {
+    if (time() - $last < 10) {
+        if ($json) auth_json_err('rate_limit');
         header("Location: ?action=$redirect&error=rate_limit"); exit;
     }
     $_SESSION['inbound_check_last'] = time();
 
     if (getSetting($pdo, 'inbound_enabled', '1') !== '1') {
+        if ($json) auth_json_err('check_disabled');
         header("Location: ?action=$redirect&error=check_disabled"); exit;
     }
 
     $stats = inbound_run($pdo, 20);
     $matched = (int)($stats['matched'] ?? 0);
     $busy    = (!empty($stats['error']) && $stats['error'] === 'busy') ? '1' : '0';
+    if ($json) auth_json_ok(['matched' => $matched, 'busy' => $busy === '1']);
     header("Location: ?action=$redirect&msg=checked&matched=$matched&busy=$busy"); exit;
 }
 
@@ -4757,7 +6024,7 @@ if($action=='index'){
             <div class="field"><label>نام کاربری یا ایمیل</label><input type="text" name="username" placeholder="نام کاربری یا ایمیل" required autocomplete="username"></div>
             <div class="field"><label>رمز عبور</label><input type="password" name="password" placeholder="••••••••" required autocomplete="current-password">
                 <div style="text-align:left;margin-top:6px">
-                  <a href="?action=forgot_password_step1" style="color:#3b82f6;text-decoration:none;font-size:.8rem">بازیابی رمز عبور</a>
+                  <a href="?action=auth_shell&amp;view=forgot" style="color:#3b82f6;text-decoration:none;font-size:.8rem">بازیابی رمز عبور</a>
                 </div>
             </div>
             <button type="submit" class="submit-btn">ورود به سیستم</button>
@@ -4770,7 +6037,7 @@ if($action=='index'){
         <div id="pkSt"></div>
         <?php if (registrationEnabled($pdo)): ?>
         <div style="text-align:center;margin-top:18px;font-size:.85rem;color:#94a3b8">
-          حساب ندارید؟ <a href="?action=register_step1" style="color:#3b82f6;text-decoration:none;font-weight:600">ثبت‌نام در XCloud</a>
+          حساب ندارید؟ <a href="?action=auth_shell&amp;view=register" style="color:#3b82f6;text-decoration:none;font-weight:600">ثبت‌نام در XCloud</a>
         </div>
         <?php endif; ?>
     </div>
@@ -4831,15 +6098,10 @@ elseif($action=='dashboard'){
     $ss=$pdo->prepare("SELECT fs.*, fs.id as share_id FROM file_shares fs WHERE fs.shared_with=? ORDER BY fs.created_at DESC");
     $ss->execute([$viewUser]);$sharedWithMe=$ss->fetchAll(PDO::FETCH_ASSOC);
 
-    // Public files
+    // Public files (visible to all logged-in users)
     $publicFiles=[];
     if($activeTab==='public'){
-        if($role==='admin'){
-            $pfs=$pdo->query("SELECT * FROM public_files ORDER BY created_at DESC");$publicFiles=$pfs->fetchAll(PDO::FETCH_ASSOC);
-        }else{
-            $pfs=$pdo->prepare("SELECT pf.* FROM public_files pf INNER JOIN public_file_access pfa ON pf.id=pfa.file_id WHERE pfa.username=? ORDER BY pf.created_at DESC");
-            $pfs->execute([$_SESSION['user']]);$publicFiles=$pfs->fetchAll(PDO::FETCH_ASSOC);
-        }
+        $pfs=$pdo->query("SELECT * FROM public_files ORDER BY id DESC");$publicFiles=$pfs->fetchAll(PDO::FETCH_ASSOC);
     }
     // Folder management
     $userFolders = getUserFolders($pdo, $viewUser);
@@ -4906,7 +6168,14 @@ elseif($action=='dashboard'){
     .app-header{position:sticky;top:0;z-index:1000;background:rgba(10,14,26,.94);backdrop-filter:blur(16px);border-bottom:1px solid var(--border)}
     .header-inner{display:flex;justify-content:space-between;align-items:center;padding:10px 20px;max-width:1280px;margin:0 auto}
     .header-brand{display:flex;align-items:center;gap:8px}
-    .header-brand span{font-weight:900;font-size:1.1rem;background:linear-gradient(135deg,var(--primary),var(--purple));-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+    .header-brand span{font-weight:900;font-size:1.1rem;background:linear-gradient(135deg,var(--primary),var(--purple));-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
+    .logo-link{position:relative;text-decoration:none;padding:6px 12px;border-radius:10px;transition:transform .3s;cursor:pointer}
+    .logo-link::before{content:'';position:absolute;inset:0;background:linear-gradient(135deg,rgba(59,130,246,.3),rgba(139,92,246,.3));border-radius:10px;opacity:0;filter:blur(12px);transition:opacity .25s;z-index:-1;pointer-events:none}
+    .logo-link:hover::before{opacity:1}
+    .logo-link:hover .logo-text{text-shadow:0 0 20px rgba(59,130,246,.5)}
+    .logo-link.spinning{animation:logoSpin .35s ease-out}
+    @keyframes logoSpin{to{transform:rotate(360deg)}}
+    .logo-text{background:linear-gradient(135deg,#3b82f6,#8b5cf6);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;font-weight:900;font-size:1.1rem;transition:text-shadow .25s}
     .header-actions{display:flex;align-items:center;gap:5px;flex-wrap:wrap}
     .nav-btn{display:inline-flex;align-items:center;gap:4px;padding:6px 10px;border-radius:8px;font-size:.72rem;font-weight:700;text-decoration:none;border:none;cursor:pointer;transition:all .2s;white-space:nowrap;line-height:1}
     .nav-btn svg{width:13px;height:13px;flex-shrink:0}
@@ -5102,10 +6371,10 @@ elseif($action=='dashboard'){
 
     <header class="app-header">
         <div class="header-inner">
-            <div class="header-brand">
+            <a href="?action=dashboard" class="header-brand logo-link" onclick="this.classList.add('spinning');setTimeout(function(){location.reload();},350);return false;">
                 <img src="/icons/web-app-manifest-512x512.png" alt="XCloud" style="width:28px;height:28px;border-radius:8px;object-fit:contain;">
-                <span>XCloud</span>
-            </div>
+                <span class="logo-text">XCloud</span>
+            </a>
             <div class="header-actions">
                 <span class="mobile-username"><?php echo h($_SESSION['user']);?></span>
                 <span class="nav-btn nb-user"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg><span class="btn-text"><?php echo h($_SESSION['user']);?></span></span>
@@ -6511,7 +7780,11 @@ elseif($action=='trash'){
             <div class="trash-meta">
                 <div class="trash-name" title="<?php echo h($it['original_filename']);?>"><?php echo h($it['original_filename']);?></div>
                 <div class="trash-details">
-                    <span>👤 <?php echo h($it['original_owner']);?></span>
+                    <?php if(!empty($it['is_public'])||$it['original_owner']==='__public__'):?>
+                        <span style="background:#dbeafe;color:#1e40af;padding:1px 6px;border-radius:4px">📢 عمومی</span>
+                    <?php else:?>
+                        <span>👤 <?php echo h($it['original_owner']);?></span>
+                    <?php endif;?>
                     <span>🗑 <?php echo h($it['deleted_by']);?></span>
                     <span>📅 <?php echo to_jalali($it['deleted_at']);?></span>
                     <span>💾 <?php echo formatBytes($it['file_size']);?></span>
@@ -6566,7 +7839,52 @@ elseif($action=='users'){
     *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}body{font-family:'Dana','JetBrains Mono',sans-serif;background:#0a0e1a;color:#e2e8f0;min-height:100vh}
     .app-header{position:sticky;top:0;z-index:1000;background:rgba(10,14,26,.88);backdrop-filter:blur(16px);padding:12px 20px;display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid #1e293b}
     .back-link{color:#3b82f6;text-decoration:none;font-size:.85rem;font-weight:600}
-    .container{padding:20px;max-width:720px;margin:0 auto}
+    .container{padding:20px;max-width:1280px;margin:0 auto}
+    .users-toolbar{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:12px;flex-wrap:wrap}
+    .users-toolbar input[type="search"]{flex:1;min-width:200px;background:rgba(15,23,42,.6);border:1.5px solid #1e293b;color:#e2e8f0;padding:10px 14px;border-radius:10px;font-family:inherit;font-size:.85rem;outline:none}
+    .users-toolbar input[type="search"]:focus{border-color:#3b82f6}
+    .users-count{color:#94a3b8;font-size:.82rem;font-weight:600;background:rgba(15,23,42,.5);padding:6px 12px;border-radius:8px;border:1px solid #1e293b}
+    .users-table-wrap{max-height:70vh;overflow-y:auto;border:1px solid #1e293b;border-radius:12px;background:#111827}
+    .users-table{width:100%;border-collapse:collapse;font-size:.82rem}
+    .users-table thead{position:sticky;top:0;background:rgba(10,14,26,.95);backdrop-filter:blur(12px);z-index:1}
+    .users-table th{padding:10px 12px;color:#94a3b8;font-weight:700;text-align:right;font-size:.7rem;text-transform:uppercase;letter-spacing:.05em;border-bottom:1px solid #1e293b;white-space:nowrap}
+    .users-table td{padding:10px 12px;border-bottom:1px solid rgba(30,41,59,.5);color:#e2e8f0;vertical-align:middle}
+    .users-table tbody tr:hover{background:rgba(30,41,59,.3)}
+    .users-table tbody tr:last-child td{border-bottom:none}
+    .users-table td.col-email{color:#fde68a;direction:ltr;font-family:Consolas,monospace;font-size:.78rem;text-align:left}
+    .users-table td.col-name{font-weight:700}
+    .users-table td.col-date{color:#64748b;font-size:.74rem;white-space:nowrap}
+    .role-badge{display:inline-block;padding:2px 8px;border-radius:6px;font-size:.68rem;font-weight:700}
+    .role-badge.role-admin{background:rgba(168,85,247,.2);color:#d8b4fe}
+    .role-badge.role-user{background:rgba(34,197,94,.15);color:#4ade80}
+    .perm-icons{display:flex;gap:4px;flex-wrap:wrap}
+    .perm-icon{display:inline-flex;align-items:center;justify-content:center;width:26px;height:26px;border-radius:6px;border:1px solid #1e293b;background:rgba(15,23,42,.5);cursor:pointer;font-size:.78rem;padding:0;transition:filter .15s}
+    .perm-icon:hover{filter:brightness(1.3)}
+    .perm-icon.on{background:rgba(34,197,94,.18);color:#4ade80;border-color:rgba(34,197,94,.3)}
+    .perm-icon.off{background:rgba(100,116,139,.08);color:#475569;border-color:#1e293b;opacity:.6}
+    .perm-icon.admin-all{background:linear-gradient(135deg,rgba(139,92,246,.18),rgba(59,130,246,.18));color:#a78bfa;border-color:rgba(139,92,246,.3);cursor:default;width:auto;padding:0 10px;font-weight:700;font-size:.7rem}
+    .row-actions{display:flex;gap:4px;align-items:center;flex-wrap:nowrap}
+    .row-action-btn{display:inline-flex;align-items:center;justify-content:center;border:none;border-radius:6px;padding:5px 8px;font-size:.72rem;font-weight:700;cursor:pointer;font-family:inherit;white-space:nowrap;background:rgba(59,130,246,.12);color:#93c5fd}
+    .row-action-btn:hover{filter:brightness(1.3)}
+    .row-action-btn.ra-del{background:rgba(239,68,68,.12);color:#f87171}
+    .row-action-btn.ra-mail{background:rgba(30,58,138,.4);color:#bfdbfe}
+    .row-action-btn.ra-pass{background:rgba(139,92,246,.12);color:#a78bfa}
+    .self-tag{font-size:.7rem;color:#64748b;padding:2px 6px}
+    .email-status{font-size:.62rem;padding:1px 6px;border-radius:4px;margin-right:4px;display:inline-block;direction:rtl;font-family:inherit}
+    .email-status.ok{background:#14532d;color:#bbf7d0}
+    .email-status.pending{background:#7c2d12;color:#fed7aa}
+    .users-pagination{display:flex;gap:6px;justify-content:center;margin-top:14px;flex-wrap:wrap}
+    .page-btn{background:rgba(15,23,42,.6);border:1px solid #1e293b;color:#cbd5e1;padding:6px 12px;border-radius:8px;font-family:inherit;font-size:.78rem;cursor:pointer;min-width:34px}
+    .page-btn:hover{background:rgba(30,41,59,.7)}
+    .page-btn.active{background:linear-gradient(135deg,#3b82f6,#6366f1);color:#fff;border-color:transparent;font-weight:700}
+    .users-empty{text-align:center;padding:30px;color:#64748b;font-size:.85rem}
+    .logo-link{position:relative;display:inline-flex;align-items:center;gap:8px;text-decoration:none;padding:6px 12px;border-radius:10px;transition:transform .3s;cursor:pointer}
+    .logo-link::before{content:'';position:absolute;inset:0;background:linear-gradient(135deg,rgba(59,130,246,.3),rgba(139,92,246,.3));border-radius:10px;opacity:0;filter:blur(12px);transition:opacity .25s;z-index:-1}
+    .logo-link:hover::before{opacity:1}
+    .logo-link:hover .logo-text{text-shadow:0 0 20px rgba(59,130,246,.5)}
+    .logo-link.spinning{animation:logoSpin .35s ease-out}
+    @keyframes logoSpin{to{transform:rotate(360deg)}}
+    .logo-text{background:linear-gradient(135deg,#3b82f6,#8b5cf6);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;font-weight:900;font-size:1.1rem;transition:text-shadow .25s}
     .card{background:#111827;border-radius:14px;padding:18px;border:1px solid #1e293b;margin-bottom:16px}
     .card h3{font-size:.88rem;margin-bottom:14px}
     .form-row{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px}
@@ -6668,6 +7986,13 @@ elseif($action=='users'){
         </div>
         <div style="background:#1e293b;border:1px solid #334155;border-radius:10px;padding:14px 20px;margin-bottom:16px;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px" dir="rtl">
           <div>
+            <strong style="color:#f1f5f9">کدهای معرف</strong>
+            <p style="margin:4px 0 0;color:#94a3b8;font-size:.85rem">مدیریت کدهای دعوت و الزام ثبت‌نام با کد معرف.</p>
+          </div>
+          <a href="?action=referrals" style="background:#7c3aed;color:#fff;padding:9px 18px;border-radius:6px;text-decoration:none;font-weight:600;font-size:.85rem">🎟️ مدیریت کدهای معرف</a>
+        </div>
+        <div style="background:#1e293b;border:1px solid #334155;border-radius:10px;padding:14px 20px;margin-bottom:16px;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px" dir="rtl">
+          <div>
             <strong style="color:#f1f5f9">پشتیبان‌گیری دیتابیس</strong>
             <p style="margin:4px 0 0;color:#94a3b8;font-size:.85rem">قبل از هر بار آپلود نسخه‌ی جدید کد، یک نسخه‌ی پشتیبان دانلود کنید.</p>
           </div>
@@ -6696,69 +8021,85 @@ elseif($action=='users'){
             </form>
         </div>
 
-        <div class="card">
-            <h3>👥 کاربران (<?php echo count($users);?>)</h3>
-            <?php foreach($users as $u):
-                $up2=getUserUploadPath($u['username']);$us=getDirSize($up2);$uf=count(array_diff(scandir($up2),['.','..']));?>
-            <div class="user-row">
-                <div class="user-top">
-                    <div class="user-info">
-                        <span class="user-name"><?php echo h($u['username']);?></span>
-                        <span class="role-tag <?php echo $u['role']=='admin'?'role-admin':'role-user';?>"><?php echo $u['role']=='admin'?'مدیر':'کاربر';?></span>
-                    </div>
-                    <?php if($u['username']!==$_SESSION['user']):?>
-                    <div class="user-btns">
-                        <button class="ub ub-pass" onclick="openPassModal(<?php echo $u['id'];?>,'<?php echo h(addslashes($u['username']));?>')">🔑 رمز</button>
-                        <form method="POST" action="?action=delete_user" style="display:inline" onsubmit="return confirm('حذف «<?php echo h(addslashes($u['username']));?>»؟')">
-                            <input type="hidden" name="csrf_token" value="<?php echo $csrf;?>">
-                            <input type="hidden" name="user_id" value="<?php echo $u['id'];?>">
-                            <button type="submit" class="ub ub-del">حذف</button>
-                        </form>
-                    </div>
-                    <?php else:?><span style="font-size:.7rem;color:#64748b">شما</span><?php endif;?>
-                </div>
-                <div class="user-storage">💾 <?php echo $uf;?> فایل — <?php echo formatBytes($us);?></div>
-                <div class="email-section" style="margin:8px 0;padding:8px;background:rgba(15,23,42,.4);border-radius:8px;border:1px solid #1e293b">
-                    <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap">
-                        <div style="font-size:.78rem">
-                            <span style="color:#94a3b8">ایمیل:</span>
-                            <?php if (!empty($u['email'])): ?>
-                                <span style="color:#fde68a;direction:ltr;font-family:Consolas,monospace"><?php echo h($u['email']); ?></span>
-                                <?php if ((int)$u['email_verified'] === 1): ?>
-                                    <span class="badge badge-ok" style="background:#14532d;color:#bbf7d0;padding:1px 6px;border-radius:4px;font-size:.65rem;margin-right:4px">تایید شده</span>
-                                <?php else: ?>
-                                    <span class="badge" style="background:#7c2d12;color:#fed7aa;padding:1px 6px;border-radius:4px;font-size:.65rem;margin-right:4px">تایید نشده</span>
-                                <?php endif; ?>
-                            <?php else: ?>
-                                <span style="color:#64748b">ثبت نشده</span>
-                            <?php endif; ?>
-                        </div>
-                        <?php if ($u['username'] !== $_SESSION['user']): ?>
-                        <button type="button" class="ub ub-pass" style="background:#1e3a8a;color:#bfdbfe" onclick="openEmailModal(<?php echo $u['id']; ?>,'<?php echo h(addslashes($u['username'])); ?>','<?php echo h(addslashes($u['email'] ?? '')); ?>')">📧 تنظیم ایمیل</button>
-                        <?php endif; ?>
-                    </div>
-                </div>
-                <?php if($u['role']==='admin'):?>
-                <div class="admin-note">مدیر — دسترسی کامل</div>
-                <?php else:?>
-                <div class="perms-section">
-                    <div class="perms-title">دسترسی‌ها</div>
-                    <?php foreach([['can_download','⬇ دانلود','dl'],['can_change_password','🔑 تغییر رمز','pass'],['can_delete','🗑 حذف فایل‌های خود','del'],['can_share','📤 اشتراک‌گذاری','share']] as [$field,$label,$cls]):?>
-                    <div class="perm-row">
-                        <span class="perm-label"><?php echo $label;?></span>
-                        <form method="POST" action="?action=update_permissions" style="margin:0">
-                            <input type="hidden" name="csrf_token" value="<?php echo $csrf;?>">
-                            <input type="hidden" name="user_id" value="<?php echo $u['id'];?>">
-                            <input type="hidden" name="field" value="<?php echo $field;?>">
-                            <input type="hidden" name="value" value="<?php echo $u[$field]?0:1;?>">
-                            <button type="submit" class="perm-btn <?php echo $u[$field]?"on-$cls":"off-$cls";?>"><?php echo $u[$field]?'فعال':'غیرفعال';?></button>
-                        </form>
-                    </div>
-                    <?php endforeach;?>
-                </div>
-                <?php endif;?>
+        <div class="card" style="padding:14px">
+            <div class="users-toolbar">
+                <h3 style="margin:0">👥 کاربران</h3>
+                <input type="search" id="userSearch" placeholder="🔍 جستجوی نام کاربری یا ایمیل...">
+                <span class="users-count" id="usersCount"><?php echo count($users);?> کاربر</span>
             </div>
-            <?php endforeach;?>
+            <div class="users-table-wrap">
+                <table class="users-table">
+                    <thead>
+                        <tr>
+                            <th>کاربر</th>
+                            <th>ایمیل</th>
+                            <th>نقش</th>
+                            <th>دسترسی‌ها</th>
+                            <th>تاریخ ثبت</th>
+                            <th>عملیات</th>
+                        </tr>
+                    </thead>
+                    <tbody id="usersBody">
+                        <?php foreach($users as $u):
+                            $searchKey = strtolower($u['username'].' '.($u['email'] ?? ''));
+                            $isSelf = ($u['username']===$_SESSION['user']);
+                            $isAdmin = ($u['role']==='admin');
+                        ?>
+                        <tr data-search="<?php echo h($searchKey);?>">
+                            <td class="col-name"><?php echo h($u['username']);?></td>
+                            <td class="col-email">
+                                <?php if (!empty($u['email'])): ?>
+                                    <?php echo h($u['email']);?>
+                                    <?php if ((int)$u['email_verified'] === 1): ?>
+                                        <span class="email-status ok">✓</span>
+                                    <?php else: ?>
+                                        <span class="email-status pending">!</span>
+                                    <?php endif; ?>
+                                <?php else: ?>
+                                    <span style="color:#64748b;font-family:inherit;direction:rtl">—</span>
+                                <?php endif; ?>
+                            </td>
+                            <td><span class="role-badge role-<?php echo h($u['role']);?>"><?php echo $isAdmin?'مدیر':'کاربر';?></span></td>
+                            <td>
+                                <?php if($isAdmin):?>
+                                    <span class="perm-icon admin-all">دسترسی کامل</span>
+                                <?php else: ?>
+                                <div class="perm-icons">
+                                <?php foreach([['can_download','⬇','دانلود'],['can_change_password','🔑','تغییر رمز'],['can_delete','🗑','حذف فایل خود'],['can_share','📤','اشتراک‌گذاری']] as [$field,$icon,$label]):?>
+                                    <form method="POST" action="?action=update_permissions" style="margin:0;display:inline">
+                                        <input type="hidden" name="csrf_token" value="<?php echo $csrf;?>">
+                                        <input type="hidden" name="user_id" value="<?php echo $u['id'];?>">
+                                        <input type="hidden" name="field" value="<?php echo $field;?>">
+                                        <input type="hidden" name="value" value="<?php echo $u[$field]?0:1;?>">
+                                        <button type="submit" class="perm-icon <?php echo $u[$field]?'on':'off';?>" title="<?php echo $label.' — '.($u[$field]?'فعال':'غیرفعال');?>"><?php echo $icon;?></button>
+                                    </form>
+                                <?php endforeach;?>
+                                </div>
+                                <?php endif;?>
+                            </td>
+                            <td class="col-date"><?php echo h(to_jalali($u['created_at']));?></td>
+                            <td>
+                                <?php if($isSelf):?>
+                                    <span class="self-tag">شما</span>
+                                <?php else:?>
+                                    <div class="row-actions">
+                                        <button type="button" class="row-action-btn ra-pass" onclick="openPassModal(<?php echo $u['id'];?>,'<?php echo h(addslashes($u['username']));?>')" title="تغییر رمز">🔑</button>
+                                        <button type="button" class="row-action-btn ra-mail" onclick="openEmailModal(<?php echo $u['id'];?>,'<?php echo h(addslashes($u['username']));?>','<?php echo h(addslashes($u['email'] ?? ''));?>')" title="تنظیم ایمیل">📧</button>
+                                        <form method="POST" action="?action=delete_user" style="margin:0;display:inline" onsubmit="return confirm('حذف «<?php echo h(addslashes($u['username']));?>»؟')">
+                                            <input type="hidden" name="csrf_token" value="<?php echo $csrf;?>">
+                                            <input type="hidden" name="user_id" value="<?php echo $u['id'];?>">
+                                            <button type="submit" class="row-action-btn ra-del" title="حذف">🗑</button>
+                                        </form>
+                                    </div>
+                                <?php endif;?>
+                            </td>
+                        </tr>
+                        <?php endforeach;?>
+                    </tbody>
+                </table>
+                <div class="users-empty" id="usersEmpty" hidden>هیچ کاربری پیدا نشد.</div>
+            </div>
+            <div class="users-pagination" id="usersPagination" hidden></div>
         </div>
     </div>
 
@@ -6812,8 +8153,249 @@ elseif($action=='users'){
         if(msg&&msgs[msg]){const t=document.getElementById('toast');t.innerHTML='<span>'+msgs[msg][0]+'</span><span>'+msgs[msg][1]+'</span>';
             setTimeout(()=>t.classList.add('show'),80);setTimeout(()=>t.classList.remove('show'),3200);}
     })();
+
+    // Users table: client-side search + pagination
+    (function(){
+        const PAGE_SIZE = 50;
+        const allRows = Array.from(document.querySelectorAll('#usersBody tr'));
+        const countEl = document.getElementById('usersCount');
+        const totalUsers = allRows.length;
+        let currentPage = 1;
+        let filteredRows = allRows.slice();
+
+        function renderPage(){
+            const start = (currentPage - 1) * PAGE_SIZE;
+            const end = start + PAGE_SIZE;
+            allRows.forEach(r => r.hidden = true);
+            filteredRows.slice(start, end).forEach(r => r.hidden = false);
+            document.getElementById('usersEmpty').hidden = filteredRows.length !== 0;
+            renderPagination();
+        }
+        function renderPagination(){
+            const total = Math.ceil(filteredRows.length / PAGE_SIZE);
+            const pag = document.getElementById('usersPagination');
+            if (total <= 1) { pag.hidden = true; pag.innerHTML = ''; return; }
+            pag.hidden = false;
+            pag.innerHTML = '';
+            for (let i = 1; i <= total; i++) {
+                const btn = document.createElement('button');
+                btn.type = 'button';
+                btn.textContent = i;
+                btn.className = 'page-btn' + (i === currentPage ? ' active' : '');
+                btn.addEventListener('click', () => { currentPage = i; renderPage(); document.querySelector('.users-table-wrap').scrollTop = 0; });
+                pag.appendChild(btn);
+            }
+        }
+        const searchEl = document.getElementById('userSearch');
+        if (searchEl) {
+            searchEl.addEventListener('input', e => {
+                const q = e.target.value.trim().toLowerCase();
+                filteredRows = q ? allRows.filter(r => r.dataset.search.includes(q)) : allRows.slice();
+                currentPage = 1;
+                if (countEl) countEl.textContent = (q ? filteredRows.length + ' از ' + totalUsers : totalUsers) + ' کاربر';
+                renderPage();
+            });
+        }
+        renderPage();
+    })();
     </script>
     </body></html><?php
+}
+
+// ================================================================
+// REFERRAL CODES (Admin)
+// ================================================================
+elseif($action=='referrals'){
+    if(!isset($_SESSION['user'])||$_SESSION['role']!=='admin'){header("Location: index.php");exit;}
+    $csrf = generateCsrfToken();
+    $requiresReferral = getSetting($pdo, 'registration_requires_referral', '0') === '1';
+    $codes = $pdo->query("SELECT * FROM referral_codes ORDER BY id DESC")->fetchAll();
+    $msg = $_GET['msg'] ?? '';
+    $newCode = $_GET['new'] ?? '';
+    $msgMap = [
+        'created'      => ['✅', 'کد جدید ساخته شد'],
+        'create_error' => ['❌', 'خطا در ساخت کد'],
+        'revoked'      => ['🚫', 'کد باطل شد'],
+        'deleted'      => ['🗑️', 'کد حذف شد'],
+        'required_on'  => ['✅', 'ثبت‌نام با کد معرف اجباری شد'],
+        'required_off' => ['ℹ️', 'ثبت‌نام دیگر نیاز به کد معرف ندارد'],
+    ];
+?>
+<!DOCTYPE html><html lang="fa" dir="rtl"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>XCloud — کدهای معرف</title>
+<?= renderHeadAssets() ?>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'Dana','JetBrains Mono',sans-serif;background:#0a0e1a;color:#e2e8f0;min-height:100vh}
+.app-header{position:sticky;top:0;z-index:1000;background:rgba(10,14,26,.94);backdrop-filter:blur(16px);padding:12px 20px;display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid #1e293b}
+.back-link{color:#3b82f6;text-decoration:none;font-size:.85rem;font-weight:600}
+.brand-title{font-weight:900;font-size:1rem;background:linear-gradient(135deg,#3b82f6,#8b5cf6);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
+.container{padding:20px;max-width:1100px;margin:0 auto}
+.card{background:#111827;border-radius:14px;padding:18px;border:1px solid #1e293b;margin-bottom:16px}
+.card h3{font-size:.95rem;margin-bottom:14px;color:#f1f5f9}
+.toggle-row{display:flex;justify-content:space-between;align-items:center;gap:14px;flex-wrap:wrap}
+.toggle-row .desc{color:#94a3b8;font-size:.82rem;margin-top:4px}
+.toggle-btn{padding:10px 18px;border:none;border-radius:8px;cursor:pointer;font-weight:700;font-family:inherit;font-size:.85rem}
+.toggle-on{background:#dc2626;color:#fff}
+.toggle-off{background:#16a34a;color:#fff}
+.create-form .row{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:10px}
+.create-form .row > *{flex:1;min-width:140px}
+.create-form input[type="text"],.create-form input[type="datetime-local"],.create-form input[type="number"],.create-form select{background:rgba(15,23,42,.5);border:1.5px solid #1e293b;padding:10px 14px;border-radius:10px;color:#e2e8f0;font-family:inherit;font-size:.84rem;outline:none;width:100%}
+.create-form input:focus,.create-form select:focus{border-color:#3b82f6}
+.type-radios{display:flex;gap:10px;flex-wrap:wrap}
+.type-radios label{display:flex;align-items:center;gap:6px;padding:8px 12px;border:1.5px solid #1e293b;border-radius:10px;cursor:pointer;font-size:.82rem;background:rgba(15,23,42,.4);flex:1;justify-content:center}
+.type-radios input{accent-color:#3b82f6}
+.type-radios label.active{border-color:#3b82f6;background:rgba(59,130,246,.1)}
+.create-btn{padding:12px 22px;background:linear-gradient(135deg,#3b82f6,#6366f1);color:#fff;border:none;border-radius:10px;font-weight:700;cursor:pointer;font-family:inherit;font-size:.88rem}
+table.codes{width:100%;border-collapse:collapse;font-size:.82rem}
+table.codes th{padding:10px 12px;color:#94a3b8;font-size:.7rem;text-transform:uppercase;letter-spacing:.05em;border-bottom:1px solid #1e293b;text-align:right;font-weight:700}
+table.codes td{padding:10px 12px;border-bottom:1px solid rgba(30,41,59,.5)}
+table.codes tbody tr:hover{background:rgba(30,41,59,.3)}
+.code-cell{font-family:'JetBrains Mono',Consolas,monospace;font-weight:700;color:#a5b4fc;direction:ltr;letter-spacing:.08em}
+.type-badge{padding:2px 8px;border-radius:6px;font-size:.7rem;font-weight:700}
+.type-single{background:rgba(59,130,246,.2);color:#93c5fd}
+.type-multi{background:rgba(168,85,247,.2);color:#d8b4fe}
+.type-unlimited{background:rgba(34,197,94,.18);color:#4ade80}
+.status-badge{padding:2px 8px;border-radius:6px;font-size:.7rem;font-weight:700}
+.status-active{background:rgba(34,197,94,.18);color:#4ade80}
+.status-expired{background:rgba(100,116,139,.18);color:#94a3b8}
+.status-revoked{background:rgba(239,68,68,.15);color:#fca5a5}
+.status-used{background:rgba(249,115,22,.18);color:#fdba74}
+.row-actions{display:flex;gap:6px}
+.row-action-btn{display:inline-flex;align-items:center;justify-content:center;border:none;border-radius:6px;padding:6px 10px;font-size:.74rem;font-weight:700;cursor:pointer;font-family:inherit;background:rgba(59,130,246,.12);color:#93c5fd}
+.row-action-btn:hover{filter:brightness(1.3)}
+.row-action-btn.ra-rev{background:rgba(249,115,22,.15);color:#fdba74}
+.row-action-btn.ra-del{background:rgba(239,68,68,.12);color:#f87171}
+.empty{text-align:center;color:#64748b;padding:30px;font-size:.85rem}
+.banner{background:rgba(30,58,138,.3);border:1px solid rgba(59,130,246,.3);color:#bfdbfe;padding:10px 14px;border-radius:10px;margin-bottom:14px;font-size:.85rem;display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}
+.banner.new{background:rgba(20,83,45,.4);border-color:rgba(34,197,94,.3);color:#bbf7d0}
+.banner code{font-family:'JetBrains Mono',Consolas,monospace;font-size:1rem;letter-spacing:.08em;background:rgba(0,0,0,.3);padding:4px 10px;border-radius:6px}
+.copy-mini{background:rgba(51,65,85,.6);color:#e2e8f0;border:none;border-radius:6px;padding:5px 10px;font-size:.74rem;cursor:pointer;font-family:inherit}
+.toast{position:fixed;top:72px;left:50%;transform:translateX(-50%) translateY(-16px);background:#1a2235;border:1px solid #1e293b;border-radius:12px;padding:12px 20px;z-index:3000;font-size:.82rem;font-weight:600;box-shadow:0 12px 40px rgba(0,0,0,.4);opacity:0;pointer-events:none;transition:all .4s cubic-bezier(.16,1,.3,1);display:flex;align-items:center;gap:8px}
+.toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+</style></head><body>
+<header class="app-header">
+    <a href="?action=dashboard" class="back-link">← بازگشت</a>
+    <span class="brand-title">کدهای معرف</span>
+</header>
+<div class="container">
+    <?php if($msg && isset($msgMap[$msg])): ?>
+    <div class="banner<?= $msg==='created'?' new':'' ?>">
+        <span><?= h($msgMap[$msg][0].' '.$msgMap[$msg][1]) ?><?php if($msg==='created' && $newCode): ?> — <code id="newCode"><?= h($newCode) ?></code> <button type="button" class="copy-mini" onclick="navigator.clipboard&&navigator.clipboard.writeText('<?= h($newCode) ?>');this.textContent='✓ کپی شد'">کپی</button><?php endif; ?></span>
+    </div>
+    <?php endif; ?>
+
+    <div class="card">
+        <div class="toggle-row">
+            <div>
+                <h3 style="margin:0">🔒 ثبت‌نام فقط با کد معرف</h3>
+                <div class="desc">
+                    <?= $requiresReferral
+                        ? 'فعال — برای ثبت‌نام جدید کد معرف معتبر لازم است.'
+                        : 'غیرفعال — کاربران می‌توانند بدون کد معرف ثبت‌نام کنند.' ?>
+                </div>
+            </div>
+            <form method="POST" action="?action=admin_toggle_referral_required" style="margin:0">
+                <input type="hidden" name="csrf_token" value="<?= h($csrf) ?>">
+                <button type="submit" class="toggle-btn <?= $requiresReferral ? 'toggle-on' : 'toggle-off' ?>">
+                    <?= $requiresReferral ? 'غیرفعال کردن' : 'فعال کردن' ?>
+                </button>
+            </form>
+        </div>
+    </div>
+
+    <div class="card">
+        <h3>➕ ساخت کد معرف جدید</h3>
+        <form method="POST" action="?action=referral_create" class="create-form">
+            <input type="hidden" name="csrf_token" value="<?= h($csrf) ?>">
+            <div class="type-radios" id="typeRadios">
+                <label class="active"><input type="radio" name="code_type" value="single" checked> یکبار مصرف</label>
+                <label><input type="radio" name="code_type" value="multi"> چندبار مصرف</label>
+                <label><input type="radio" name="code_type" value="unlimited"> نامحدود</label>
+            </div>
+            <div class="row" style="margin-top:10px">
+                <input type="text" name="label" placeholder="برچسب (اختیاری) — مثل: کمپین تابستان">
+                <input type="number" name="max_uses" id="maxUsesInput" min="2" placeholder="سقف استفاده (فقط چندبار مصرف)" disabled>
+                <input type="datetime-local" name="expires_at" placeholder="تاریخ انقضا (اختیاری)">
+            </div>
+            <button type="submit" class="create-btn">ساخت کد</button>
+        </form>
+    </div>
+
+    <div class="card">
+        <h3>📋 کدهای موجود (<?= count($codes) ?>)</h3>
+        <?php if(empty($codes)): ?>
+        <div class="empty">هنوز هیچ کدی ساخته نشده است.</div>
+        <?php else: ?>
+        <div style="overflow-x:auto">
+        <table class="codes">
+            <thead><tr>
+                <th>کد</th><th>نوع</th><th>برچسب</th><th>استفاده / سقف</th><th>انقضا</th><th>سازنده</th><th>وضعیت</th><th>عملیات</th>
+            </tr></thead>
+            <tbody>
+            <?php foreach($codes as $c):
+                $isRevoked = !empty($c['revoked_at']);
+                $isExpired = !empty($c['expires_at']) && strtotime($c['expires_at']) < time();
+                $isExhausted = false;
+                if ($c['code_type'] === 'single' && (int)$c['use_count'] >= 1) $isExhausted = true;
+                if ($c['code_type'] === 'multi' && (int)$c['use_count'] >= (int)$c['max_uses']) $isExhausted = true;
+                $statusKey = $isRevoked ? 'revoked' : ($isExpired ? 'expired' : ($isExhausted ? 'used' : 'active'));
+                $statusLabel = ['active'=>'فعال','expired'=>'منقضی','revoked'=>'باطل شده','used'=>'به سقف رسیده'][$statusKey];
+                $limitText = $c['code_type']==='unlimited' ? '∞' : ($c['code_type']==='single' ? '1' : (int)$c['max_uses']);
+            ?>
+            <tr>
+                <td><span class="code-cell"><?= h($c['code']) ?></span> <button type="button" class="copy-mini" onclick="navigator.clipboard&&navigator.clipboard.writeText('<?= h($c['code']) ?>');this.textContent='✓'">📋</button></td>
+                <td><span class="type-badge type-<?= h($c['code_type']) ?>"><?= ['single'=>'یکبار مصرف','multi'=>'چندبار','unlimited'=>'نامحدود'][$c['code_type']] ?></span></td>
+                <td><?= h($c['label'] ?: '—') ?></td>
+                <td><?= (int)$c['use_count'] ?> / <?= h($limitText) ?></td>
+                <td><?= !empty($c['expires_at']) ? h(to_jalali($c['expires_at'])) : '—' ?></td>
+                <td><?= h($c['created_by']) ?></td>
+                <td><span class="status-badge status-<?= $statusKey ?>"><?= $statusLabel ?></span></td>
+                <td>
+                    <div class="row-actions">
+                        <?php if(!$isRevoked): ?>
+                        <form method="POST" action="?action=referral_revoke" style="margin:0" onsubmit="return confirm('باطل کردن کد «<?= h($c['code']) ?>»؟ پس از این قابل استفاده نخواهد بود.')">
+                            <input type="hidden" name="csrf_token" value="<?= h($csrf) ?>">
+                            <input type="hidden" name="referral_id" value="<?= (int)$c['id'] ?>">
+                            <button type="submit" class="row-action-btn ra-rev" title="باطل کردن">🚫</button>
+                        </form>
+                        <?php endif; ?>
+                        <form method="POST" action="?action=referral_delete" style="margin:0" onsubmit="return confirm('حذف دائم کد «<?= h($c['code']) ?>»؟ تاریخچهٔ استفاده هم پاک می‌شود.')">
+                            <input type="hidden" name="csrf_token" value="<?= h($csrf) ?>">
+                            <input type="hidden" name="referral_id" value="<?= (int)$c['id'] ?>">
+                            <button type="submit" class="row-action-btn ra-del" title="حذف">🗑</button>
+                        </form>
+                    </div>
+                </td>
+            </tr>
+            <?php endforeach; ?>
+            </tbody>
+        </table>
+        </div>
+        <?php endif; ?>
+    </div>
+</div>
+<div class="toast" id="toast"></div>
+<script>
+(function(){
+    var radios = document.querySelectorAll('#typeRadios input[type="radio"]');
+    var maxInput = document.getElementById('maxUsesInput');
+    function sync(){
+        document.querySelectorAll('#typeRadios label').forEach(function(l){
+            l.classList.toggle('active', l.querySelector('input').checked);
+        });
+        var checked = document.querySelector('#typeRadios input[type="radio"]:checked');
+        var isMulti = checked && checked.value === 'multi';
+        maxInput.disabled = !isMulti;
+        if (!isMulti) maxInput.value = '';
+        maxInput.required = isMulti;
+    }
+    radios.forEach(function(r){ r.addEventListener('change', sync); });
+    sync();
+})();
+</script>
+</body></html><?php
 }
 
 // ================================================================

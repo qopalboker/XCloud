@@ -1260,6 +1260,36 @@ $pdo->exec("CREATE TABLE IF NOT EXISTS file_captions (
     UNIQUE KEY uniq_owner_filename (owner, filename)
 )");
 
+// ─── HF-4: One-shot raw view tokens ────────────────────────────────
+$pdo->exec("CREATE TABLE IF NOT EXISTS raw_tokens (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    token CHAR(32) UNIQUE NOT NULL,
+    file_owner VARCHAR(50) NOT NULL,
+    file_path VARCHAR(500) NOT NULL,
+    file_type ENUM('user','public') NOT NULL DEFAULT 'user',
+    file_size BIGINT DEFAULT NULL,
+    created_by VARCHAR(50) NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    consumed_at TIMESTAMP NULL DEFAULT NULL,
+    consumer_ip VARCHAR(45) DEFAULT NULL,
+    consumer_ua VARCHAR(300) DEFAULT NULL,
+    INDEX idx_token (token),
+    INDEX idx_consumed_at (consumed_at),
+    INDEX idx_created_at (created_at)
+)");
+try {
+    $stRawSeed = $pdo->prepare("INSERT IGNORE INTO settings (setting_key, setting_value) VALUES (?, ?)");
+    foreach ([
+        'raw_view_enabled'    => '1',
+        'raw_view_host'       => 'raw.retrivo.ir',
+        'raw_main_host'       => 'xcloud.retrivo.ir',
+        'raw_token_ttl_hours' => '24',
+    ] as $k => $v) {
+        $stRawSeed->execute([$k, $v]);
+    }
+} catch (Exception $e) {}
+try { $pdo->exec("DELETE FROM raw_tokens WHERE created_at < DATE_SUB(NOW(), INTERVAL 7 DAY)"); } catch (Exception $e) {}
+
 define('XCLOUD_MAX_FOLDERS_PER_USER', 5);
 
 function getUserFolders(PDO $pdo, string $owner): array {
@@ -1305,6 +1335,70 @@ function logActivity($pdo,$username,$actionType,$target=null,$details=null){
     $ip=$_SERVER['REMOTE_ADDR']??'unknown';
     $s=$pdo->prepare("INSERT INTO activity_log (username,action_type,target,details,ip_address) VALUES(?,?,?,?,?)");
     $s->execute([$username,$actionType,$target,$details,$ip]);
+}
+
+// ─── HF-4: Raw view helpers ────────────────────────────────────────
+function raw_mime_type(string $ext): string {
+    $map = [
+        'txt'  => 'text/plain; charset=utf-8',
+        'log'  => 'text/plain; charset=utf-8',
+        'ini'  => 'text/plain; charset=utf-8',
+        'sh'   => 'text/plain; charset=utf-8',
+        'yml'  => 'text/plain; charset=utf-8',
+        'yaml' => 'text/plain; charset=utf-8',
+        'py'   => 'text/plain; charset=utf-8',
+        'md'   => 'text/plain; charset=utf-8',
+        'json' => 'application/json; charset=utf-8',
+        'csv'  => 'text/csv; charset=utf-8',
+        'js'   => 'text/plain; charset=utf-8',
+        'html' => 'text/html; charset=utf-8',
+    ];
+    return $map[strtolower($ext)] ?? '';
+}
+
+function raw_extension_allowed(string $filename): bool {
+    $ext = strtolower(pathinfo($filename, PATHINFO_EXTENSION));
+    return raw_mime_type($ext) !== '';
+}
+
+function raw_mint_token($pdo, string $fileOwner, string $filePath, string $fileType, ?int $fileSize): array {
+    if (!in_array($fileType, ['user','public'], true)) {
+        return ['ok' => false, 'reason' => 'invalid_type'];
+    }
+    if (!raw_extension_allowed($filePath)) {
+        return ['ok' => false, 'reason' => 'extension_not_allowed'];
+    }
+    $token = '';
+    for ($attempt = 0; $attempt < 5; $attempt++) {
+        $candidate = bin2hex(random_bytes(16));
+        $check = $pdo->prepare("SELECT id FROM raw_tokens WHERE token = ?");
+        $check->execute([$candidate]);
+        if (!$check->fetch()) { $token = $candidate; break; }
+    }
+    if ($token === '') return ['ok' => false, 'reason' => 'token_collision'];
+
+    $st = $pdo->prepare("INSERT INTO raw_tokens
+        (token, file_owner, file_path, file_type, file_size, created_by)
+        VALUES (?, ?, ?, ?, ?, ?)");
+    $st->execute([$token, $fileOwner, $filePath, $fileType, $fileSize, $_SESSION['user']]);
+    return ['ok' => true, 'token' => $token];
+}
+
+function raw_consume_token($pdo, string $token): ?array {
+    $ttl = (int)getSetting($pdo, 'raw_token_ttl_hours', 24);
+    $upd = $pdo->prepare("UPDATE raw_tokens
+        SET consumed_at = NOW(), consumer_ip = ?, consumer_ua = ?
+        WHERE token = ?
+          AND consumed_at IS NULL
+          AND created_at > DATE_SUB(NOW(), INTERVAL ? HOUR)");
+    $ip = $_SERVER['REMOTE_ADDR'] ?? '';
+    $ua = mb_substr($_SERVER['HTTP_USER_AGENT'] ?? '', 0, 300);
+    $upd->execute([$ip, $ua, $token, $ttl]);
+    if ($upd->rowCount() === 0) return null;
+
+    $sel = $pdo->prepare("SELECT * FROM raw_tokens WHERE token = ?");
+    $sel->execute([$token]);
+    return $sel->fetch(PDO::FETCH_ASSOC) ?: null;
 }
 
 function getClientIp(){return $_SERVER['REMOTE_ADDR']??'0.0.0.0';}
@@ -2330,6 +2424,23 @@ foreach($pdo->query("SELECT id,password FROM users")->fetchAll() as $u){
 
 $action=$_GET['action']??'index';
 
+// ─── Subdomain isolation: raw.retrivo.ir only serves raw_view ──────
+$rawHost  = getSetting($pdo, 'raw_view_host', 'raw.retrivo.ir');
+$mainHost = getSetting($pdo, 'raw_main_host', 'xcloud.retrivo.ir');
+$currentHost = strtolower((string)($_SERVER['HTTP_HOST'] ?? ''));
+$requestedAction = (string)($_GET['action'] ?? '');
+
+if ($currentHost === strtolower($rawHost) && $requestedAction !== 'raw_view') {
+    $qs = $_SERVER['QUERY_STRING'] ?? '';
+    header("Location: https://$mainHost/" . ($qs !== '' ? "?$qs" : ''));
+    exit;
+}
+if ($currentHost === strtolower($mainHost) && $requestedAction === 'raw_view') {
+    $qs = $_SERVER['QUERY_STRING'] ?? '';
+    header("Location: https://$rawHost/" . ($qs !== '' ? "?$qs" : ''));
+    exit;
+}
+
 // ─── Self-unregistering Service Worker (kills any stale SW from past) ──
 if ($action === 'sw' || preg_match('#/sw\.js(\?|$)#', $_SERVER['REQUEST_URI'] ?? '')) {
     header('Content-Type: application/javascript; charset=utf-8');
@@ -2446,6 +2557,146 @@ if(isset($_SESSION['user'])&&$_SESSION['role']==='admin'){
 // ================================================================
 // ACTION HANDLERS
 // ================================================================
+
+// ================================================================
+// HF-4: RAW VIEW (mint + serve)
+// ================================================================
+if ($action === 'raw_mint') {
+    header('Content-Type: application/json; charset=utf-8');
+    if (!isset($_SESSION['user'])) {
+        http_response_code(401);
+        echo json_encode(['ok' => false, 'error' => 'auth_required']);
+        exit;
+    }
+    if (getSetting($pdo, 'raw_view_enabled', '1') !== '1') {
+        echo json_encode(['ok' => false, 'error' => 'disabled']);
+        exit;
+    }
+    verifyCsrf();
+    $kind = $_POST['kind'] ?? 'user';
+
+    $logTarget = '';
+    if ($kind === 'public') {
+        $fid = (int)($_POST['file_id'] ?? 0);
+        $st = $pdo->prepare("SELECT * FROM public_files WHERE id = ?");
+        $st->execute([$fid]);
+        $pf = $st->fetch(PDO::FETCH_ASSOC);
+        if (!$pf) { echo json_encode(['ok'=>false,'error'=>'not_found']); exit; }
+        $mint = raw_mint_token($pdo, '__public__', $pf['filename'], 'public', (int)$pf['file_size']);
+        $logTarget = $pf['filename'];
+    } else {
+        $owner = $_POST['owner'] ?? $_SESSION['user'];
+        $name  = basename($_POST['name'] ?? '');
+        if ($name === '') { echo json_encode(['ok'=>false,'error'=>'invalid_name']); exit; }
+        $isAdmin = ($_SESSION['role'] ?? '') === 'admin';
+        $isOwner = $owner === $_SESSION['user'];
+        $isShared = false;
+        if (!$isAdmin && !$isOwner) {
+            $shareCheck = $pdo->prepare("SELECT id FROM file_shares
+                WHERE original_owner = ? AND filename = ? AND shared_with = ?");
+            $shareCheck->execute([$owner, $name, $_SESSION['user']]);
+            $isShared = (bool)$shareCheck->fetch();
+        }
+        if (!$isAdmin && !$isOwner && !$isShared) {
+            http_response_code(403);
+            echo json_encode(['ok'=>false,'error'=>'forbidden']); exit;
+        }
+        global $upload_base;
+        $ownerDir = $upload_base . preg_replace('/[^a-zA-Z0-9_-]/','_',$owner);
+        $absPath = realpath($ownerDir . '/' . $name);
+        $expectedPrefix = realpath($ownerDir);
+        if (!$absPath || !$expectedPrefix || strpos($absPath, $expectedPrefix . DIRECTORY_SEPARATOR) !== 0) {
+            echo json_encode(['ok'=>false,'error'=>'invalid_path']); exit;
+        }
+        $mint = raw_mint_token($pdo, $owner, $name, 'user', filesize($absPath));
+        $logTarget = $name;
+    }
+
+    if (!$mint['ok']) {
+        echo json_encode(['ok'=>false,'error'=>$mint['reason']]); exit;
+    }
+
+    $rawHost = getSetting($pdo, 'raw_view_host', 'raw.retrivo.ir');
+    $url = "https://$rawHost/?action=raw_view&t=" . $mint['token'];
+
+    logActivity($pdo, $_SESSION['user'], 'raw_mint', $logTarget, "token=" . substr($mint['token'], 0, 8) . "...");
+    echo json_encode(['ok' => true, 'url' => $url]);
+    exit;
+}
+
+if ($action === 'raw_view') {
+    if (getSetting($pdo, 'raw_view_enabled', '1') !== '1') {
+        http_response_code(503);
+        header('Content-Type: text/plain; charset=utf-8');
+        echo "Raw view is disabled.";
+        exit;
+    }
+    $token = (string)($_GET['t'] ?? '');
+    if (!preg_match('/^[a-f0-9]{32}$/', $token)) {
+        http_response_code(400);
+        header('Content-Type: text/plain; charset=utf-8');
+        echo "Invalid token format.";
+        exit;
+    }
+
+    $row = raw_consume_token($pdo, $token);
+    if (!$row) {
+        http_response_code(410);
+        header('Content-Type: text/html; charset=utf-8');
+        echo '<!DOCTYPE html><html lang="fa" dir="rtl"><head><meta charset="UTF-8"><title>لینک منقضی</title>'
+           . '<style>body{font-family:Tahoma,sans-serif;background:#0a0e1a;color:#e2e8f0;display:flex;'
+           . 'align-items:center;justify-content:center;min-height:100vh;margin:0;padding:20px}'
+           . '.card{background:rgba(17,24,39,.85);padding:32px;border-radius:14px;text-align:center;max-width:420px}'
+           . 'h1{font-size:1.2rem;color:#fca5a5;margin:0 0 10px}p{color:#94a3b8;font-size:.9rem;line-height:1.8}</style>'
+           . '</head><body><div class="card"><h1>🔒 لینک قابل دسترسی نیست</h1>'
+           . '<p>این لینک قبلاً استفاده شده، منقضی شده، یا معتبر نیست.<br>برای دیدن دوباره، یک لینک جدید از پنل بسازید.</p>'
+           . '</div></body></html>';
+        exit;
+    }
+
+    global $upload_base, $public_base;
+    if ($row['file_type'] === 'public') {
+        $absPath = realpath($public_base . $row['file_path']);
+        $expectedPrefix = realpath($public_base);
+    } else {
+        $ownerDir = $upload_base . preg_replace('/[^a-zA-Z0-9_-]/','_',$row['file_owner']);
+        $absPath = realpath($ownerDir . '/' . $row['file_path']);
+        $expectedPrefix = realpath($ownerDir);
+    }
+    if (!$absPath || !$expectedPrefix || strpos($absPath, $expectedPrefix . DIRECTORY_SEPARATOR) !== 0 || !is_file($absPath)) {
+        http_response_code(404);
+        header('Content-Type: text/plain; charset=utf-8');
+        echo "File not found.";
+        exit;
+    }
+
+    $ext = strtolower(pathinfo($row['file_path'], PATHINFO_EXTENSION));
+    $mime = raw_mime_type($ext);
+    if ($mime === '') {
+        http_response_code(415);
+        header('Content-Type: text/plain; charset=utf-8');
+        echo "Unsupported file type.";
+        exit;
+    }
+
+    header("Content-Type: $mime");
+    header("X-Content-Type-Options: nosniff");
+    header("Content-Disposition: inline; filename=\"" . basename($row['file_path']) . "\"");
+    header("Cache-Control: private, no-store, no-cache, must-revalidate");
+    header("Pragma: no-cache");
+    header("Referrer-Policy: no-referrer");
+    if ($ext !== 'html') {
+        header("Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'");
+    }
+    header("X-Frame-Options: SAMEORIGIN");
+
+    logActivity($pdo, $row['created_by'], 'raw_view', $row['file_path'],
+        "ip=" . ($_SERVER['REMOTE_ADDR'] ?? '?') . ", token=" . substr($token, 0, 8) . "...");
+
+    @ob_end_clean();
+    readfile($absPath);
+    exit;
+}
 
 // ================================================================
 // SETUP WIZARD (one-time, post-deploy automation)
@@ -6399,6 +6650,9 @@ elseif($action=='dashboard'){
     .btn-info{background:rgba(139,92,246,.1);color:#a78bfa}.btn-info:hover{background:rgba(139,92,246,.2)}
     .btn-rename{background:rgba(59,130,246,.1);color:var(--primary)}.btn-rename:hover{background:rgba(59,130,246,.2)}
     .btn-del{background:rgba(239,68,68,.1);color:var(--danger)}.btn-del:hover{background:rgba(239,68,68,.2)}
+    .btn-raw{background:rgba(168,85,247,.12);color:#d8b4fe;border:1px solid rgba(168,85,247,.25);padding:6px 10px;border-radius:8px;font-size:.8rem;cursor:pointer;font-family:inherit;transition:background .15s}
+    .btn-raw:hover{background:rgba(168,85,247,.25)}
+    .btn-raw:disabled{opacity:.5;cursor:wait}
     .locked-badge{font-size:.7rem;color:var(--text-dim);width:100%;text-align:center;padding:8px;background:rgba(255,255,255,.02);border-radius:8px;border:1px solid var(--border)}
 
     /* EMPTY STATE */
@@ -6799,11 +7053,17 @@ elseif($action=='dashboard'){
                             <?php if($role=='admin'):?>
                                 <a href="?action=download&name=<?php echo urlencode($file);?>&owner=<?php echo urlencode($viewUser);?>" class="btn-sm btn-dl">⬇ دانلود</a>
                                 <a href="?action=file_info&name=<?php echo urlencode($file);?>&owner=<?php echo urlencode($viewUser);?>" class="btn-sm btn-info">🔍</a>
+                                <?php if(raw_extension_allowed($file)):?>
+                                <button class="btn-sm btn-raw" data-mint-kind="user" data-mint-owner="<?php echo h($viewUser);?>" data-mint-name="<?php echo h($file);?>" title="نمایش خام (یکبار-مصرف)">👁 خام</button>
+                                <?php endif;?>
                                 <button class="btn-sm btn-rename" onclick="openRename('<?php echo h(addslashes($file));?>')">✏️</button>
                                 <a href="?action=delete_file&name=<?php echo urlencode($file);?>&owner=<?php echo urlencode($viewUser);?>" class="btn-sm btn-del" onclick="return confirm('حذف «<?php echo h($file);?>»؟')">🗑</a>
                             <?php else:?>
                                 <?php if($canDownload):?><a href="?action=download&name=<?php echo urlencode($file);?>&owner=<?php echo urlencode($viewUser);?>" class="btn-sm btn-dl">⬇ دانلود</a><?php endif;?>
                                 <a href="?action=file_info&name=<?php echo urlencode($file);?>&owner=<?php echo urlencode($viewUser);?>" class="btn-sm btn-info">🔍 بررسی</a>
+                                <?php if(raw_extension_allowed($file)):?>
+                                <button class="btn-sm btn-raw" data-mint-kind="user" data-mint-owner="<?php echo h($viewUser);?>" data-mint-name="<?php echo h($file);?>" title="نمایش خام (یکبار-مصرف)">👁 خام</button>
+                                <?php endif;?>
                                 <?php if($canDelete&&$viewUser===$_SESSION['user']):?><a href="?action=delete_file&name=<?php echo urlencode($file);?>&owner=<?php echo urlencode($viewUser);?>" class="btn-sm btn-del" onclick="return confirm('حذف «<?php echo h($file);?>»؟')">🗑 حذف</a><?php endif;?>
                                 <?php if(!$canDownload&&!$canDelete):?><div class="locked-badge">🔒 دسترسی محدود</div><?php endif;?>
                             <?php endif;?>
@@ -6843,6 +7103,9 @@ elseif($action=='dashboard'){
                         </div>
                         <div class="file-actions">
                             <?php if($canDownload):?><a href="?action=download&name=<?php echo urlencode($sh['filename']);?>&owner=<?php echo urlencode($sh['original_owner']);?>" class="btn-sm btn-dl">⬇ دانلود</a><?php endif;?>
+                            <?php if(raw_extension_allowed($sh['filename'])):?>
+                            <button class="btn-sm btn-raw" data-mint-kind="user" data-mint-owner="<?php echo h($sh['original_owner']);?>" data-mint-name="<?php echo h($sh['filename']);?>" title="نمایش خام (یکبار-مصرف)">👁 خام</button>
+                            <?php endif;?>
                             <a href="?action=unshare_file&share_id=<?php echo $sh['share_id'];?>" class="btn-sm btn-del" onclick="return confirm('حذف این اشتراک‌گذاری؟')">🗑 حذف</a>
                         </div>
                     </div>
@@ -6897,6 +7160,9 @@ elseif($action=='dashboard'){
 
                         <div class="file-actions">
                             <?php if($canDownload||$role==='admin'):?><a href="?action=download&public_file_id=<?php echo $pf['id'];?>&name=<?php echo urlencode($pf['filename']);?>" class="btn-sm btn-dl">⬇ دانلود</a><?php endif;?>
+                            <?php if(raw_extension_allowed($pf['filename'])):?>
+                            <button class="btn-sm btn-raw" data-mint-kind="public" data-mint-file-id="<?php echo (int)$pf['id'];?>" title="نمایش خام (یکبار-مصرف)">👁 خام</button>
+                            <?php endif;?>
                         </div>
                     </div>
                     <?php endforeach;
@@ -7298,6 +7564,42 @@ elseif($action=='dashboard'){
             const btn=document.getElementById('uploadBtn');const n=fi.files?fi.files.length:0;
             btn.disabled=true;btn.style.opacity='.65';btn.textContent=n>1?('در حال آپلود '+n+' فایل...'):'در حال آپلود...';});
     }
+    // Raw view: mint one-shot token and open in new tab
+    document.addEventListener('click', async function(e){
+        var btn = e.target.closest('.btn-raw');
+        if (!btn || btn.disabled) return;
+        btn.disabled = true;
+        var origText = btn.textContent;
+        btn.textContent = '⏳ ...';
+        try {
+            var fd = new FormData();
+            fd.append('csrf_token', '<?php echo h($csrf ?? generateCsrfToken()); ?>');
+            fd.append('kind', btn.dataset.mintKind);
+            if (btn.dataset.mintKind === 'public') {
+                fd.append('file_id', btn.dataset.mintFileId);
+            } else {
+                fd.append('owner', btn.dataset.mintOwner);
+                fd.append('name', btn.dataset.mintName);
+            }
+            var r = await fetch('?action=raw_mint', {
+                method: 'POST',
+                credentials: 'same-origin',
+                body: fd
+            });
+            var j = await r.json();
+            if (j.ok && j.url) {
+                window.open(j.url, '_blank', 'noopener,noreferrer');
+            } else {
+                alert('خطا: ' + (j.error || 'ناشناخته'));
+            }
+        } catch (err) {
+            alert('خطا در ارتباط با سرور');
+        } finally {
+            btn.disabled = false;
+            btn.textContent = origText;
+        }
+    });
+
     function openRename(n){document.getElementById('renameOldName').value=n;document.getElementById('renameNewName').value=n;document.getElementById('renameModal').classList.add('active');setTimeout(()=>document.getElementById('renameNewName').focus(),100);}
     function closeRename(){document.getElementById('renameModal').classList.remove('active');}
     document.getElementById('renameModal').addEventListener('click',function(e){if(e.target===this)closeRename();});

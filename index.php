@@ -5344,7 +5344,14 @@ elseif($action=='dashboard'){
     .app-header{position:sticky;top:0;z-index:1000;background:rgba(10,14,26,.94);backdrop-filter:blur(16px);border-bottom:1px solid var(--border)}
     .header-inner{display:flex;justify-content:space-between;align-items:center;padding:10px 20px;max-width:1280px;margin:0 auto}
     .header-brand{display:flex;align-items:center;gap:8px}
-    .header-brand span{font-weight:900;font-size:1.1rem;background:linear-gradient(135deg,var(--primary),var(--purple));-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+    .header-brand span{font-weight:900;font-size:1.1rem;background:linear-gradient(135deg,var(--primary),var(--purple));-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
+    .logo-link{position:relative;text-decoration:none;padding:6px 12px;border-radius:10px;transition:transform .3s;cursor:pointer}
+    .logo-link::before{content:'';position:absolute;inset:0;background:linear-gradient(135deg,rgba(59,130,246,.3),rgba(139,92,246,.3));border-radius:10px;opacity:0;filter:blur(12px);transition:opacity .25s;z-index:-1;pointer-events:none}
+    .logo-link:hover::before{opacity:1}
+    .logo-link:hover .logo-text{text-shadow:0 0 20px rgba(59,130,246,.5)}
+    .logo-link.spinning{animation:logoSpin .35s ease-out}
+    @keyframes logoSpin{to{transform:rotate(360deg)}}
+    .logo-text{background:linear-gradient(135deg,#3b82f6,#8b5cf6);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;font-weight:900;font-size:1.1rem;transition:text-shadow .25s}
     .header-actions{display:flex;align-items:center;gap:5px;flex-wrap:wrap}
     .nav-btn{display:inline-flex;align-items:center;gap:4px;padding:6px 10px;border-radius:8px;font-size:.72rem;font-weight:700;text-decoration:none;border:none;cursor:pointer;transition:all .2s;white-space:nowrap;line-height:1}
     .nav-btn svg{width:13px;height:13px;flex-shrink:0}
@@ -5540,10 +5547,10 @@ elseif($action=='dashboard'){
 
     <header class="app-header">
         <div class="header-inner">
-            <div class="header-brand">
+            <a href="?action=dashboard" class="header-brand logo-link" onclick="this.classList.add('spinning');setTimeout(function(){location.reload();},350);return false;">
                 <img src="/icons/web-app-manifest-512x512.png" alt="XCloud" style="width:28px;height:28px;border-radius:8px;object-fit:contain;">
-                <span>XCloud</span>
-            </div>
+                <span class="logo-text">XCloud</span>
+            </a>
             <div class="header-actions">
                 <span class="mobile-username"><?php echo h($_SESSION['user']);?></span>
                 <span class="nav-btn nb-user"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg><span class="btn-text"><?php echo h($_SESSION['user']);?></span></span>
@@ -7008,7 +7015,52 @@ elseif($action=='users'){
     *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}body{font-family:'Dana','JetBrains Mono',sans-serif;background:#0a0e1a;color:#e2e8f0;min-height:100vh}
     .app-header{position:sticky;top:0;z-index:1000;background:rgba(10,14,26,.88);backdrop-filter:blur(16px);padding:12px 20px;display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid #1e293b}
     .back-link{color:#3b82f6;text-decoration:none;font-size:.85rem;font-weight:600}
-    .container{padding:20px;max-width:720px;margin:0 auto}
+    .container{padding:20px;max-width:1280px;margin:0 auto}
+    .users-toolbar{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:12px;flex-wrap:wrap}
+    .users-toolbar input[type="search"]{flex:1;min-width:200px;background:rgba(15,23,42,.6);border:1.5px solid #1e293b;color:#e2e8f0;padding:10px 14px;border-radius:10px;font-family:inherit;font-size:.85rem;outline:none}
+    .users-toolbar input[type="search"]:focus{border-color:#3b82f6}
+    .users-count{color:#94a3b8;font-size:.82rem;font-weight:600;background:rgba(15,23,42,.5);padding:6px 12px;border-radius:8px;border:1px solid #1e293b}
+    .users-table-wrap{max-height:70vh;overflow-y:auto;border:1px solid #1e293b;border-radius:12px;background:#111827}
+    .users-table{width:100%;border-collapse:collapse;font-size:.82rem}
+    .users-table thead{position:sticky;top:0;background:rgba(10,14,26,.95);backdrop-filter:blur(12px);z-index:1}
+    .users-table th{padding:10px 12px;color:#94a3b8;font-weight:700;text-align:right;font-size:.7rem;text-transform:uppercase;letter-spacing:.05em;border-bottom:1px solid #1e293b;white-space:nowrap}
+    .users-table td{padding:10px 12px;border-bottom:1px solid rgba(30,41,59,.5);color:#e2e8f0;vertical-align:middle}
+    .users-table tbody tr:hover{background:rgba(30,41,59,.3)}
+    .users-table tbody tr:last-child td{border-bottom:none}
+    .users-table td.col-email{color:#fde68a;direction:ltr;font-family:Consolas,monospace;font-size:.78rem;text-align:left}
+    .users-table td.col-name{font-weight:700}
+    .users-table td.col-date{color:#64748b;font-size:.74rem;white-space:nowrap}
+    .role-badge{display:inline-block;padding:2px 8px;border-radius:6px;font-size:.68rem;font-weight:700}
+    .role-badge.role-admin{background:rgba(168,85,247,.2);color:#d8b4fe}
+    .role-badge.role-user{background:rgba(34,197,94,.15);color:#4ade80}
+    .perm-icons{display:flex;gap:4px;flex-wrap:wrap}
+    .perm-icon{display:inline-flex;align-items:center;justify-content:center;width:26px;height:26px;border-radius:6px;border:1px solid #1e293b;background:rgba(15,23,42,.5);cursor:pointer;font-size:.78rem;padding:0;transition:filter .15s}
+    .perm-icon:hover{filter:brightness(1.3)}
+    .perm-icon.on{background:rgba(34,197,94,.18);color:#4ade80;border-color:rgba(34,197,94,.3)}
+    .perm-icon.off{background:rgba(100,116,139,.08);color:#475569;border-color:#1e293b;opacity:.6}
+    .perm-icon.admin-all{background:linear-gradient(135deg,rgba(139,92,246,.18),rgba(59,130,246,.18));color:#a78bfa;border-color:rgba(139,92,246,.3);cursor:default;width:auto;padding:0 10px;font-weight:700;font-size:.7rem}
+    .row-actions{display:flex;gap:4px;align-items:center;flex-wrap:nowrap}
+    .row-action-btn{display:inline-flex;align-items:center;justify-content:center;border:none;border-radius:6px;padding:5px 8px;font-size:.72rem;font-weight:700;cursor:pointer;font-family:inherit;white-space:nowrap;background:rgba(59,130,246,.12);color:#93c5fd}
+    .row-action-btn:hover{filter:brightness(1.3)}
+    .row-action-btn.ra-del{background:rgba(239,68,68,.12);color:#f87171}
+    .row-action-btn.ra-mail{background:rgba(30,58,138,.4);color:#bfdbfe}
+    .row-action-btn.ra-pass{background:rgba(139,92,246,.12);color:#a78bfa}
+    .self-tag{font-size:.7rem;color:#64748b;padding:2px 6px}
+    .email-status{font-size:.62rem;padding:1px 6px;border-radius:4px;margin-right:4px;display:inline-block;direction:rtl;font-family:inherit}
+    .email-status.ok{background:#14532d;color:#bbf7d0}
+    .email-status.pending{background:#7c2d12;color:#fed7aa}
+    .users-pagination{display:flex;gap:6px;justify-content:center;margin-top:14px;flex-wrap:wrap}
+    .page-btn{background:rgba(15,23,42,.6);border:1px solid #1e293b;color:#cbd5e1;padding:6px 12px;border-radius:8px;font-family:inherit;font-size:.78rem;cursor:pointer;min-width:34px}
+    .page-btn:hover{background:rgba(30,41,59,.7)}
+    .page-btn.active{background:linear-gradient(135deg,#3b82f6,#6366f1);color:#fff;border-color:transparent;font-weight:700}
+    .users-empty{text-align:center;padding:30px;color:#64748b;font-size:.85rem}
+    .logo-link{position:relative;display:inline-flex;align-items:center;gap:8px;text-decoration:none;padding:6px 12px;border-radius:10px;transition:transform .3s;cursor:pointer}
+    .logo-link::before{content:'';position:absolute;inset:0;background:linear-gradient(135deg,rgba(59,130,246,.3),rgba(139,92,246,.3));border-radius:10px;opacity:0;filter:blur(12px);transition:opacity .25s;z-index:-1}
+    .logo-link:hover::before{opacity:1}
+    .logo-link:hover .logo-text{text-shadow:0 0 20px rgba(59,130,246,.5)}
+    .logo-link.spinning{animation:logoSpin .35s ease-out}
+    @keyframes logoSpin{to{transform:rotate(360deg)}}
+    .logo-text{background:linear-gradient(135deg,#3b82f6,#8b5cf6);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;font-weight:900;font-size:1.1rem;transition:text-shadow .25s}
     .card{background:#111827;border-radius:14px;padding:18px;border:1px solid #1e293b;margin-bottom:16px}
     .card h3{font-size:.88rem;margin-bottom:14px}
     .form-row{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px}
@@ -7138,69 +7190,85 @@ elseif($action=='users'){
             </form>
         </div>
 
-        <div class="card">
-            <h3>👥 کاربران (<?php echo count($users);?>)</h3>
-            <?php foreach($users as $u):
-                $up2=getUserUploadPath($u['username']);$us=getDirSize($up2);$uf=count(array_diff(scandir($up2),['.','..']));?>
-            <div class="user-row">
-                <div class="user-top">
-                    <div class="user-info">
-                        <span class="user-name"><?php echo h($u['username']);?></span>
-                        <span class="role-tag <?php echo $u['role']=='admin'?'role-admin':'role-user';?>"><?php echo $u['role']=='admin'?'مدیر':'کاربر';?></span>
-                    </div>
-                    <?php if($u['username']!==$_SESSION['user']):?>
-                    <div class="user-btns">
-                        <button class="ub ub-pass" onclick="openPassModal(<?php echo $u['id'];?>,'<?php echo h(addslashes($u['username']));?>')">🔑 رمز</button>
-                        <form method="POST" action="?action=delete_user" style="display:inline" onsubmit="return confirm('حذف «<?php echo h(addslashes($u['username']));?>»؟')">
-                            <input type="hidden" name="csrf_token" value="<?php echo $csrf;?>">
-                            <input type="hidden" name="user_id" value="<?php echo $u['id'];?>">
-                            <button type="submit" class="ub ub-del">حذف</button>
-                        </form>
-                    </div>
-                    <?php else:?><span style="font-size:.7rem;color:#64748b">شما</span><?php endif;?>
-                </div>
-                <div class="user-storage">💾 <?php echo $uf;?> فایل — <?php echo formatBytes($us);?></div>
-                <div class="email-section" style="margin:8px 0;padding:8px;background:rgba(15,23,42,.4);border-radius:8px;border:1px solid #1e293b">
-                    <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap">
-                        <div style="font-size:.78rem">
-                            <span style="color:#94a3b8">ایمیل:</span>
-                            <?php if (!empty($u['email'])): ?>
-                                <span style="color:#fde68a;direction:ltr;font-family:Consolas,monospace"><?php echo h($u['email']); ?></span>
-                                <?php if ((int)$u['email_verified'] === 1): ?>
-                                    <span class="badge badge-ok" style="background:#14532d;color:#bbf7d0;padding:1px 6px;border-radius:4px;font-size:.65rem;margin-right:4px">تایید شده</span>
-                                <?php else: ?>
-                                    <span class="badge" style="background:#7c2d12;color:#fed7aa;padding:1px 6px;border-radius:4px;font-size:.65rem;margin-right:4px">تایید نشده</span>
-                                <?php endif; ?>
-                            <?php else: ?>
-                                <span style="color:#64748b">ثبت نشده</span>
-                            <?php endif; ?>
-                        </div>
-                        <?php if ($u['username'] !== $_SESSION['user']): ?>
-                        <button type="button" class="ub ub-pass" style="background:#1e3a8a;color:#bfdbfe" onclick="openEmailModal(<?php echo $u['id']; ?>,'<?php echo h(addslashes($u['username'])); ?>','<?php echo h(addslashes($u['email'] ?? '')); ?>')">📧 تنظیم ایمیل</button>
-                        <?php endif; ?>
-                    </div>
-                </div>
-                <?php if($u['role']==='admin'):?>
-                <div class="admin-note">مدیر — دسترسی کامل</div>
-                <?php else:?>
-                <div class="perms-section">
-                    <div class="perms-title">دسترسی‌ها</div>
-                    <?php foreach([['can_download','⬇ دانلود','dl'],['can_change_password','🔑 تغییر رمز','pass'],['can_delete','🗑 حذف فایل‌های خود','del'],['can_share','📤 اشتراک‌گذاری','share']] as [$field,$label,$cls]):?>
-                    <div class="perm-row">
-                        <span class="perm-label"><?php echo $label;?></span>
-                        <form method="POST" action="?action=update_permissions" style="margin:0">
-                            <input type="hidden" name="csrf_token" value="<?php echo $csrf;?>">
-                            <input type="hidden" name="user_id" value="<?php echo $u['id'];?>">
-                            <input type="hidden" name="field" value="<?php echo $field;?>">
-                            <input type="hidden" name="value" value="<?php echo $u[$field]?0:1;?>">
-                            <button type="submit" class="perm-btn <?php echo $u[$field]?"on-$cls":"off-$cls";?>"><?php echo $u[$field]?'فعال':'غیرفعال';?></button>
-                        </form>
-                    </div>
-                    <?php endforeach;?>
-                </div>
-                <?php endif;?>
+        <div class="card" style="padding:14px">
+            <div class="users-toolbar">
+                <h3 style="margin:0">👥 کاربران</h3>
+                <input type="search" id="userSearch" placeholder="🔍 جستجوی نام کاربری یا ایمیل...">
+                <span class="users-count" id="usersCount"><?php echo count($users);?> کاربر</span>
             </div>
-            <?php endforeach;?>
+            <div class="users-table-wrap">
+                <table class="users-table">
+                    <thead>
+                        <tr>
+                            <th>کاربر</th>
+                            <th>ایمیل</th>
+                            <th>نقش</th>
+                            <th>دسترسی‌ها</th>
+                            <th>تاریخ ثبت</th>
+                            <th>عملیات</th>
+                        </tr>
+                    </thead>
+                    <tbody id="usersBody">
+                        <?php foreach($users as $u):
+                            $searchKey = strtolower($u['username'].' '.($u['email'] ?? ''));
+                            $isSelf = ($u['username']===$_SESSION['user']);
+                            $isAdmin = ($u['role']==='admin');
+                        ?>
+                        <tr data-search="<?php echo h($searchKey);?>">
+                            <td class="col-name"><?php echo h($u['username']);?></td>
+                            <td class="col-email">
+                                <?php if (!empty($u['email'])): ?>
+                                    <?php echo h($u['email']);?>
+                                    <?php if ((int)$u['email_verified'] === 1): ?>
+                                        <span class="email-status ok">✓</span>
+                                    <?php else: ?>
+                                        <span class="email-status pending">!</span>
+                                    <?php endif; ?>
+                                <?php else: ?>
+                                    <span style="color:#64748b;font-family:inherit;direction:rtl">—</span>
+                                <?php endif; ?>
+                            </td>
+                            <td><span class="role-badge role-<?php echo h($u['role']);?>"><?php echo $isAdmin?'مدیر':'کاربر';?></span></td>
+                            <td>
+                                <?php if($isAdmin):?>
+                                    <span class="perm-icon admin-all">دسترسی کامل</span>
+                                <?php else: ?>
+                                <div class="perm-icons">
+                                <?php foreach([['can_download','⬇','دانلود'],['can_change_password','🔑','تغییر رمز'],['can_delete','🗑','حذف فایل خود'],['can_share','📤','اشتراک‌گذاری']] as [$field,$icon,$label]):?>
+                                    <form method="POST" action="?action=update_permissions" style="margin:0;display:inline">
+                                        <input type="hidden" name="csrf_token" value="<?php echo $csrf;?>">
+                                        <input type="hidden" name="user_id" value="<?php echo $u['id'];?>">
+                                        <input type="hidden" name="field" value="<?php echo $field;?>">
+                                        <input type="hidden" name="value" value="<?php echo $u[$field]?0:1;?>">
+                                        <button type="submit" class="perm-icon <?php echo $u[$field]?'on':'off';?>" title="<?php echo $label.' — '.($u[$field]?'فعال':'غیرفعال');?>"><?php echo $icon;?></button>
+                                    </form>
+                                <?php endforeach;?>
+                                </div>
+                                <?php endif;?>
+                            </td>
+                            <td class="col-date"><?php echo h(to_jalali($u['created_at']));?></td>
+                            <td>
+                                <?php if($isSelf):?>
+                                    <span class="self-tag">شما</span>
+                                <?php else:?>
+                                    <div class="row-actions">
+                                        <button type="button" class="row-action-btn ra-pass" onclick="openPassModal(<?php echo $u['id'];?>,'<?php echo h(addslashes($u['username']));?>')" title="تغییر رمز">🔑</button>
+                                        <button type="button" class="row-action-btn ra-mail" onclick="openEmailModal(<?php echo $u['id'];?>,'<?php echo h(addslashes($u['username']));?>','<?php echo h(addslashes($u['email'] ?? ''));?>')" title="تنظیم ایمیل">📧</button>
+                                        <form method="POST" action="?action=delete_user" style="margin:0;display:inline" onsubmit="return confirm('حذف «<?php echo h(addslashes($u['username']));?>»؟')">
+                                            <input type="hidden" name="csrf_token" value="<?php echo $csrf;?>">
+                                            <input type="hidden" name="user_id" value="<?php echo $u['id'];?>">
+                                            <button type="submit" class="row-action-btn ra-del" title="حذف">🗑</button>
+                                        </form>
+                                    </div>
+                                <?php endif;?>
+                            </td>
+                        </tr>
+                        <?php endforeach;?>
+                    </tbody>
+                </table>
+                <div class="users-empty" id="usersEmpty" hidden>هیچ کاربری پیدا نشد.</div>
+            </div>
+            <div class="users-pagination" id="usersPagination" hidden></div>
         </div>
     </div>
 
@@ -7253,6 +7321,51 @@ elseif($action=='users'){
     (function(){const msgs=<?php echo json_encode($umsgs);?>;const msg='<?php echo h($msg);?>';
         if(msg&&msgs[msg]){const t=document.getElementById('toast');t.innerHTML='<span>'+msgs[msg][0]+'</span><span>'+msgs[msg][1]+'</span>';
             setTimeout(()=>t.classList.add('show'),80);setTimeout(()=>t.classList.remove('show'),3200);}
+    })();
+
+    // Users table: client-side search + pagination
+    (function(){
+        const PAGE_SIZE = 50;
+        const allRows = Array.from(document.querySelectorAll('#usersBody tr'));
+        const countEl = document.getElementById('usersCount');
+        const totalUsers = allRows.length;
+        let currentPage = 1;
+        let filteredRows = allRows.slice();
+
+        function renderPage(){
+            const start = (currentPage - 1) * PAGE_SIZE;
+            const end = start + PAGE_SIZE;
+            allRows.forEach(r => r.hidden = true);
+            filteredRows.slice(start, end).forEach(r => r.hidden = false);
+            document.getElementById('usersEmpty').hidden = filteredRows.length !== 0;
+            renderPagination();
+        }
+        function renderPagination(){
+            const total = Math.ceil(filteredRows.length / PAGE_SIZE);
+            const pag = document.getElementById('usersPagination');
+            if (total <= 1) { pag.hidden = true; pag.innerHTML = ''; return; }
+            pag.hidden = false;
+            pag.innerHTML = '';
+            for (let i = 1; i <= total; i++) {
+                const btn = document.createElement('button');
+                btn.type = 'button';
+                btn.textContent = i;
+                btn.className = 'page-btn' + (i === currentPage ? ' active' : '');
+                btn.addEventListener('click', () => { currentPage = i; renderPage(); document.querySelector('.users-table-wrap').scrollTop = 0; });
+                pag.appendChild(btn);
+            }
+        }
+        const searchEl = document.getElementById('userSearch');
+        if (searchEl) {
+            searchEl.addEventListener('input', e => {
+                const q = e.target.value.trim().toLowerCase();
+                filteredRows = q ? allRows.filter(r => r.dataset.search.includes(q)) : allRows.slice();
+                currentPage = 1;
+                if (countEl) countEl.textContent = (q ? filteredRows.length + ' از ' + totalUsers : totalUsers) + ' کاربر';
+                renderPage();
+            });
+        }
+        renderPage();
     })();
     </script>
     </body></html><?php

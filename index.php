@@ -7344,6 +7344,7 @@ $_userBg = getUserBgUrl($_SESSION['user'], $pdo);
                 <a href="?action=bg_admin" class="nav-btn" style="background:rgba(139,92,246,.1);color:#a78bfa;border:1px solid rgba(139,92,246,.2)" title="مدیریت گالری بک‌گراند"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" width="13" height="13"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21"/></svg><span class="btn-text">گالری</span></a>
                 <a href="?action=users" class="nav-btn nb-users" title="کاربران"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/></svg><span class="btn-text">کاربران</span></a>
                 <a href="?action=inbound_settings" class="nav-btn nb-users" title="دریافت ایمیل"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22,6 12,13 2,6"/></svg><span class="btn-text">📨</span></a>
+                <a href="?action=receipt_generator" class="nav-btn" style="background:rgba(245,158,11,.1);color:#fcd34d;border:1px solid rgba(245,158,11,.25)" title="مولد رسید نمونه (DEMO)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" width="13" height="13"><path d="M14 2H6a2 2 0 0 0-2 2v16l3-2 3 2 3-2 3 2 3-2V8z"/><line x1="8" y1="10" x2="16" y2="10"/><line x1="8" y1="14" x2="16" y2="14"/></svg><span class="btn-text">رسید</span></a>
                 <?php endif;?>
                 <a href="?action=logout" class="nav-btn nb-logout" title="خروج"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg><span class="btn-text">خروج</span></a>
             </div>
@@ -9681,6 +9682,312 @@ elseif($action=='my_shares'){
         setTimeout(function(){ btn.innerHTML=orig; }, 1400);
     }
     </script>
+    </body></html><?php
+}
+// ─── Receipt Generator (Admin DEMO tool) ─────────────────────
+// Generates a sample/demo receipt with a visible "نمونه / DEMO"
+// watermark so it cannot be mistaken for a real bank receipt.
+elseif($action=='receipt_generator'){
+    if(!isset($_SESSION['user'])||$_SESSION['role']!=='admin'){header("Location: index.php");exit;}
+    $csrf=generateCsrfToken();
+
+    $persianDigits=function($s){
+        $en=['0','1','2','3','4','5','6','7','8','9'];
+        $fa=['۰','۱','۲','۳','۴','۵','۶','۷','۸','۹'];
+        return str_replace($en,$fa,(string)$s);
+    };
+    $normalizeDigits=function($s){
+        $fa=['۰','۱','۲','۳','۴','۵','۶','۷','۸','۹'];
+        $ar=['٠','١','٢','٣','٤','٥','٦','٧','٨','٩'];
+        $en=['0','1','2','3','4','5','6','7','8','9'];
+        return str_replace(array_merge($fa,$ar),array_merge($en,$en),(string)$s);
+    };
+    $formatCard=function($digits) use ($persianDigits){
+        $digits=preg_replace('/\D/','',$digits);
+        if(strlen($digits)!==16) return $persianDigits($digits);
+        return $persianDigits(substr($digits,0,4).' '.substr($digits,4,4).' '.substr($digits,8,4).' '.substr($digits,12,4));
+    };
+    $jalaliFull=function($timestamp) use ($persianDigits){
+        $g_y=(int)date('Y',$timestamp);$g_m=(int)date('m',$timestamp);$g_d=(int)date('d',$timestamp);
+        $d_4=$g_y%4;$g_a=[0,0,31,59,90,120,151,181,212,243,273,304,334];
+        $doy_g=$g_a[$g_m]+$g_d;if($d_4==0&&$g_m>2)$doy_g++;
+        $doy_j=$doy_g-79;$jy=$g_y-621;
+        if($doy_j<=0){$jy--;$doy_j+=($d_4==1)?366:365;}
+        $jm=($doy_j<=186)?(int)ceil($doy_j/31):(int)ceil(($doy_j-186)/30)+6;
+        $jd=($doy_j<=186)?($doy_j%31?:31):(($doy_j-186)%30?:30);
+        $months=['فروردین','اردیبهشت','خرداد','تیر','مرداد','شهریور','مهر','آبان','آذر','دی','بهمن','اسفند'];
+        $weekdays=['شنبه','یکشنبه','دوشنبه','سه‌شنبه','چهارشنبه','پنجشنبه','جمعه'];
+        // PHP w: 0=Sun..6=Sat → Persian: Sat=0 ... Fri=6
+        $map=[6=>0,0=>1,1=>2,2=>3,3=>4,4=>5,5=>6];
+        $wd=$weekdays[$map[(int)date('w',$timestamp)]];
+        $time=$persianDigits(date('H:i',$timestamp));
+        $day=$persianDigits($jd);
+        $year=$persianDigits($jy);
+        return $time.' '.$wd.'، '.$day.' '.$months[$jm-1].' '.$year;
+    };
+    $formatAmount=function($n) use ($persianDigits){
+        $n=preg_replace('/\D/','',(string)$n);
+        if($n==='') return '';
+        return $persianDigits(number_format((int)$n));
+    };
+
+    $generated=false;
+    $errors=[];
+    $form=[
+        'holder'=>'',
+        'dest_card'=>'',
+        'amount'=>'',
+        'source_card'=>'6219861234562279',
+        'tracking'=>'',
+        'reference'=>'',
+        'datetime'=>'',
+    ];
+
+    if($_SERVER['REQUEST_METHOD']==='POST' && ($_POST['op']??'')==='generate'){
+        verifyCsrf();
+        $form['holder']=trim((string)($_POST['holder']??''));
+        $form['dest_card']=preg_replace('/\D/','',$normalizeDigits($_POST['dest_card']??''));
+        $form['amount']=preg_replace('/\D/','',$normalizeDigits($_POST['amount']??''));
+        $form['source_card']=preg_replace('/\D/','',$normalizeDigits($_POST['source_card']??''));
+        $form['tracking']=preg_replace('/\D/','',$normalizeDigits($_POST['tracking']??''));
+        $form['reference']=preg_replace('/\D/','',$normalizeDigits($_POST['reference']??''));
+        $form['datetime']=trim((string)($_POST['datetime']??''));
+
+        if($form['holder']==='') $errors[]='نام صاحب حساب الزامی است.';
+        if(strlen($form['dest_card'])!==16) $errors[]='شماره کارت مقصد باید ۱۶ رقم باشد.';
+        if($form['amount']==='' || (int)$form['amount']<=0) $errors[]='مبلغ تراکنش معتبر نیست.';
+        if($form['source_card']!=='' && strlen($form['source_card'])!==16) $errors[]='شماره کارت مبدا باید ۱۶ رقم باشد.';
+
+        if(!$errors){
+            if($form['tracking']==='') $form['tracking']=(string)random_int(100000,999999);
+            if($form['reference']==='') $form['reference']=(string)random_int(1000000000000,9999999999999);
+            $ts=$form['datetime']!=='' ? (strtotime($form['datetime'])?:time()) : time();
+
+            $sourceMasked='';
+            if($form['source_card']!==''){
+                $sc=$form['source_card'];
+                $sourceMasked=$persianDigits(substr($sc,0,4)).' '.$persianDigits(substr($sc,4,2)).'** **** '.$persianDigits(substr($sc,12,4));
+            }
+
+            $receipt=[
+                'holder'=>$form['holder'],
+                'dest_card_fmt'=>$formatCard($form['dest_card']),
+                'amount_fmt'=>$formatAmount($form['amount']),
+                'datetime_fmt'=>$jalaliFull($ts),
+                'source_masked'=>$sourceMasked,
+                'tracking_fmt'=>$persianDigits($form['tracking']),
+                'reference_fmt'=>$persianDigits($form['reference']),
+            ];
+            $generated=true;
+            logActivity($pdo,$_SESSION['user'],'receipt_generator_demo',null,'holder='.$form['holder'].' amount='.$form['amount']);
+        }
+    }
+    ?><!DOCTYPE html><html lang="fa" dir="rtl"><head>
+    <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+    <title>XCloud — مولد رسید نمونه</title>
+<?= renderHeadAssets() ?>
+    <style>
+    *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+    body{font-family:'Dana',-apple-system,system-ui,Tahoma,sans-serif;background:#0a0e1a;color:#e2e8f0;min-height:100vh;padding:18px;line-height:1.6}
+    .wrap{max-width:1080px;margin:0 auto}
+    h1{font-size:1.15rem;margin-bottom:14px;color:#f1f5f9;display:flex;align-items:center;gap:8px}
+    .back{display:inline-block;color:#3b82f6;text-decoration:none;font-size:.85rem;margin-bottom:14px}
+    .back:hover{color:#60a5fa}
+    .notice{padding:12px 16px;border-radius:10px;margin-bottom:14px;display:flex;align-items:flex-start;gap:10px;font-size:.85rem;background:rgba(245,158,11,.08);color:#fcd34d;border:1px solid rgba(245,158,11,.25)}
+    .errbox{padding:12px 16px;border-radius:10px;margin-bottom:14px;background:rgba(239,68,68,.08);color:#fca5a5;border:1px solid rgba(239,68,68,.25);font-size:.85rem}
+    .errbox ul{margin:0;padding-right:18px}
+    .grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}
+    @media(max-width:820px){.grid{grid-template-columns:1fr}}
+    .card{background:#111827;border:1px solid #1e293b;border-radius:14px;padding:18px}
+    .card h2{font-size:.95rem;color:#cbd5e1;margin-bottom:14px}
+    .field{margin-bottom:12px}
+    .field label{display:block;font-size:.78rem;color:#94a3b8;margin-bottom:6px}
+    .field input{width:100%;padding:10px 12px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:8px;font-family:inherit;font-size:.9rem;direction:ltr;text-align:right}
+    .field input[name="holder"]{direction:rtl;text-align:right}
+    .field .hint{font-size:.72rem;color:#64748b;margin-top:4px}
+    .row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+    .submit-row{display:flex;gap:10px;align-items:center;margin-top:8px}
+    .btn-primary{padding:11px 22px;background:#3b82f6;color:#fff;border:none;border-radius:8px;font-family:inherit;font-size:.9rem;cursor:pointer;font-weight:600}
+    .btn-primary:hover{background:#2563eb}
+    .btn-secondary{padding:11px 18px;background:#1e293b;color:#cbd5e1;border:1px solid #334155;border-radius:8px;font-family:inherit;font-size:.85rem;cursor:pointer;text-decoration:none;display:inline-block}
+    .btn-secondary:hover{background:#334155}
+
+    /* Receipt preview */
+    .receipt-wrap{position:relative}
+    .receipt{position:relative;background:#1f2937;border-radius:18px;padding:28px 22px 22px;overflow:hidden;direction:rtl}
+    .receipt::before,.receipt::after{
+        content:'نمونه • DEMO • نمونه • DEMO • نمونه • DEMO';
+        position:absolute;left:-30%;right:-30%;
+        color:rgba(248,113,113,.16);font-weight:900;font-size:2.2rem;letter-spacing:3px;
+        text-align:center;pointer-events:none;white-space:nowrap;
+        transform:rotate(-28deg);
+    }
+    .receipt::before{top:30%}
+    .receipt::after{top:65%}
+    .demo-banner{background:#dc2626;color:#fff;text-align:center;padding:8px 12px;font-weight:700;font-size:.85rem;letter-spacing:1px;border-radius:8px 8px 0 0;margin:-28px -22px 18px}
+    .demo-banner small{display:block;font-weight:500;font-size:.7rem;opacity:.95;margin-top:2px}
+    .avatar-wrap{display:flex;justify-content:center;position:relative;z-index:2}
+    .avatar{width:78px;height:78px;border-radius:50%;background:#4b5563;display:flex;align-items:center;justify-content:center;position:relative}
+    .avatar svg{width:62px;height:62px;color:#9ca3af}
+    .avatar .badge-mini{position:absolute;bottom:0;right:0;width:22px;height:22px;border-radius:6px;background:#fda4af;display:flex;align-items:center;justify-content:center;border:2px solid #1f2937}
+    .avatar .badge-mini::after{content:'';width:8px;height:8px;background:#f59e0b;border-radius:1px}
+    .holder-name{text-align:center;font-size:1.05rem;font-weight:700;color:#f8fafc;margin-top:12px;position:relative;z-index:2}
+    .card-num{text-align:center;color:#cbd5e1;font-size:.9rem;margin-top:6px;letter-spacing:1px;position:relative;z-index:2}
+    .amount{text-align:center;font-size:1.9rem;font-weight:800;color:#f8fafc;margin-top:18px;position:relative;z-index:2}
+    .amount-label{text-align:center;color:#94a3b8;font-size:.8rem;margin-top:2px;position:relative;z-index:2}
+    .status-pill{display:flex;justify-content:center;margin-top:14px;position:relative;z-index:2}
+    .status-pill span{background:#10b981;color:#fff;padding:8px 18px;border-radius:999px;font-size:.85rem;font-weight:600;display:inline-flex;align-items:center;gap:8px}
+    .status-pill .check{width:18px;height:18px;border-radius:50%;background:#064e3b;display:inline-flex;align-items:center;justify-content:center;font-size:.7rem}
+    .dotline{border-top:2px dashed #374151;margin:18px -4px;position:relative;z-index:2}
+    .rows{position:relative;z-index:2}
+    .rrow{display:flex;justify-content:space-between;align-items:center;padding:11px 0;border-bottom:1px solid #374151;gap:12px}
+    .rrow:last-child{border-bottom:none}
+    .rrow .lbl{color:#94a3b8;font-size:.82rem}
+    .rrow .val{color:#e5e7eb;font-size:.85rem;text-align:left;direction:ltr;font-feature-settings:"tnum"}
+    .rrow .val.fa{direction:rtl;text-align:left}
+    .footer-brand{display:flex;align-items:center;justify-content:center;gap:8px;margin-top:18px;padding-top:14px;position:relative;z-index:2}
+    .footer-brand .logo-circle{width:36px;height:36px;border-radius:50%;background:#374151;display:flex;align-items:center;justify-content:center;color:#9ca3af;font-weight:800;font-size:1.1rem}
+    .footer-brand .brand-text{color:#9ca3af;font-size:.95rem;font-weight:600}
+    .footer-brand .brand-sub{color:#6b7280;font-size:.75rem;display:block}
+    .disclaimer{margin-top:14px;padding:10px;text-align:center;background:rgba(220,38,38,.12);border:1px dashed rgba(220,38,38,.5);border-radius:8px;color:#fca5a5;font-size:.78rem;position:relative;z-index:2}
+    .preview-actions{display:flex;gap:10px;margin-top:14px;flex-wrap:wrap}
+    .empty-preview{text-align:center;color:#64748b;padding:60px 20px;font-size:.9rem}
+    </style>
+    </head><body>
+    <div class="wrap">
+        <a href="?action=dashboard" class="back">← بازگشت به داشبورد</a>
+        <h1>🧾 مولد رسید نمونه (DEMO)</h1>
+
+        <div class="notice">
+            <span>⚠️</span>
+            <div>
+                این بخش فقط برای ساخت <strong>رسید نمونه / دمو</strong> به‌منظور تست رابط کاربری و آرشیو داخلی است.
+                خروجی واترمارک پررنگ «نمونه / DEMO» دارد و رسید بانکی واقعی محسوب نمی‌شود.
+                استفاده از آن برای فریب اشخاص ثالث ممنوع است.
+            </div>
+        </div>
+
+        <?php if($errors): ?>
+        <div class="errbox">
+            <ul>
+            <?php foreach($errors as $er): ?><li><?php echo h($er); ?></li><?php endforeach; ?>
+            </ul>
+        </div>
+        <?php endif; ?>
+
+        <div class="grid">
+            <div class="card">
+                <h2>📝 اطلاعات تراکنش</h2>
+                <form method="POST" action="?action=receipt_generator">
+                    <input type="hidden" name="csrf_token" value="<?= h($csrf) ?>">
+                    <input type="hidden" name="op" value="generate">
+
+                    <div class="field">
+                        <label>صاحب حساب (مقصد)</label>
+                        <input type="text" name="holder" value="<?= h($form['holder']) ?>" placeholder="مثلاً: محمدپارسا عفت روش" required>
+                    </div>
+
+                    <div class="field">
+                        <label>شماره کارت مقصد (۱۶ رقم)</label>
+                        <input type="text" name="dest_card" value="<?= h($form['dest_card']) ?>" placeholder="6104338924672682" maxlength="20" required>
+                        <div class="hint">فاصله یا خط تیره مهم نیست؛ فقط ارقام ۰-۹.</div>
+                    </div>
+
+                    <div class="field">
+                        <label>مبلغ تراکنش (ریال)</label>
+                        <input type="text" name="amount" value="<?= h($form['amount']) ?>" placeholder="10000" required>
+                    </div>
+
+                    <div class="field">
+                        <label>شماره کارت مبدا (اختیاری، ۱۶ رقم)</label>
+                        <input type="text" name="source_card" value="<?= h($form['source_card']) ?>" placeholder="6219861234562279" maxlength="20">
+                        <div class="hint">در رسید به صورت ماسک‌شده نمایش داده می‌شود.</div>
+                    </div>
+
+                    <div class="row">
+                        <div class="field">
+                            <label>شماره پیگیری (اختیاری)</label>
+                            <input type="text" name="tracking" value="<?= h($form['tracking']) ?>" placeholder="خودکار">
+                        </div>
+                        <div class="field">
+                            <label>شماره مرجع (اختیاری)</label>
+                            <input type="text" name="reference" value="<?= h($form['reference']) ?>" placeholder="خودکار">
+                        </div>
+                    </div>
+
+                    <div class="field">
+                        <label>تاریخ و زمان (اختیاری)</label>
+                        <input type="datetime-local" name="datetime" value="<?= h($form['datetime']) ?>" style="direction:ltr">
+                        <div class="hint">خالی بگذارید تا زمان فعلی استفاده شود.</div>
+                    </div>
+
+                    <div class="submit-row">
+                        <button type="submit" class="btn-primary">🧾 ساخت رسید نمونه</button>
+                        <a href="?action=receipt_generator" class="btn-secondary">پاک کردن</a>
+                    </div>
+                </form>
+            </div>
+
+            <div class="card">
+                <h2>👁 پیش‌نمایش رسید</h2>
+                <?php if(!$generated): ?>
+                    <div class="empty-preview">اطلاعات را وارد و دکمهٔ «ساخت رسید نمونه» را بزنید.</div>
+                <?php else: ?>
+                <div class="receipt-wrap">
+                    <div class="receipt" id="receiptBox">
+                        <div class="demo-banner">
+                            نمونه / DEMO — این رسید واقعی نیست
+                            <small>Sample receipt generated by XCloud admin tool — NOT a real bank transaction</small>
+                        </div>
+                        <div class="avatar-wrap">
+                            <div class="avatar">
+                                <svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 12c2.7 0 4.9-2.2 4.9-4.9S14.7 2.2 12 2.2 7.1 4.4 7.1 7.1 9.3 12 12 12zm0 2.4c-3.3 0-9.8 1.6-9.8 4.9v2.4h19.6v-2.4c0-3.3-6.5-4.9-9.8-4.9z"/></svg>
+                                <span class="badge-mini"></span>
+                            </div>
+                        </div>
+                        <div class="holder-name"><?= h($receipt['holder']) ?></div>
+                        <div class="card-num"><?= h($receipt['dest_card_fmt']) ?></div>
+
+                        <div class="amount"><?= h($receipt['amount_fmt']) ?> ریال</div>
+                        <div class="amount-label">مبلغ انتقال</div>
+
+                        <div class="status-pill">
+                            <span><span class="check">✓</span> انتقال موفق</span>
+                        </div>
+
+                        <div class="dotline"></div>
+
+                        <div class="rows">
+                            <div class="rrow"><span class="lbl">زمان</span><span class="val fa"><?= h($receipt['datetime_fmt']) ?></span></div>
+                            <div class="rrow"><span class="lbl">انتقال دهنده</span><span class="val fa"><?= h($receipt['holder']) ?></span></div>
+                            <div class="rrow"><span class="lbl">روش انتقال</span><span class="val fa">کارت به کارت</span></div>
+                            <?php if($receipt['source_masked']!==''): ?>
+                            <div class="rrow"><span class="lbl">کارت مبدا</span><span class="val"><?= h($receipt['source_masked']) ?></span></div>
+                            <?php endif; ?>
+                            <div class="rrow"><span class="lbl">شماره پیگیری</span><span class="val"><?= h($receipt['tracking_fmt']) ?></span></div>
+                            <div class="rrow"><span class="lbl">شماره مرجع</span><span class="val"><?= h($receipt['reference_fmt']) ?></span></div>
+                        </div>
+
+                        <div class="footer-brand">
+                            <div class="logo-circle">D</div>
+                            <div>
+                                <span class="brand-text">Demo Receipt</span>
+                                <span class="brand-sub">xcloud-demo • not a bank</span>
+                            </div>
+                        </div>
+
+                        <div class="disclaimer">
+                            ⚠️ این یک رسید <strong>نمونه/دمو</strong> است و هیچ تراکنش واقعی انجام نشده. استفاده برای فریب دیگران ممنوع است.
+                        </div>
+                    </div>
+                </div>
+                <div class="preview-actions">
+                    <button type="button" class="btn-secondary" onclick="window.print()">🖨 چاپ</button>
+                </div>
+                <?php endif; ?>
+            </div>
+        </div>
+    </div>
     </body></html><?php
 }
 else{header("Location: index.php");exit;}

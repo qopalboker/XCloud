@@ -9731,6 +9731,25 @@ elseif($action=='receipt_generator'){
         return $persianDigits(number_format((int)$n));
     };
 
+    // Stylized (NOT real-logo) bank badges shown on the avatar.
+    // Intentionally text-only colored chips so the output cannot be mistaken
+    // for an authentic bank artwork — combined with the DEMO watermark this
+    // keeps the tool firmly inside its sample-only purpose.
+    $bankBadges=[
+        'generic' => ['label'=>'پیش‌فرض (دمو)',  'letter'=>'D', 'bg'=>'#fda4af', 'inner'=>'#f59e0b'],
+        'mellat'  => ['label'=>'ملت (دمو)',       'letter'=>'م', 'bg'=>'#dc2626', 'inner'=>'#fecaca'],
+        'melli'   => ['label'=>'ملی (دمو)',       'letter'=>'ل', 'bg'=>'#0e7490', 'inner'=>'#a5f3fc'],
+        'saderat' => ['label'=>'صادرات (دمو)',    'letter'=>'ص', 'bg'=>'#1d4ed8', 'inner'=>'#bfdbfe'],
+        'parsian' => ['label'=>'پارسیان (دمو)',   'letter'=>'پ', 'bg'=>'#b91c1c', 'inner'=>'#fde68a'],
+        'pasargad'=> ['label'=>'پاسارگاد (دمو)',  'letter'=>'پ', 'bg'=>'#b45309', 'inner'=>'#fde68a'],
+        'saman'   => ['label'=>'سامان (دمو)',     'letter'=>'س', 'bg'=>'#6d28d9', 'inner'=>'#ddd6fe'],
+        'tejarat' => ['label'=>'تجارت (دمو)',     'letter'=>'ت', 'bg'=>'#047857', 'inner'=>'#a7f3d0'],
+        'sepah'   => ['label'=>'سپه (دمو)',       'letter'=>'س', 'bg'=>'#15803d', 'inner'=>'#bbf7d0'],
+        'refah'   => ['label'=>'رفاه (دمو)',      'letter'=>'ر', 'bg'=>'#0369a1', 'inner'=>'#bae6fd'],
+        'eghtesad'=> ['label'=>'اقتصاد نوین (دمو)','letter'=>'ا','bg'=>'#7c3aed', 'inner'=>'#ede9fe'],
+        'ayandeh' => ['label'=>'آینده (دمو)',     'letter'=>'آ', 'bg'=>'#0f766e', 'inner'=>'#99f6e4'],
+    ];
+
     $generated=false;
     $errors=[];
     $form=[
@@ -9741,6 +9760,7 @@ elseif($action=='receipt_generator'){
         'tracking'=>'',
         'reference'=>'',
         'datetime'=>'',
+        'bank_badge'=>'generic',
     ];
 
     if($_SERVER['REQUEST_METHOD']==='POST' && ($_POST['op']??'')==='generate'){
@@ -9752,6 +9772,8 @@ elseif($action=='receipt_generator'){
         $form['tracking']=preg_replace('/\D/','',$normalizeDigits($_POST['tracking']??''));
         $form['reference']=preg_replace('/\D/','',$normalizeDigits($_POST['reference']??''));
         $form['datetime']=trim((string)($_POST['datetime']??''));
+        $bb=(string)($_POST['bank_badge']??'generic');
+        $form['bank_badge']=isset($bankBadges[$bb]) ? $bb : 'generic';
 
         if($form['holder']==='') $errors[]='نام صاحب حساب الزامی است.';
         if(strlen($form['dest_card'])!==16) $errors[]='شماره کارت مقصد باید ۱۶ رقم باشد.';
@@ -9766,7 +9788,7 @@ elseif($action=='receipt_generator'){
             $sourceMasked='';
             if($form['source_card']!==''){
                 $sc=$form['source_card'];
-                $sourceMasked=$persianDigits(substr($sc,0,4)).' '.$persianDigits(substr($sc,4,2)).'** **** '.$persianDigits(substr($sc,12,4));
+                $sourceMasked=$persianDigits(substr($sc,0,4)).'  '.$persianDigits(substr($sc,4,2)).'** **** '.$persianDigits(substr($sc,12,4));
             }
 
             $receipt=[
@@ -9777,9 +9799,10 @@ elseif($action=='receipt_generator'){
                 'source_masked'=>$sourceMasked,
                 'tracking_fmt'=>$persianDigits($form['tracking']),
                 'reference_fmt'=>$persianDigits($form['reference']),
+                'badge'=>$bankBadges[$form['bank_badge']],
             ];
             $generated=true;
-            logActivity($pdo,$_SESSION['user'],'receipt_generator_demo',null,'holder='.$form['holder'].' amount='.$form['amount']);
+            logActivity($pdo,$_SESSION['user'],'receipt_generator_demo',null,'holder='.$form['holder'].' amount='.$form['amount'].' badge='.$form['bank_badge']);
         }
     }
     ?><!DOCTYPE html><html lang="fa" dir="rtl"><head>
@@ -9812,46 +9835,49 @@ elseif($action=='receipt_generator'){
     .btn-secondary{padding:11px 18px;background:#1e293b;color:#cbd5e1;border:1px solid #334155;border-radius:8px;font-family:inherit;font-size:.85rem;cursor:pointer;text-decoration:none;display:inline-block}
     .btn-secondary:hover{background:#334155}
 
-    /* Receipt preview */
+    /* Receipt preview — visually inspired by typical Iranian bank receipts,
+       but PERMANENTLY watermarked + branded as DEMO so it cannot be passed
+       off as a real bank artifact. Watermark elements are real DOM nodes
+       (not pseudo-elements) so they are also captured in the PNG download. */
     .receipt-wrap{position:relative}
-    .receipt{position:relative;background:#1f2937;border-radius:18px;padding:28px 22px 22px;overflow:hidden;direction:rtl}
-    .receipt::before,.receipt::after{
-        content:'نمونه • DEMO • نمونه • DEMO • نمونه • DEMO';
-        position:absolute;left:-30%;right:-30%;
-        color:rgba(248,113,113,.16);font-weight:900;font-size:2.2rem;letter-spacing:3px;
-        text-align:center;pointer-events:none;white-space:nowrap;
-        transform:rotate(-28deg);
-    }
-    .receipt::before{top:30%}
-    .receipt::after{top:65%}
-    .demo-banner{background:#dc2626;color:#fff;text-align:center;padding:8px 12px;font-weight:700;font-size:.85rem;letter-spacing:1px;border-radius:8px 8px 0 0;margin:-28px -22px 18px}
-    .demo-banner small{display:block;font-weight:500;font-size:.7rem;opacity:.95;margin-top:2px}
-    .avatar-wrap{display:flex;justify-content:center;position:relative;z-index:2}
-    .avatar{width:78px;height:78px;border-radius:50%;background:#4b5563;display:flex;align-items:center;justify-content:center;position:relative}
-    .avatar svg{width:62px;height:62px;color:#9ca3af}
-    .avatar .badge-mini{position:absolute;bottom:0;right:0;width:22px;height:22px;border-radius:6px;background:#fda4af;display:flex;align-items:center;justify-content:center;border:2px solid #1f2937}
-    .avatar .badge-mini::after{content:'';width:8px;height:8px;background:#f59e0b;border-radius:1px}
-    .holder-name{text-align:center;font-size:1.05rem;font-weight:700;color:#f8fafc;margin-top:12px;position:relative;z-index:2}
-    .card-num{text-align:center;color:#cbd5e1;font-size:.9rem;margin-top:6px;letter-spacing:1px;position:relative;z-index:2}
-    .amount{text-align:center;font-size:1.9rem;font-weight:800;color:#f8fafc;margin-top:18px;position:relative;z-index:2}
-    .amount-label{text-align:center;color:#94a3b8;font-size:.8rem;margin-top:2px;position:relative;z-index:2}
-    .status-pill{display:flex;justify-content:center;margin-top:14px;position:relative;z-index:2}
-    .status-pill span{background:#10b981;color:#fff;padding:8px 18px;border-radius:999px;font-size:.85rem;font-weight:600;display:inline-flex;align-items:center;gap:8px}
-    .status-pill .check{width:18px;height:18px;border-radius:50%;background:#064e3b;display:inline-flex;align-items:center;justify-content:center;font-size:.7rem}
-    .dotline{border-top:2px dashed #374151;margin:18px -4px;position:relative;z-index:2}
-    .rows{position:relative;z-index:2}
-    .rrow{display:flex;justify-content:space-between;align-items:center;padding:11px 0;border-bottom:1px solid #374151;gap:12px}
+    .receipt{position:relative;background:#13141a;border-radius:22px;padding:0 26px 26px;overflow:hidden;direction:rtl;color:#e5e7eb;width:380px;max-width:100%;margin:0 auto}
+    .demo-banner{background:#dc2626;color:#fff;text-align:center;padding:9px 12px;font-weight:800;font-size:.82rem;letter-spacing:1px;margin:0 -26px 0}
+    .demo-banner small{display:block;font-weight:500;font-size:.68rem;opacity:.95;margin-top:2px;letter-spacing:0}
+    .wm-layer{position:absolute;inset:0;pointer-events:none;z-index:1;overflow:hidden}
+    .wm-line{position:absolute;left:-30%;right:-30%;color:rgba(248,113,113,.18);font-weight:900;font-size:2.1rem;letter-spacing:3px;text-align:center;white-space:nowrap;transform:rotate(-26deg);font-family:'Dana',Tahoma,sans-serif}
+    .wm-line.l1{top:22%}
+    .wm-line.l2{top:48%}
+    .wm-line.l3{top:74%}
+    .avatar-wrap{display:flex;justify-content:center;position:relative;z-index:2;margin-top:30px}
+    .avatar{width:84px;height:84px;border-radius:50%;background:#4b5563;display:flex;align-items:center;justify-content:center;position:relative}
+    .avatar svg.silhouette{width:72px;height:72px;color:#9ca3af}
+    .avatar .badge-mini{position:absolute;bottom:-2px;right:-2px;width:28px;height:28px;border-radius:8px;display:flex;align-items:center;justify-content:center;border:3px solid #13141a;font-weight:800;font-size:.78rem;color:#fff;font-family:'Dana',Tahoma,sans-serif}
+    .holder-name{text-align:center;font-size:1.05rem;font-weight:700;color:#f8fafc;margin-top:14px;position:relative;z-index:2}
+    .card-num{text-align:center;color:#9ca3af;font-size:.92rem;margin-top:8px;letter-spacing:2px;position:relative;z-index:2;direction:ltr;font-family:'Dana',Tahoma,sans-serif}
+    .amount{text-align:center;font-size:2.35rem;font-weight:800;color:#f8fafc;margin-top:22px;position:relative;z-index:2;letter-spacing:1px}
+    .amount-label{text-align:center;color:#94a3b8;font-size:.82rem;margin-top:4px;position:relative;z-index:2}
+    .status-pill{display:flex;justify-content:center;margin-top:18px;position:relative;z-index:2}
+    .status-pill span{background:#10b981;color:#fff;padding:10px 22px;border-radius:999px;font-size:.88rem;font-weight:700;display:inline-flex;align-items:center;gap:10px;flex-direction:row-reverse}
+    .status-pill .check{width:20px;height:20px;border-radius:50%;background:#0b3a2a;display:inline-flex;align-items:center;justify-content:center;color:#fff;font-size:.72rem;font-weight:900}
+    .dotline{display:flex;justify-content:space-between;align-items:center;margin:22px -6px 8px;position:relative;z-index:2;height:8px}
+    .dotline span{width:4px;height:4px;border-radius:50%;background:#374151;display:block;flex:0 0 auto}
+    .rows{position:relative;z-index:2;margin-top:6px}
+    .rrow{display:flex;justify-content:space-between;align-items:center;padding:14px 0;border-bottom:1px solid #232631;gap:12px}
     .rrow:last-child{border-bottom:none}
-    .rrow .lbl{color:#94a3b8;font-size:.82rem}
-    .rrow .val{color:#e5e7eb;font-size:.85rem;text-align:left;direction:ltr;font-feature-settings:"tnum"}
+    .rrow .lbl{color:#9ca3af;font-size:.85rem;flex:0 0 auto}
+    .rrow .val{color:#e5e7eb;font-size:.9rem;text-align:left;direction:ltr;font-feature-settings:"tnum";font-family:'Dana',Tahoma,sans-serif}
     .rrow .val.fa{direction:rtl;text-align:left}
-    .footer-brand{display:flex;align-items:center;justify-content:center;gap:8px;margin-top:18px;padding-top:14px;position:relative;z-index:2}
-    .footer-brand .logo-circle{width:36px;height:36px;border-radius:50%;background:#374151;display:flex;align-items:center;justify-content:center;color:#9ca3af;font-weight:800;font-size:1.1rem}
-    .footer-brand .brand-text{color:#9ca3af;font-size:.95rem;font-weight:600}
-    .footer-brand .brand-sub{color:#6b7280;font-size:.75rem;display:block}
-    .disclaimer{margin-top:14px;padding:10px;text-align:center;background:rgba(220,38,38,.12);border:1px dashed rgba(220,38,38,.5);border-radius:8px;color:#fca5a5;font-size:.78rem;position:relative;z-index:2}
+    .footer-brand{display:flex;align-items:center;justify-content:center;gap:10px;margin-top:22px;padding-top:18px;position:relative;z-index:2}
+    .footer-brand .logo-circle{width:40px;height:40px;border-radius:50%;background:#374151;display:flex;align-items:center;justify-content:center;color:#9ca3af;font-weight:800;font-size:1.2rem;font-family:'Dana',Tahoma,sans-serif}
+    .footer-brand .brand-text{color:#9ca3af;font-size:1rem;font-weight:700;display:block}
+    .footer-brand .brand-sub{color:#6b7280;font-size:.75rem;display:block;margin-top:2px}
+    .disclaimer{margin-top:16px;padding:10px;text-align:center;background:rgba(220,38,38,.12);border:1px dashed rgba(220,38,38,.5);border-radius:8px;color:#fca5a5;font-size:.78rem;position:relative;z-index:2}
     .preview-actions{display:flex;gap:10px;margin-top:14px;flex-wrap:wrap}
+    .preview-actions .btn-download{padding:11px 18px;background:#10b981;color:#fff;border:none;border-radius:8px;font-family:inherit;font-size:.9rem;cursor:pointer;font-weight:600}
+    .preview-actions .btn-download:hover{background:#059669}
+    .preview-actions .btn-download[disabled]{opacity:.6;cursor:wait}
     .empty-preview{text-align:center;color:#64748b;padding:60px 20px;font-size:.9rem}
+    .field select{width:100%;padding:10px 12px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:8px;font-family:inherit;font-size:.9rem}
     </style>
     </head><body>
     <div class="wrap">
@@ -9921,6 +9947,16 @@ elseif($action=='receipt_generator'){
                         <div class="hint">خالی بگذارید تا زمان فعلی استفاده شود.</div>
                     </div>
 
+                    <div class="field">
+                        <label>آیکون بانک روی آواتار</label>
+                        <select name="bank_badge">
+                            <?php foreach($bankBadges as $bk=>$bv): ?>
+                            <option value="<?= h($bk) ?>" <?= $form['bank_badge']===$bk?'selected':'' ?>><?= h($bv['label']) ?></option>
+                            <?php endforeach; ?>
+                        </select>
+                        <div class="hint">فقط آیکون رنگی استایلیزه — لوگوی رسمی هیچ بانکی نیست (DEMO).</div>
+                    </div>
+
                     <div class="submit-row">
                         <button type="submit" class="btn-primary">🧾 ساخت رسید نمونه</button>
                         <a href="?action=receipt_generator" class="btn-secondary">پاک کردن</a>
@@ -9939,10 +9975,15 @@ elseif($action=='receipt_generator'){
                             نمونه / DEMO — این رسید واقعی نیست
                             <small>Sample receipt generated by XCloud admin tool — NOT a real bank transaction</small>
                         </div>
+                        <div class="wm-layer" aria-hidden="true">
+                            <div class="wm-line l1">نمونه • DEMO • نمونه • DEMO • نمونه • DEMO</div>
+                            <div class="wm-line l2">نمونه • DEMO • نمونه • DEMO • نمونه • DEMO</div>
+                            <div class="wm-line l3">نمونه • DEMO • نمونه • DEMO • نمونه • DEMO</div>
+                        </div>
                         <div class="avatar-wrap">
                             <div class="avatar">
-                                <svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 12c2.7 0 4.9-2.2 4.9-4.9S14.7 2.2 12 2.2 7.1 4.4 7.1 7.1 9.3 12 12 12zm0 2.4c-3.3 0-9.8 1.6-9.8 4.9v2.4h19.6v-2.4c0-3.3-6.5-4.9-9.8-4.9z"/></svg>
-                                <span class="badge-mini"></span>
+                                <svg class="silhouette" viewBox="0 0 24 24" fill="currentColor"><path d="M12 12c2.7 0 4.9-2.2 4.9-4.9S14.7 2.2 12 2.2 7.1 4.4 7.1 7.1 9.3 12 12 12zm0 2.4c-3.3 0-9.8 1.6-9.8 4.9v2.4h19.6v-2.4c0-3.3-6.5-4.9-9.8-4.9z"/></svg>
+                                <span class="badge-mini" style="background:<?= h($receipt['badge']['bg']) ?>;color:<?= h($receipt['badge']['inner']) ?>"><?= h($receipt['badge']['letter']) ?></span>
                             </div>
                         </div>
                         <div class="holder-name"><?= h($receipt['holder']) ?></div>
@@ -9952,20 +9993,22 @@ elseif($action=='receipt_generator'){
                         <div class="amount-label">مبلغ انتقال</div>
 
                         <div class="status-pill">
-                            <span><span class="check">✓</span> انتقال موفق</span>
+                            <span>انتقال موفق <span class="check">✓</span></span>
                         </div>
 
-                        <div class="dotline"></div>
+                        <div class="dotline">
+                            <?php for($i=0;$i<32;$i++): ?><span></span><?php endfor; ?>
+                        </div>
 
                         <div class="rows">
-                            <div class="rrow"><span class="lbl">زمان</span><span class="val fa"><?= h($receipt['datetime_fmt']) ?></span></div>
-                            <div class="rrow"><span class="lbl">انتقال دهنده</span><span class="val fa"><?= h($receipt['holder']) ?></span></div>
-                            <div class="rrow"><span class="lbl">روش انتقال</span><span class="val fa">کارت به کارت</span></div>
+                            <div class="rrow"><span class="val fa"><?= h($receipt['datetime_fmt']) ?></span><span class="lbl">زمان</span></div>
+                            <div class="rrow"><span class="val fa"><?= h($receipt['holder']) ?></span><span class="lbl">انتقال دهنده</span></div>
+                            <div class="rrow"><span class="val fa">کارت به کارت</span><span class="lbl">روش انتقال</span></div>
                             <?php if($receipt['source_masked']!==''): ?>
-                            <div class="rrow"><span class="lbl">کارت مبدا</span><span class="val"><?= h($receipt['source_masked']) ?></span></div>
+                            <div class="rrow"><span class="val"><?= h($receipt['source_masked']) ?></span><span class="lbl">سپرده مبدأ</span></div>
                             <?php endif; ?>
-                            <div class="rrow"><span class="lbl">شماره پیگیری</span><span class="val"><?= h($receipt['tracking_fmt']) ?></span></div>
-                            <div class="rrow"><span class="lbl">شماره مرجع</span><span class="val"><?= h($receipt['reference_fmt']) ?></span></div>
+                            <div class="rrow"><span class="val"><?= h($receipt['tracking_fmt']) ?></span><span class="lbl">شماره پیگیری</span></div>
+                            <div class="rrow"><span class="val"><?= h($receipt['reference_fmt']) ?></span><span class="lbl">شماره مرجع</span></div>
                         </div>
 
                         <div class="footer-brand">
@@ -9982,8 +10025,43 @@ elseif($action=='receipt_generator'){
                     </div>
                 </div>
                 <div class="preview-actions">
+                    <button type="button" id="btnDownload" class="btn-download">⬇ دانلود PNG (DEMO)</button>
                     <button type="button" class="btn-secondary" onclick="window.print()">🖨 چاپ</button>
                 </div>
+                <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js" integrity="sha512-BNaRQnYJYiPSqHHDb58B0yaPfCu+Wgds8Gp/gU33kqBtgNS4tSPHuGibyoeqMV/TJlSKda6FXzoEyYGjTe+vXA==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+                <script>
+                (function(){
+                    var btn=document.getElementById('btnDownload');
+                    if(!btn) return;
+                    btn.addEventListener('click', function(){
+                        var node=document.getElementById('receiptBox');
+                        if(!node || typeof html2canvas==='undefined'){
+                            alert('کتابخانهٔ تولید تصویر بارگذاری نشده.');
+                            return;
+                        }
+                        btn.disabled=true;
+                        var oldText=btn.textContent;
+                        btn.textContent='در حال آماده‌سازی…';
+                        // Capture at 2x for crisper output; keep dark background.
+                        html2canvas(node,{backgroundColor:'#13141a',scale:2,useCORS:true,logging:false}).then(function(canvas){
+                            var link=document.createElement('a');
+                            var ts=new Date();
+                            var pad=function(n){return n<10?'0'+n:''+n;};
+                            var name='demo-receipt-'+ts.getFullYear()+pad(ts.getMonth()+1)+pad(ts.getDate())+'-'+pad(ts.getHours())+pad(ts.getMinutes())+pad(ts.getSeconds())+'.png';
+                            link.download=name;
+                            link.href=canvas.toDataURL('image/png');
+                            document.body.appendChild(link);
+                            link.click();
+                            document.body.removeChild(link);
+                        }).catch(function(err){
+                            alert('خطا در ساخت تصویر: '+(err&&err.message?err.message:err));
+                        }).finally(function(){
+                            btn.disabled=false;
+                            btn.textContent=oldText;
+                        });
+                    });
+                })();
+                </script>
                 <?php endif; ?>
             </div>
         </div>

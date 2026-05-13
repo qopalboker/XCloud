@@ -7050,6 +7050,23 @@ elseif($action=='dashboard'){
             .app-header:hover .header-inner{padding-top:14px;padding-bottom:14px}
         }
     }
+    /* Glassmorphism header when user has custom background */
+    body.has-custom-bg .app-header{
+        background:rgba(15,23,42,.42);
+        backdrop-filter:blur(24px) saturate(180%);
+        -webkit-backdrop-filter:blur(24px) saturate(180%);
+        border-bottom-color:rgba(255,255,255,.06);
+        box-shadow:0 1px 0 rgba(255,255,255,.04) inset,0 8px 24px rgba(0,0,0,.18)
+    }
+    @media (hover:hover) and (pointer:fine){
+        body.has-custom-bg .app-header:hover{
+            background:rgba(15,23,42,.55);
+            border-bottom-color:rgba(255,255,255,.12)
+        }
+    }
+    @supports not ((backdrop-filter:blur(1px)) or (-webkit-backdrop-filter:blur(1px))){
+        body.has-custom-bg .app-header{background:rgba(10,14,26,.82)}
+    }
     .header-inner{display:flex;justify-content:space-between;align-items:center;padding:10px 20px;max-width:1280px;margin:0 auto}
     .header-brand{display:flex;align-items:center;gap:8px}
     .header-brand span{font-weight:900;font-size:1.1rem;background:linear-gradient(135deg,var(--primary),var(--purple));-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}

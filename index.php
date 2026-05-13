@@ -1444,6 +1444,56 @@ function renderSharePageStyles(): string {
     ";
 }
 
+/**
+ * Returns true when the caller asked for application/json (SPA fetch path).
+ * Process handlers branch on this to emit JSON instead of 302 redirects so
+ * the SPA can swap views without a full reload.
+ */
+function wants_json(): bool {
+    $accept = $_SERVER['HTTP_ACCEPT'] ?? '';
+    return stripos($accept, 'application/json') !== false;
+}
+
+function auth_json_err(string $error, array $extra = []): void {
+    header('Content-Type: application/json');
+    echo json_encode(array_merge(['ok' => false, 'error' => $error], $extra));
+    exit;
+}
+
+function auth_json_ok(array $data = []): void {
+    header('Content-Type: application/json');
+    echo json_encode(array_merge(['ok' => true], $data));
+    exit;
+}
+
+/**
+ * Snapshot of the live verify-view state for the SPA. Returns null when
+ * there is no pending verification for either flow.
+ */
+function spa_verify_snapshot(): ?array {
+    if (!empty($_SESSION['pending_password_reset'])) {
+        $p = $_SESSION['pending_password_reset'];
+        return [
+            'flow'        => 'reset',
+            'token'       => $p['token'] ?? '',
+            'user_email'  => $p['email'] ?? '',
+            'expires_at'  => isset($p['expires_at']) ? strtotime($p['expires_at']) : null,
+            'next_redirect' => '?action=auth_shell&view=newpass',
+        ];
+    }
+    if (!empty($_SESSION['pending_registration'])) {
+        $p = $_SESSION['pending_registration'];
+        return [
+            'flow'        => 'register',
+            'token'       => $p['token'] ?? '',
+            'user_email'  => $p['email'] ?? '',
+            'expires_at'  => isset($p['expires_at']) ? strtotime($p['expires_at']) : null,
+            'next_redirect' => '?action=dashboard',
+        ];
+    }
+    return null;
+}
+
 function getAuthSharedCss(): string {
     return getDanaFontFaceCss() . <<<'CSS'
 body {
@@ -2595,12 +2645,579 @@ if($action==='passkey_delete'){
     exit;
 }
 
+// ================================================================
+// AUTH SPA SHELL — single document with all 5 views
+// ================================================================
+if ($action == 'auth_shell') {
+    if (isset($_SESSION['user'])) { header("Location: ?action=dashboard"); exit; }
+    $allowedViews = ['login','register','forgot','verify','newpass'];
+    $view = $_GET['view'] ?? 'login';
+    if (!in_array($view, $allowedViews, true)) $view = 'login';
+
+    $csrf = generateCsrfToken();
+    $regEnabled = registrationEnabled($pdo);
+    $requiresReferral = getSetting($pdo, 'registration_requires_referral', '0') === '1';
+    $toAddr = getSetting($pdo, 'inbound_to_address', 'xcloud@retrivo.ir');
+    $verifyData = spa_verify_snapshot();
+    $hasResetAuth = !empty($_SESSION['reset_authorized_otp_id']) &&
+                    !empty($_SESSION['reset_authorized_at']) &&
+                    (time() - (int)$_SESSION['reset_authorized_at']) <= 300;
+
+    // Force valid initial view based on session state
+    if ($view === 'verify'  && !$verifyData)    $view = 'login';
+    if ($view === 'newpass' && !$hasResetAuth)  $view = 'login';
+    if ($view === 'register' && !$regEnabled)   $view = 'login';
+
+    $loginError = isset($_GET['error']) ? '⚠️ نام کاربری یا رمز عبور اشتباه است.' : '';
+    $loginMsg = ($_GET['msg'] ?? '') === 'password_reset_success' ? '✅ رمز عبور با موفقیت تغییر کرد. وارد شوید.' : '';
+
+    $verifyTokenJs   = $verifyData['token']      ?? '';
+    $verifyEmailJs   = $verifyData['user_email'] ?? '';
+    $verifyExpiresJs = $verifyData['expires_at'] ?? 0;
+    $verifyFlowJs    = $verifyData['flow']       ?? 'register';
+    $verifyNextJs    = $verifyData['next_redirect'] ?? '?action=dashboard';
+?>
+<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>XCloud — احراز هویت</title>
+<?= renderHeadAssets() ?>
+<style>
+<?= getAuthSharedCss() ?>
+section[data-view]{transition:opacity .25s ease;opacity:1}
+section[data-view].is-hidden{opacity:0;pointer-events:none;position:absolute;visibility:hidden;left:-9999px;top:-9999px}
+.auth-link-row{margin-top:14px;text-align:center;font-size:.82rem;color:#94a3b8}
+.auth-link-row a,.auth-link-row button.text-link{color:#3b82f6;text-decoration:none;font-weight:600;background:none;border:none;font-family:inherit;font-size:inherit;cursor:pointer;padding:0}
+.spa-noscript{background:rgba(127,29,29,.4);border:1px solid rgba(239,68,68,.3);color:#fee2e2;padding:10px 14px;border-radius:10px;margin-bottom:16px;font-size:.85rem;text-align:center}
+</style>
+</head>
+<body data-initial-view="<?= h($view) ?>">
+<div class="bg-glow bg-glow-1"></div>
+<div class="bg-glow bg-glow-2"></div>
+
+<noscript>
+  <div class="auth-card spa-noscript">
+    جاوااسکریپت غیرفعال است. لطفاً از این لینک‌های جایگزین استفاده کنید:
+    <div style="margin-top:8px"><a href="index.php">ورود</a> · <a href="?action=register_step1">ثبت‌نام</a> · <a href="?action=forgot_password_step1">فراموشی رمز</a></div>
+  </div>
+</noscript>
+
+<!-- ─── LOGIN ─────────────────────────────────────── -->
+<section data-view="login" class="<?= $view==='login'?'':'is-hidden' ?>">
+  <div class="auth-card">
+    <h1>🔐 ورود به XCloud</h1>
+    <div class="auth-subtitle">با نام کاربری یا ایمیل وارد شوید</div>
+    <div class="alert-err" data-err-slot hidden></div>
+    <?php if ($loginError): ?><div class="alert-err"><?= $loginError ?></div><?php endif; ?>
+    <?php if ($loginMsg): ?><div class="alert-ok"><?= $loginMsg ?></div><?php endif; ?>
+    <form method="POST" action="?action=login_process" data-spa-form>
+      <input type="hidden" name="csrf_token" value="<?= h($csrf) ?>">
+      <div class="field">
+        <label for="li_user">نام کاربری یا ایمیل</label>
+        <input type="text" id="li_user" name="username" required autocomplete="username">
+      </div>
+      <div class="field">
+        <label for="li_pass">رمز عبور</label>
+        <input type="password" id="li_pass" name="password" required autocomplete="current-password">
+      </div>
+      <button type="submit" class="btn-primary">ورود</button>
+    </form>
+    <div class="auth-link-row">
+      <a href="?action=auth_shell&view=forgot" data-spa-link="forgot">رمز عبور را فراموش کرده‌اید؟</a>
+    </div>
+    <?php if ($regEnabled): ?>
+    <div class="auth-link-row">
+      حساب ندارید؟ <a href="?action=auth_shell&view=register" data-spa-link="register">ثبت‌نام</a>
+    </div>
+    <?php endif; ?>
+  </div>
+</section>
+
+<!-- ─── REGISTER ──────────────────────────────────── -->
+<section data-view="register" class="<?= $view==='register'?'':'is-hidden' ?>">
+  <div class="auth-card">
+    <h1>📝 ثبت‌نام در XCloud</h1>
+    <div class="auth-subtitle">با تأیید ایمیل، حساب جدید بسازید</div>
+    <div class="alert-err" data-err-slot hidden></div>
+    <div class="alert-info">
+      💡 <b>توصیه می‌شود</b> از ایمیل‌های ایرانی (mail.ir، chmail.ir، mailfa.com) استفاده کنید. تأیید آن‌ها سریع‌تر است.
+    </div>
+    <?php if (!$regEnabled): ?>
+    <div class="alert-err">ثبت‌نام عمومی در حال حاضر غیرفعال است.</div>
+    <?php else: ?>
+    <form method="POST" action="?action=register_step1_process" data-spa-form>
+      <input type="hidden" name="csrf_token" value="<?= h($csrf) ?>">
+      <div class="field">
+        <label for="rg_email">ایمیل</label>
+        <input type="email" id="rg_email" name="email" required autocomplete="email">
+      </div>
+      <div class="field">
+        <label for="rg_user">نام کاربری</label>
+        <input type="text" id="rg_user" name="username" required autocomplete="username">
+        <div class="hint">شروع با حرف انگلیسی، ۳ تا ۳۰ کاراکتر، شامل حروف/اعداد/_/-</div>
+      </div>
+      <div class="field">
+        <label for="rg_pass">رمز عبور</label>
+        <input type="password" id="rg_pass" name="password" required autocomplete="new-password" minlength="8">
+        <div class="hint">حداقل ۸ کاراکتر، شامل حروف و اعداد</div>
+      </div>
+      <div class="field">
+        <label for="rg_pass2">تکرار رمز عبور</label>
+        <input type="password" id="rg_pass2" name="password_confirm" required autocomplete="new-password" minlength="8">
+      </div>
+      <?php if ($requiresReferral): ?>
+      <div class="field">
+        <label for="rg_ref">کد معرف</label>
+        <input type="text" id="rg_ref" name="referral_code" required autocomplete="off" style="direction:ltr;text-transform:uppercase;letter-spacing:.08em">
+        <div class="hint">برای ثبت‌نام به یک کد معرف معتبر نیاز دارید.</div>
+      </div>
+      <?php endif; ?>
+      <div class="field">
+        <label>پاسخ این محاسبه چیست؟</label>
+        <div class="captcha-box"><img src="?action=captcha_image&amp;v=<?= time() ?>" alt="کپچا" width="160" height="50" data-captcha-img></div>
+        <input type="text" name="captcha" required inputmode="numeric" autocomplete="off">
+      </div>
+      <button type="submit" class="btn-primary">ارسال کد تأیید</button>
+    </form>
+    <?php endif; ?>
+    <div class="auth-link-row">
+      قبلاً ثبت‌نام کرده‌اید؟ <a href="?action=auth_shell&view=login" data-spa-link="login">ورود</a>
+    </div>
+  </div>
+</section>
+
+<!-- ─── FORGOT ────────────────────────────────────── -->
+<section data-view="forgot" class="<?= $view==='forgot'?'':'is-hidden' ?>">
+  <div class="auth-card">
+    <h1>🔑 بازیابی رمز عبور</h1>
+    <div class="auth-subtitle">ایمیل خود را وارد کنید تا کد بازیابی صادر شود</div>
+    <div class="alert-err" data-err-slot hidden></div>
+    <form method="POST" action="?action=forgot_password_step1_process" data-spa-form>
+      <input type="hidden" name="csrf_token" value="<?= h($csrf) ?>">
+      <div class="field">
+        <label for="fp_email">ایمیل</label>
+        <input type="email" id="fp_email" name="email" required autocomplete="email">
+      </div>
+      <div class="field">
+        <label>پاسخ این محاسبه چیست؟</label>
+        <div class="captcha-box"><img src="?action=captcha_image&amp;v=<?= time() ?>" alt="کپچا" width="160" height="50" data-captcha-img></div>
+        <input type="text" name="captcha" required inputmode="numeric" autocomplete="off">
+      </div>
+      <button type="submit" class="btn-primary">ارسال کد بازیابی</button>
+    </form>
+    <div class="auth-link-row">
+      <a href="?action=auth_shell&view=login" data-spa-link="login">بازگشت به ورود</a>
+    </div>
+  </div>
+</section>
+
+<!-- ─── VERIFY ────────────────────────────────────── -->
+<section data-view="verify" class="<?= $view==='verify'?'':'is-hidden' ?>">
+  <div class="auth-card verify-card">
+    <h1>📨 تأیید ایمیل</h1>
+    <div class="auth-subtitle">یک ایمیل از آدرس خود به کد زیر بفرستید.</div>
+    <div class="alert-err" data-err-slot hidden></div>
+    <div class="alert-ok" data-ok-slot hidden></div>
+
+    <div class="verify-block top">
+      <span class="block-label">📬 ایمیل ما (گیرنده)</span>
+      <div class="block-value-row">
+        <span class="block-value" id="vfTo"><?= h($toAddr) ?></span>
+        <button type="button" class="copy-btn" data-target="vfTo">📋</button>
+      </div>
+    </div>
+
+    <div class="verify-block center">
+      <span class="block-label">🔑 کد تأیید (موضوع ایمیل)</span>
+      <div class="code-display" id="vfCode"><?= h($verifyTokenJs) ?></div>
+      <button type="button" class="copy-btn-wide" data-target="vfCode">📋 کپی کد</button>
+    </div>
+
+    <div class="verify-block bottom">
+      <span class="block-label">از</span>
+      <span class="block-value-plain" id="vfEmail"><?= h($verifyEmailJs) ?></span>
+    </div>
+
+    <div class="alert-info" style="margin-top:14px">
+      💡 توصیه: از ایمیل‌های ایرانی (mail.ir، chmail.ir، mailfa.com) استفاده کنید — تأییدشان سریع‌تر است.
+    </div>
+
+    <a class="btn-primary" id="vfMailto" href="mailto:<?= h($toAddr) ?>?subject=<?= h($verifyTokenJs) ?>">📧 باز کردن برنامهٔ ایمیل</a>
+
+    <form method="POST" action="?action=inbound_check_now" id="vfCheckForm" data-spa-form-check style="margin:0">
+      <input type="hidden" name="csrf_token" value="<?= h($csrf) ?>">
+      <input type="hidden" name="redirect" value="register_step2" id="vfCheckRedirect">
+      <button type="submit" class="btn-secondary check-btn" id="vfCheckBtn">
+        <span class="check-btn-default">🔄 چک کردن دستی</span>
+        <span class="check-btn-loading" hidden><span class="spinner-sm"></span> در حال بررسی...</span>
+        <span class="check-btn-cooldown" hidden>⏳ <span id="vfCooldownNum">10</span> ثانیه...</span>
+      </button>
+    </form>
+
+    <div class="status-line" id="vfStatusLine">
+      <span class="spinner" id="vfStatusSpin"></span>
+      <span id="vfStatusText">منتظر دریافت ایمیلت هستیم...</span>
+    </div>
+
+    <div class="timer-wrap">
+      <svg class="timer-ring" viewBox="0 0 100 100" width="80" height="80">
+        <defs>
+          <linearGradient id="timerGrad" x1="0" y1="0" x2="1" y2="1">
+            <stop offset="0%" stop-color="#3b82f6"/>
+            <stop offset="100%" stop-color="#8b5cf6"/>
+          </linearGradient>
+        </defs>
+        <circle class="timer-track" cx="50" cy="50" r="42" />
+        <circle class="timer-progress" cx="50" cy="50" r="42" id="vfTimerCircle"/>
+      </svg>
+      <div class="timer-text" id="vfTimerText">--:--</div>
+    </div>
+
+    <div class="links-row">
+      <a href="?action=auth_shell&view=login" data-spa-link="login">انصراف / ورود</a>
+      <form method="POST" action="?action=register_resend_otp" id="vfResendForm" data-spa-form-resend style="display:inline;margin:0">
+        <input type="hidden" name="csrf_token" value="<?= h($csrf) ?>">
+        <button type="submit" class="text-link">صدور کد جدید</button>
+      </form>
+    </div>
+  </div>
+</section>
+
+<!-- ─── NEWPASS ───────────────────────────────────── -->
+<section data-view="newpass" class="<?= $view==='newpass'?'':'is-hidden' ?>">
+  <div class="auth-card">
+    <h1>✅ ایمیل تأیید شد</h1>
+    <div class="auth-subtitle">حالا رمز عبور جدید را وارد کنید</div>
+    <div class="alert-ok">مالکیت ایمیل تأیید شده. این فرم ۵ دقیقه اعتبار دارد.</div>
+    <div class="alert-err" data-err-slot hidden></div>
+    <form method="POST" action="?action=forgot_password_step3_process" data-spa-form>
+      <input type="hidden" name="csrf_token" value="<?= h($csrf) ?>">
+      <div class="field">
+        <label for="np_pass">رمز عبور جدید</label>
+        <input type="password" id="np_pass" name="new_password" required autocomplete="new-password" minlength="8">
+        <div class="hint">حداقل ۸ کاراکتر، شامل حروف و اعداد</div>
+      </div>
+      <div class="field">
+        <label for="np_pass2">تکرار رمز عبور جدید</label>
+        <input type="password" id="np_pass2" name="password_confirm" required autocomplete="new-password" minlength="8">
+      </div>
+      <div class="field">
+        <label>پاسخ این محاسبه چیست؟</label>
+        <div class="captcha-box"><img src="?action=captcha_image&amp;v=<?= time() ?>" alt="کپچا" width="160" height="50" data-captcha-img></div>
+        <input type="text" name="captcha" required inputmode="numeric" autocomplete="off">
+      </div>
+      <button type="submit" class="btn-primary">تغییر رمز عبور</button>
+    </form>
+  </div>
+</section>
+
+<script>
+(function(){
+    var ERR_MESSAGES = {
+        invalid: '⚠️ نام کاربری یا رمز عبور اشتباه است.',
+        captcha_wrong: '⚠️ پاسخ کپچا اشتباه است.',
+        invalid_email: '⚠️ فرمت ایمیل نامعتبر است.',
+        invalid_username: '⚠️ نام کاربری معتبر نیست.',
+        weak_password: '⚠️ رمز عبور باید حداقل ۸ کاراکتر و شامل حروف و اعداد باشد.',
+        password_mismatch: '⚠️ تکرار رمز با رمز اصلی مطابقت ندارد.',
+        username_taken: '⚠️ این نام کاربری قبلاً انتخاب شده است.',
+        send_failed: '⚠️ ارسال ایمیل با مشکل مواجه شد.',
+        cooldown: '⏳ کمی صبر کنید و دوباره تلاش کنید.',
+        rate_limit: '⏳ کمی صبر کن — یک بررسی به‌تازگی اجرا شده است.',
+        check_disabled: '⚠️ سامانهٔ دریافت ایمیل خاموش است.',
+        email_quota: '⛔ تعداد درخواست‌ها برای این ایمیل پر شده است.',
+        ip_quota: '⛔ تعداد درخواست‌ها از این IP پر شده است.',
+        referral_required: '⚠️ کد معرف لازم است.',
+        referral_invalid: '⚠️ کد معرف معتبر نیست.',
+        referral_expired: '⚠️ کد معرف منقضی شده است.',
+        referral_used: '⚠️ کد معرف قبلاً استفاده شده یا به سقف رسیده است.',
+        registration_disabled: '⚠️ ثبت‌نام عمومی غیرفعال است.',
+        no_session: '⚠️ نشست منقضی شد. لطفاً از ابتدا شروع کنید.',
+        expired: '⏰ پنجرهٔ زمانی منقضی شد.'
+    };
+
+    var AuthSPA = {
+        current: document.body.dataset.initialView || 'login',
+        verify: {
+            token:   <?= json_encode($verifyTokenJs) ?>,
+            email:   <?= json_encode($verifyEmailJs) ?>,
+            toAddr:  <?= json_encode($toAddr) ?>,
+            expires: <?= (int)$verifyExpiresJs ?>,
+            flow:    <?= json_encode($verifyFlowJs) ?>,
+            next:    <?= json_encode($verifyNextJs) ?>
+        },
+        sections: function(){ return document.querySelectorAll('section[data-view]'); },
+        sectionFor: function(view){ return document.querySelector('section[data-view="' + view + '"]'); },
+        clearError: function(section){
+            if (!section) return;
+            var slot = section.querySelector('[data-err-slot]');
+            if (slot) { slot.hidden = true; slot.textContent = ''; }
+        },
+        showError: function(section, err){
+            if (!section) return;
+            var slot = section.querySelector('[data-err-slot]');
+            if (!slot) { alert(err); return; }
+            slot.textContent = ERR_MESSAGES[err] || err;
+            slot.hidden = false;
+        },
+        refreshCaptchas: function(section){
+            section.querySelectorAll('[data-captcha-img]').forEach(function(img){
+                img.src = '?action=captcha_image&v=' + Date.now();
+            });
+        },
+        show: function(view, opts){
+            opts = opts || {};
+            if (!this.sectionFor(view)) return;
+            if (this.current === view && !opts.force) return;
+            var prev = this.sectionFor(this.current);
+            var next = this.sectionFor(view);
+            if (prev && prev !== next) {
+                prev.style.opacity = '0';
+                setTimeout(function(){ prev.classList.add('is-hidden'); prev.style.opacity = ''; }, 250);
+            }
+            next.classList.remove('is-hidden');
+            next.style.opacity = '0';
+            requestAnimationFrame(function(){ next.style.opacity = '1'; });
+            this.refreshCaptchas(next);
+            this.clearError(next);
+            this.current = view;
+            if (!opts.fromPop) {
+                history.pushState({view: view}, '', '?action=auth_shell&view=' + view);
+            }
+            if (view === 'verify') this.initVerify();
+        },
+        applyVerify: function(data){
+            if (!data) return;
+            this.verify.token   = data.token       || this.verify.token;
+            this.verify.email   = data.user_email  || this.verify.email;
+            this.verify.expires = data.expires_at  || this.verify.expires;
+            this.verify.flow    = data.flow        || this.verify.flow;
+            this.verify.next    = data.next_redirect || this.verify.next;
+            var codeEl = document.getElementById('vfCode');
+            if (codeEl) codeEl.textContent = this.verify.token;
+            var emailEl = document.getElementById('vfEmail');
+            if (emailEl) emailEl.textContent = this.verify.email;
+            var mailto = document.getElementById('vfMailto');
+            if (mailto) mailto.href = 'mailto:' + encodeURIComponent(this.verify.toAddr) +
+                '?subject=' + encodeURIComponent(this.verify.token);
+            var redirInput = document.getElementById('vfCheckRedirect');
+            if (redirInput) redirInput.value = this.verify.flow === 'reset' ? 'forgot_password_step2' : 'register_step2';
+        },
+        submit: async function(form){
+            var section = form.closest('section[data-view]');
+            this.clearError(section);
+            var btn = form.querySelector('button[type="submit"]');
+            if (btn) btn.disabled = true;
+            try {
+                var fd = new FormData(form);
+                var r = await fetch(form.action, {
+                    method: 'POST',
+                    headers: {'Accept': 'application/json'},
+                    body: fd,
+                    credentials: 'same-origin'
+                });
+                var j;
+                try { j = await r.json(); }
+                catch (e) {
+                    // Server didn't return JSON — fall back to native submission
+                    form.removeAttribute('data-spa-form');
+                    form.submit();
+                    return;
+                }
+                if (j.ok) {
+                    if (j.verify) this.applyVerify(j.verify);
+                    if (j.next_view) this.show(j.next_view);
+                    else if (j.redirect) window.location = j.redirect;
+                    else if (j.resent) this.flashOk(section, '✅ کد جدید صادر شد.');
+                } else {
+                    this.showError(section, j.error || 'send_failed');
+                    this.refreshCaptchas(section);
+                }
+            } catch (e) {
+                this.showError(section, 'send_failed');
+            } finally {
+                if (btn) btn.disabled = false;
+            }
+        },
+        flashOk: function(section, msg){
+            if (!section) return;
+            var ok = section.querySelector('[data-ok-slot]');
+            if (!ok) return;
+            ok.textContent = msg;
+            ok.hidden = false;
+            setTimeout(function(){ ok.hidden = true; }, 2800);
+        },
+        _verifyInit: false,
+        initVerify: function(){
+            this.applyVerify({
+                token: this.verify.token,
+                user_email: this.verify.email,
+                expires_at: this.verify.expires,
+                flow: this.verify.flow,
+                next_redirect: this.verify.next
+            });
+            if (this._verifyInit) return;
+            this._verifyInit = true;
+            this.startTimer();
+            this.startPolling();
+            this.bindCopyButtons();
+            this.bindCheckCooldown();
+        },
+        startTimer: function(){
+            var self = this;
+            var totalSec = 30 * 60;
+            (function tick(){
+                var now = Math.floor(Date.now()/1000);
+                var left = Math.max(0, (self.verify.expires || 0) - now);
+                var tt = document.getElementById('vfTimerText');
+                var tc = document.getElementById('vfTimerCircle');
+                if (!tt) return;
+                if (left <= 0) {
+                    tt.textContent = 'منقضی';
+                    tt.style.color = '#fca5a5';
+                    if (tc) tc.style.strokeDashoffset = 264;
+                    return;
+                }
+                var m = Math.floor(left/60), r = left%60;
+                tt.textContent = m + ':' + (r<10?'0':'') + r;
+                if (tc) tc.style.strokeDashoffset = (264 - 264 * (left / totalSec));
+                setTimeout(tick, 1000);
+            })();
+        },
+        startPolling: function(){
+            var self = this;
+            var line = document.getElementById('vfStatusLine');
+            var spin = document.getElementById('vfStatusSpin');
+            var txt  = document.getElementById('vfStatusText');
+            var stopped = false;
+            function setState(state, message){
+                if (!line) return;
+                line.classList.remove('ok','fail');
+                if (state === 'ok') { line.classList.add('ok'); if (spin) spin.style.display='none'; }
+                else if (state === 'fail') { line.classList.add('fail'); if (spin) spin.style.display='none'; }
+                if (txt) txt.textContent = message;
+            }
+            async function poll(){
+                if (stopped) return;
+                try {
+                    var r = await fetch('?action=inbound_status', {credentials:'same-origin', headers:{'Accept':'application/json'}});
+                    var j = await r.json();
+                    if (j.status === 'verified') {
+                        stopped = true;
+                        setState('ok', '✓ تایید شد — در حال انتقال...');
+                        setTimeout(function(){
+                            if (self.verify.flow === 'reset') self.show('newpass');
+                            else window.location = j.redirect || self.verify.next || '?action=dashboard';
+                        }, 700);
+                        return;
+                    }
+                    if (j.status === 'expired') { stopped = true; setState('fail', '⏰ کد منقضی شد.'); return; }
+                    if (j.status === 'race_error') { stopped = true; setState('fail', j.message || 'خطا در پردازش.'); return; }
+                    if (j.status === 'no_session') { stopped = true; setState('fail', 'نشست منقضی شد.'); return; }
+                    setTimeout(poll, 5000);
+                } catch (e) { setTimeout(poll, 8000); }
+            }
+            poll();
+        },
+        bindCopyButtons: function(){
+            document.querySelectorAll('section[data-view="verify"] .copy-btn, section[data-view="verify"] .copy-btn-wide').forEach(function(btn){
+                btn.addEventListener('click', function(){
+                    var t = document.getElementById(btn.getAttribute('data-target'));
+                    if (!t) return;
+                    var txt = t.textContent.trim();
+                    var done = function(){
+                        var o = btn.innerHTML;
+                        btn.classList.add('copied');
+                        btn.innerHTML = btn.classList.contains('copy-btn-wide') ? '✓ کپی شد' : '✓';
+                        setTimeout(function(){ btn.classList.remove('copied'); btn.innerHTML = o; }, 1200);
+                    };
+                    if (navigator.clipboard && window.isSecureContext) navigator.clipboard.writeText(txt).then(done, done);
+                    else { var ta = document.createElement('textarea'); ta.value = txt; ta.style.position='fixed'; ta.style.opacity=0;
+                        document.body.appendChild(ta); ta.select(); try { document.execCommand('copy'); } catch(e){}
+                        document.body.removeChild(ta); done(); }
+                });
+            });
+        },
+        bindCheckCooldown: function(){
+            var btn = document.getElementById('vfCheckBtn');
+            var form = document.getElementById('vfCheckForm');
+            if (!btn || !form) return;
+            var cooldownMs = 10000;
+            var lastClick = parseInt(localStorage.getItem('xc_last_check') || '0', 10);
+            function showCooldown(){
+                btn.disabled = true;
+                btn.querySelector('.check-btn-default').hidden = true;
+                btn.querySelector('.check-btn-loading').hidden = true;
+                var cd = btn.querySelector('.check-btn-cooldown');
+                cd.hidden = false;
+                var num = document.getElementById('vfCooldownNum');
+                var timer = setInterval(function(){
+                    var left = Math.ceil((cooldownMs - (Date.now() - lastClick)) / 1000);
+                    if (left <= 0) {
+                        clearInterval(timer);
+                        btn.disabled = false;
+                        cd.hidden = true;
+                        btn.querySelector('.check-btn-default').hidden = false;
+                    } else { num.textContent = left; }
+                }, 250);
+            }
+            if (Date.now() - lastClick < cooldownMs) showCooldown();
+        }
+    };
+
+    window.AuthSPA = AuthSPA;
+
+    // Submit interception
+    document.addEventListener('submit', function(e){
+        var form = e.target;
+        if (form.matches('[data-spa-form], [data-spa-form-check], [data-spa-form-resend]')) {
+            e.preventDefault();
+            if (form.matches('[data-spa-form-check]')) {
+                var lastClick = parseInt(localStorage.getItem('xc_last_check') || '0', 10);
+                if (Date.now() - lastClick < 10000) return;
+                localStorage.setItem('xc_last_check', String(Date.now()));
+                var btn = document.getElementById('vfCheckBtn');
+                if (btn) {
+                    btn.querySelector('.check-btn-default').hidden = true;
+                    btn.querySelector('.check-btn-loading').hidden = false;
+                }
+            }
+            AuthSPA.submit(form);
+        }
+    });
+
+    // SPA link navigation
+    document.addEventListener('click', function(e){
+        var a = e.target.closest('a[data-spa-link]');
+        if (a) { e.preventDefault(); AuthSPA.show(a.dataset.spaLink); }
+    });
+
+    // Browser back/forward
+    window.addEventListener('popstate', function(e){
+        var v = (e.state && e.state.view) || (new URLSearchParams(location.search).get('view')) || 'login';
+        AuthSPA.show(v, {fromPop: true});
+    });
+
+    // Set initial history state and init verify view if visible
+    history.replaceState({view: AuthSPA.current}, '', '?action=auth_shell&view=' + AuthSPA.current);
+    if (AuthSPA.current === 'verify') AuthSPA.initVerify();
+})();
+</script>
+</body></html>
+<?php
+    exit;
+}
+
 if ($action == 'login_process') {
     verifyCsrf();
     $identifier = trim($_POST['username'] ?? '');
     $p = $_POST['password'] ?? '';
+    $json = wants_json();
 
     if ($identifier === '' || $p === '') {
+        if ($json) auth_json_err('invalid');
         header("Location: index.php?error=1"); exit;
     }
 
@@ -2615,10 +3232,12 @@ if ($action == 'login_process') {
         $_SESSION['user'] = $ud['username'];
         $_SESSION['role'] = $ud['role'];
         logActivity($pdo, $ud['username'], 'login', null, 'ورود موفق');
+        if ($json) auth_json_ok(['redirect' => '?action=dashboard']);
         header("Location: ?action=dashboard"); exit;
     }
 
     logActivity($pdo, $identifier ?: 'unknown', 'login_failed', null, 'تلاش ناموفق');
+    if ($json) auth_json_err('invalid');
     header("Location: index.php?error=1"); exit;
 }
 
@@ -4058,8 +4677,12 @@ if ($action == 'register_step1') {
 
 // ─── POST: Step 1 process ────────────────────────────────────
 if ($action == 'register_step1_process') {
-    if (!registrationEnabled($pdo)) { header("Location: index.php"); exit; }
+    if (!registrationEnabled($pdo)) {
+        if (wants_json()) auth_json_err('registration_disabled');
+        header("Location: index.php"); exit;
+    }
     verifyCsrf();
+    $json = wants_json();
 
     $email           = trim(mb_strtolower($_POST['email'] ?? ''));
     $username        = trim($_POST['username'] ?? '');
@@ -4067,35 +4690,28 @@ if ($action == 'register_step1_process') {
     $passwordConfirm = $_POST['password_confirm'] ?? '';
     $captchaAnswer   = $_POST['captcha'] ?? '';
 
+    $regErr = function(string $err, string $extra = '') use ($email, $username, $json) {
+        if ($json) auth_json_err($err);
+        header("Location: ?action=register_step1&error={$err}&email=" . urlencode($email) . "&username=" . urlencode($username) . $extra); exit;
+    };
+
     // Captcha first (always invalidates regardless of outcome)
-    if (!math_captcha_verify($captchaAnswer)) {
-        header("Location: ?action=register_step1&error=captcha_wrong&email=" . urlencode($email) . "&username=" . urlencode($username)); exit;
-    }
-    if (!validate_email_address($email)) {
-        header("Location: ?action=register_step1&error=invalid_email&username=" . urlencode($username)); exit;
-    }
-    if (!validate_username($username)) {
-        header("Location: ?action=register_step1&error=invalid_username&email=" . urlencode($email)); exit;
-    }
-    if ($password !== $passwordConfirm) {
-        header("Location: ?action=register_step1&error=password_mismatch&email=" . urlencode($email) . "&username=" . urlencode($username)); exit;
-    }
-    if (!validate_password_strength($password)) {
-        header("Location: ?action=register_step1&error=weak_password&email=" . urlencode($email) . "&username=" . urlencode($username)); exit;
-    }
+    if (!math_captcha_verify($captchaAnswer)) { $regErr('captcha_wrong'); }
+    if (!validate_email_address($email))      { $regErr('invalid_email'); }
+    if (!validate_username($username))        { $regErr('invalid_username'); }
+    if ($password !== $passwordConfirm)       { $regErr('password_mismatch'); }
+    if (!validate_password_strength($password)) { $regErr('weak_password'); }
 
     // Referral code (if globally required)
     $referralId = null;
     if (getSetting($pdo, 'registration_requires_referral', '0') === '1') {
         $code = strtoupper(trim($_POST['referral_code'] ?? ''));
-        if ($code === '') {
-            header("Location: ?action=register_step1&error=referral_required&email=" . urlencode($email) . "&username=" . urlencode($username)); exit;
-        }
+        if ($code === '') { $regErr('referral_required'); }
         $rv = validate_referral_code($pdo, $code);
         if (!$rv['ok']) {
             $reason = $rv['reason'];
             $err = $reason === 'invalid' ? 'referral_invalid' : ($reason === 'expired' ? 'referral_expired' : 'referral_used');
-            header("Location: ?action=register_step1&error={$err}&email=" . urlencode($email) . "&username=" . urlencode($username) . "&ref=" . urlencode($code)); exit;
+            $regErr($err, '&ref=' . urlencode($code));
         }
         $referralId = $rv['id'];
     }
@@ -4103,9 +4719,7 @@ if ($action == 'register_step1_process') {
     // Username availability
     $st = $pdo->prepare("SELECT id FROM users WHERE username = ?");
     $st->execute([$username]);
-    if ($st->fetch()) {
-        header("Location: ?action=register_step1&error=username_taken&email=" . urlencode($email)); exit;
-    }
+    if ($st->fetch()) { $regErr('username_taken'); }
 
     // Email availability — anti-enumeration: if email exists, send a notification email
     // and pretend to step 2 anyway so attackers can't tell if email is registered
@@ -4131,6 +4745,7 @@ if ($action == 'register_step1_process') {
         $_SESSION['pending_register_otp_id'] = -1;
         $_SESSION['pending_fake_expires_at'] = time() + 1800;
         usleep(random_int(200000, 500000));
+        if ($json) auth_json_ok(['next_view' => 'verify', 'verify' => spa_verify_snapshot()]);
         header("Location: ?action=register_step2"); exit;
     }
 
@@ -4147,10 +4762,7 @@ if ($action == 'register_step1_process') {
     }
     $payload = json_encode($payloadArr);
     $result = request_email_otp($pdo, $email, 'register', $payload);
-    if (!$result['ok']) {
-        $err = $result['reason'] ?? 'send_failed';
-        header("Location: ?action=register_step1&error=" . urlencode($err) . "&email=" . urlencode($email) . "&username=" . urlencode($username)); exit;
-    }
+    if (!$result['ok']) { $regErr($result['reason'] ?? 'send_failed'); }
 
     $_SESSION['pending_registration'] = [
         'email'         => $email,
@@ -4164,6 +4776,7 @@ if ($action == 'register_step1_process') {
     $_SESSION['pending_register_otp_id'] = (int)$result['otp_id'];
     unset($_SESSION['pending_fake_expires_at']);
     logActivity($pdo, $username, 'register_otp_requested', $email);
+    if ($json) auth_json_ok(['next_view' => 'verify', 'verify' => spa_verify_snapshot()]);
     header("Location: ?action=register_step2"); exit;
 }
 
@@ -4416,9 +5029,14 @@ if ($action == 'register_step2') {
 
 // ─── POST: Resend / regenerate token (rate-limited) ──────────
 if ($action == 'register_resend_otp') {
-    if (!registrationEnabled($pdo)) { header("Location: index.php"); exit; }
+    if (!registrationEnabled($pdo)) {
+        if (wants_json()) auth_json_err('registration_disabled');
+        header("Location: index.php"); exit;
+    }
     verifyCsrf();
+    $json = wants_json();
     if (empty($_SESSION['pending_registration'])) {
+        if ($json) auth_json_err('no_session');
         header("Location: ?action=register_step1"); exit;
     }
     $pending = $_SESSION['pending_registration'];
@@ -4426,6 +5044,7 @@ if ($action == 'register_resend_otp') {
     // Session-level resend cap (3 per session)
     $count = (int)($_SESSION['register_resend_count'] ?? 0);
     if ($count >= 3) {
+        if ($json) auth_json_err('cooldown');
         header("Location: ?action=register_step2&error=cooldown"); exit;
     }
 
@@ -4436,6 +5055,7 @@ if ($action == 'register_resend_otp') {
         $_SESSION['pending_register_otp_id']            = -1;
         $_SESSION['pending_fake_expires_at']            = time() + 1800;
         $_SESSION['register_resend_count'] = $count + 1;
+        if ($json) auth_json_ok(['resent' => true, 'verify' => spa_verify_snapshot()]);
         header("Location: ?action=register_step2&msg=resent"); exit;
     }
 
@@ -4457,8 +5077,10 @@ if ($action == 'register_resend_otp') {
         $_SESSION['pending_register_otp_id'] = (int)$result['otp_id'];
         unset($_SESSION['pending_fake_expires_at']);
         $_SESSION['register_resend_count'] = $count + 1;
+        if ($json) auth_json_ok(['resent' => true, 'verify' => spa_verify_snapshot()]);
         header("Location: ?action=register_step2&msg=resent"); exit;
     }
+    if ($json) auth_json_err($result['reason'] ?? 'send_failed');
     header("Location: ?action=register_step2&error=" . urlencode($result['reason'] ?? 'send_failed')); exit;
 }
 
@@ -4515,13 +5137,16 @@ if ($action == 'forgot_password_step1') {
 // ─── POST: Step 1 process ────────────────────────────────────
 if ($action == 'forgot_password_step1_process') {
     verifyCsrf();
+    $json = wants_json();
     $email = trim(mb_strtolower($_POST['email'] ?? ''));
     $captchaAnswer = $_POST['captcha'] ?? '';
 
     if (!math_captcha_verify($captchaAnswer)) {
+        if ($json) auth_json_err('captcha_wrong');
         header("Location: ?action=forgot_password_step1&error=captcha_wrong"); exit;
     }
     if (!validate_email_address($email)) {
+        if ($json) auth_json_err('invalid_email');
         header("Location: ?action=forgot_password_step1&error=invalid_email"); exit;
     }
 
@@ -4550,6 +5175,7 @@ if ($action == 'forgot_password_step1_process') {
             // honestly — the user already knows they have an account, so leaking
             // the rate-limit is acceptable and necessary for UX.
             $err = $result['reason'] ?? 'send_failed';
+            if ($json) auth_json_err($err);
             header("Location: ?action=forgot_password_step1&error=" . urlencode($err) . "&email=" . urlencode($email));
             exit;
         }
@@ -4566,6 +5192,7 @@ if ($action == 'forgot_password_step1_process') {
         usleep(random_int(300000, 700000));
     }
 
+    if ($json) auth_json_ok(['next_view' => 'verify', 'verify' => spa_verify_snapshot()]);
     header("Location: ?action=forgot_password_step2&msg=sent"); exit;
 }
 
@@ -4835,11 +5462,14 @@ if ($action == 'forgot_password_step3') {
 // ─── POST: Step 3 process ────────────────────────────────────
 if ($action == 'forgot_password_step3_process') {
     verifyCsrf();
+    $json = wants_json();
     if (empty($_SESSION['reset_authorized_otp_id']) || empty($_SESSION['reset_authorized_at'])) {
+        if ($json) auth_json_err('no_session');
         header("Location: ?action=forgot_password_step1"); exit;
     }
     if (time() - (int)$_SESSION['reset_authorized_at'] > 300) {
         unset($_SESSION['reset_authorized_otp_id'], $_SESSION['reset_authorized_at']);
+        if ($json) auth_json_err('expired');
         header("Location: ?action=forgot_password_step1&error=expired"); exit;
     }
 
@@ -4848,12 +5478,15 @@ if ($action == 'forgot_password_step3_process') {
     $captchaAnswer = $_POST['captcha'] ?? '';
 
     if (!math_captcha_verify($captchaAnswer)) {
+        if ($json) auth_json_err('captcha_wrong');
         header("Location: ?action=forgot_password_step3&error=captcha_wrong"); exit;
     }
     if ($newPass !== $newPassConfirm) {
+        if ($json) auth_json_err('password_mismatch');
         header("Location: ?action=forgot_password_step3&error=password_mismatch"); exit;
     }
     if (!validate_password_strength($newPass)) {
+        if ($json) auth_json_err('weak_password');
         header("Location: ?action=forgot_password_step3&error=weak_password"); exit;
     }
 
@@ -4863,12 +5496,14 @@ if ($action == 'forgot_password_step3_process') {
     $otp = $st->fetch();
     if (!$otp) {
         unset($_SESSION['reset_authorized_otp_id'], $_SESSION['reset_authorized_at']);
+        if ($json) auth_json_err('no_session');
         header("Location: ?action=forgot_password_step1"); exit;
     }
     $payload = $otp['payload'] ? json_decode($otp['payload'], true) : [];
     $userId  = isset($payload['user_id']) ? (int)$payload['user_id'] : 0;
     if (!$userId) {
         unset($_SESSION['reset_authorized_otp_id'], $_SESSION['reset_authorized_at']);
+        if ($json) auth_json_err('no_session');
         header("Location: ?action=forgot_password_step1"); exit;
     }
 
@@ -4880,19 +5515,23 @@ if ($action == 'forgot_password_step3_process') {
     unset($_SESSION['reset_authorized_otp_id'], $_SESSION['reset_authorized_at'],
           $_SESSION['pending_password_reset'], $_SESSION['pending_reset_otp_id']);
 
+    if ($json) auth_json_ok(['redirect' => 'index.php?msg=password_reset_success']);
     header("Location: index.php?msg=password_reset_success"); exit;
 }
 
 // ─── POST: Resend reset token ────────────────────────────────
 if ($action == 'forgot_password_resend') {
     verifyCsrf();
+    $json = wants_json();
     if (empty($_SESSION['pending_password_reset'])) {
+        if ($json) auth_json_err('no_session');
         header("Location: ?action=forgot_password_step1"); exit;
     }
     $pending = $_SESSION['pending_password_reset'];
 
     $count = (int)($_SESSION['reset_resend_count'] ?? 0);
     if ($count >= 3) {
+        if ($json) auth_json_err('cooldown');
         header("Location: ?action=forgot_password_step2&error=cooldown"); exit;
     }
 
@@ -4902,6 +5541,7 @@ if ($action == 'forgot_password_resend') {
         $_SESSION['pending_reset_otp_id']                 = -1;
         $_SESSION['pending_fake_expires_at']              = time() + 1800;
         $_SESSION['reset_resend_count'] = $count + 1;
+        if ($json) auth_json_ok(['resent' => true, 'verify' => spa_verify_snapshot()]);
         header("Location: ?action=forgot_password_step2&msg=resent"); exit;
     }
 
@@ -4919,8 +5559,10 @@ if ($action == 'forgot_password_resend') {
         $_SESSION['pending_reset_otp_id'] = (int)$result['otp_id'];
         unset($_SESSION['pending_fake_expires_at']);
         $_SESSION['reset_resend_count'] = $count + 1;
+        if ($json) auth_json_ok(['resent' => true, 'verify' => spa_verify_snapshot()]);
         header("Location: ?action=forgot_password_step2&msg=resent"); exit;
     }
+    if ($json) auth_json_err($result['reason'] ?? 'send_failed');
     header("Location: ?action=forgot_password_step2&error=" . urlencode($result['reason'] ?? 'send_failed')); exit;
 }
 
@@ -5032,23 +5674,27 @@ if ($action == 'inbound_status') {
  */
 if ($action == 'inbound_check_now') {
     verifyCsrf();
+    $json = wants_json();
     $redirect = $_POST['redirect'] ?? 'register_step2';
     $allowedRedirects = ['register_step2', 'forgot_password_step2', 'inbound_settings'];
     if (!in_array($redirect, $allowedRedirects, true)) $redirect = 'register_step2';
 
     $last = (int)($_SESSION['inbound_check_last'] ?? 0);
     if (time() - $last < 10) {
+        if ($json) auth_json_err('rate_limit');
         header("Location: ?action=$redirect&error=rate_limit"); exit;
     }
     $_SESSION['inbound_check_last'] = time();
 
     if (getSetting($pdo, 'inbound_enabled', '1') !== '1') {
+        if ($json) auth_json_err('check_disabled');
         header("Location: ?action=$redirect&error=check_disabled"); exit;
     }
 
     $stats = inbound_run($pdo, 20);
     $matched = (int)($stats['matched'] ?? 0);
     $busy    = (!empty($stats['error']) && $stats['error'] === 'busy') ? '1' : '0';
+    if ($json) auth_json_ok(['matched' => $matched, 'busy' => $busy === '1']);
     header("Location: ?action=$redirect&msg=checked&matched=$matched&busy=$busy"); exit;
 }
 
@@ -5378,7 +6024,7 @@ if($action=='index'){
             <div class="field"><label>نام کاربری یا ایمیل</label><input type="text" name="username" placeholder="نام کاربری یا ایمیل" required autocomplete="username"></div>
             <div class="field"><label>رمز عبور</label><input type="password" name="password" placeholder="••••••••" required autocomplete="current-password">
                 <div style="text-align:left;margin-top:6px">
-                  <a href="?action=forgot_password_step1" style="color:#3b82f6;text-decoration:none;font-size:.8rem">بازیابی رمز عبور</a>
+                  <a href="?action=auth_shell&amp;view=forgot" style="color:#3b82f6;text-decoration:none;font-size:.8rem">بازیابی رمز عبور</a>
                 </div>
             </div>
             <button type="submit" class="submit-btn">ورود به سیستم</button>
@@ -5391,7 +6037,7 @@ if($action=='index'){
         <div id="pkSt"></div>
         <?php if (registrationEnabled($pdo)): ?>
         <div style="text-align:center;margin-top:18px;font-size:.85rem;color:#94a3b8">
-          حساب ندارید؟ <a href="?action=register_step1" style="color:#3b82f6;text-decoration:none;font-weight:600">ثبت‌نام در XCloud</a>
+          حساب ندارید؟ <a href="?action=auth_shell&amp;view=register" style="color:#3b82f6;text-decoration:none;font-weight:600">ثبت‌نام در XCloud</a>
         </div>
         <?php endif; ?>
     </div>

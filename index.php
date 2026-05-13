@@ -1370,6 +1370,353 @@ function renderSharePageStyles(): string {
     ";
 }
 
+function getAuthSharedCss(): string {
+    return getDanaFontFaceCss() . <<<'CSS'
+body {
+    margin: 0;
+    font-family: 'Dana', -apple-system, system-ui, Tahoma, sans-serif;
+    background: #0a0e1a;
+    color: #e2e8f0;
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 20px;
+    position: relative;
+    overflow-x: hidden;
+}
+*, *::before, *::after { box-sizing: border-box; }
+.bg-glow {
+    position: fixed;
+    border-radius: 50%;
+    filter: blur(80px);
+    z-index: 0;
+    pointer-events: none;
+}
+.bg-glow-1 {
+    width: 400px; height: 400px;
+    background: radial-gradient(circle, rgba(59,130,246,.25), transparent);
+    top: -100px; right: -100px;
+}
+.bg-glow-2 {
+    width: 350px; height: 350px;
+    background: radial-gradient(circle, rgba(139,92,246,.2), transparent);
+    bottom: -100px; left: -100px;
+}
+.auth-card {
+    position: relative;
+    z-index: 1;
+    max-width: 440px;
+    width: 100%;
+    background: rgba(17,24,39,.85);
+    backdrop-filter: blur(12px);
+    border: 1.5px solid rgba(255,255,255,.06);
+    border-radius: 20px;
+    padding: 36px 32px;
+    box-shadow: 0 20px 60px rgba(0,0,0,.4);
+}
+.auth-card h1 {
+    font-size: 1.5rem;
+    margin: 0 0 10px;
+    background: linear-gradient(135deg,#3b82f6,#8b5cf6);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+    text-align: center;
+    font-weight: 900;
+}
+.auth-subtitle {
+    color: #94a3b8;
+    font-size: .85rem;
+    text-align: center;
+    margin-bottom: 24px;
+    line-height: 1.7;
+}
+.field { margin-bottom: 14px; }
+.field label {
+    display: block;
+    color: #cbd5e1;
+    font-size: .82rem;
+    margin-bottom: 6px;
+    font-weight: 600;
+}
+.field input {
+    width: 100%;
+    background: rgba(15,23,42,.6);
+    border: 1.5px solid rgba(255,255,255,.06);
+    color: #f1f5f9;
+    padding: 11px 14px;
+    border-radius: 12px;
+    font-family: inherit;
+    font-size: .9rem;
+    box-sizing: border-box;
+    transition: border-color .2s, background .2s;
+}
+.field input:focus {
+    outline: none;
+    border-color: #3b82f6;
+    background: rgba(15,23,42,.9);
+}
+.field .hint { color: #64748b; font-size: .72rem; margin-top: 4px; }
+.btn-primary {
+    width: 100%;
+    background: linear-gradient(135deg,#3b82f6,#6366f1);
+    color: #fff;
+    border: none;
+    padding: 13px;
+    border-radius: 12px;
+    font-weight: 700;
+    font-size: .95rem;
+    cursor: pointer;
+    font-family: inherit;
+    margin-top: 8px;
+    transition: transform .1s, box-shadow .2s;
+    display: block;
+    text-decoration: none;
+    text-align: center;
+    box-sizing: border-box;
+}
+.btn-primary:hover { box-shadow: 0 10px 30px rgba(59,130,246,.3); }
+.btn-primary:active { transform: scale(.98); }
+.btn-secondary {
+    width: 100%;
+    background: rgba(51,65,85,.5);
+    color: #e2e8f0;
+    border: 1.5px solid rgba(255,255,255,.06);
+    padding: 12px;
+    border-radius: 12px;
+    font-weight: 600;
+    font-family: inherit;
+    cursor: pointer;
+    margin-top: 8px;
+    font-size: .9rem;
+    transition: background .15s;
+}
+.btn-secondary:hover { background: rgba(51,65,85,.8); }
+.alert-err {
+    background: rgba(127,29,29,.4);
+    border: 1px solid rgba(239,68,68,.3);
+    color: #fee2e2;
+    padding: 10px 14px;
+    border-radius: 10px;
+    margin-bottom: 16px;
+    font-size: .85rem;
+    text-align: center;
+}
+.alert-ok {
+    background: rgba(20,83,45,.4);
+    border: 1px solid rgba(34,197,94,.3);
+    color: #bbf7d0;
+    padding: 10px 14px;
+    border-radius: 10px;
+    margin-bottom: 16px;
+    font-size: .85rem;
+    text-align: center;
+}
+.alert-info {
+    background: rgba(30,58,138,.3);
+    border: 1px solid rgba(59,130,246,.3);
+    color: #bfdbfe;
+    padding: 10px 14px;
+    border-radius: 10px;
+    margin-bottom: 16px;
+    font-size: .8rem;
+    line-height: 1.6;
+}
+.alert-info b { color: #93c5fd; }
+.links-row {
+    display: flex;
+    justify-content: space-between;
+    margin-top: 16px;
+    font-size: .82rem;
+    color: #94a3b8;
+    gap: 10px;
+    flex-wrap: wrap;
+}
+.links-row a {
+    color: #3b82f6;
+    text-decoration: none;
+    font-weight: 600;
+}
+.text-link {
+    background: none;
+    border: none;
+    color: #3b82f6;
+    font-weight: 600;
+    cursor: pointer;
+    font-family: inherit;
+    font-size: inherit;
+    padding: 0;
+}
+.captcha-box {
+    background: rgba(15,23,42,.6);
+    border: 1.5px solid rgba(255,255,255,.06);
+    padding: 8px;
+    border-radius: 12px;
+    margin-bottom: 8px;
+    text-align: center;
+}
+.captcha-box img {
+    display: inline-block;
+    border-radius: 6px;
+    max-width: 100%;
+}
+.verify-block {
+    background: rgba(15,23,42,.4);
+    border: 1px solid rgba(255,255,255,.05);
+    border-radius: 12px;
+    padding: 12px 14px;
+    margin-bottom: 10px;
+}
+.verify-block.center {
+    background: linear-gradient(135deg, rgba(59,130,246,.08), rgba(139,92,246,.08));
+    border-color: rgba(59,130,246,.2);
+    padding: 18px 14px;
+    text-align: center;
+}
+.block-label {
+    display: block;
+    color: #64748b;
+    font-size: .7rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: .08em;
+    margin-bottom: 6px;
+}
+.block-value-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.block-value {
+    flex: 1;
+    color: #fde68a;
+    font-family: 'JetBrains Mono', Consolas, monospace;
+    font-size: .95rem;
+    direction: ltr;
+    text-align: left;
+    overflow-wrap: anywhere;
+}
+.block-value-plain {
+    color: #cbd5e1;
+    font-family: 'JetBrains Mono', Consolas, monospace;
+    font-size: .88rem;
+    direction: ltr;
+    display: block;
+    text-align: center;
+}
+.code-display {
+    font-family: 'JetBrains Mono', Consolas, monospace;
+    font-size: 2.6rem;
+    font-weight: 700;
+    color: #a5b4fc;
+    letter-spacing: .15em;
+    margin: 8px 0;
+    padding: 8px;
+    direction: ltr;
+    user-select: all;
+    cursor: pointer;
+}
+.copy-btn {
+    background: rgba(51,65,85,.6);
+    color: #e2e8f0;
+    border: 1px solid rgba(255,255,255,.06);
+    border-radius: 8px;
+    padding: 6px 10px;
+    cursor: pointer;
+    font-size: .9rem;
+    font-family: inherit;
+    transition: background .15s;
+}
+.copy-btn:hover { background: rgba(71,85,105,.8); }
+.copy-btn.copied { background: rgba(20,83,45,.6); color: #bbf7d0; }
+.copy-btn-wide {
+    width: 100%;
+    background: rgba(51,65,85,.5);
+    color: #cbd5e1;
+    border: 1px solid rgba(255,255,255,.06);
+    border-radius: 10px;
+    padding: 10px;
+    cursor: pointer;
+    font-family: inherit;
+    font-size: .85rem;
+    font-weight: 600;
+    margin-top: 8px;
+}
+.copy-btn-wide.copied { background: rgba(20,83,45,.5); color: #bbf7d0; }
+.check-btn { position: relative; display: flex; align-items: center; justify-content: center; gap: 8px; }
+.check-btn[disabled] { opacity: .6; cursor: not-allowed; }
+.spinner-sm {
+    width: 14px; height: 14px;
+    border: 2px solid rgba(255,255,255,.2);
+    border-top-color: #cbd5e1;
+    border-radius: 50%;
+    animation: spin .7s linear infinite;
+    display: inline-block;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+.status-line {
+    margin-top: 16px;
+    padding: 12px;
+    background: rgba(15,23,42,.4);
+    border: 1px solid rgba(255,255,255,.06);
+    border-radius: 12px;
+    text-align: center;
+    font-size: .85rem;
+    color: #cbd5e1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
+}
+.status-line.ok {
+    background: rgba(20,83,45,.4);
+    color: #bbf7d0;
+    border-color: rgba(34,197,94,.3);
+}
+.status-line.fail {
+    background: rgba(127,29,29,.4);
+    color: #fee2e2;
+    border-color: rgba(239,68,68,.3);
+}
+.spinner {
+    width: 16px; height: 16px;
+    border: 2px solid rgba(255,255,255,.1);
+    border-top-color: #3b82f6;
+    border-radius: 50%;
+    animation: spin .8s linear infinite;
+}
+.timer-wrap {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    margin-top: 14px;
+    position: relative;
+}
+.timer-ring { transform: rotate(-90deg); }
+.timer-track {
+    fill: none;
+    stroke: rgba(255,255,255,.08);
+    stroke-width: 6;
+}
+.timer-progress {
+    fill: none;
+    stroke: url(#timerGrad);
+    stroke-width: 6;
+    stroke-linecap: round;
+    stroke-dasharray: 264;
+    stroke-dashoffset: 0;
+    transition: stroke-dashoffset 1s linear;
+}
+.timer-text {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    font-family: 'JetBrains Mono', Consolas, monospace;
+    font-size: .85rem;
+    color: #a5b4fc;
+    font-weight: 700;
+}
+CSS;
+}
+
 function renderSharePublicPage(array $share): void {
     $filePath = getUserUploadPath($share['owner']) . $share['file_name'];
     $ext = strtolower(pathinfo($share['file_name'], PATHINFO_EXTENSION));
@@ -3498,29 +3845,22 @@ if ($action == 'register_step1') {
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>ثبت‌نام در XCloud</title>
+<?= renderHeadAssets() ?>
 <style>
-body{margin:0;font-family:Tahoma,system-ui,sans-serif;background:#0f172a;color:#e2e8f0;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:20px}
-.card{max-width:440px;width:100%;background:#1e293b;border:1px solid #334155;border-radius:14px;padding:32px;box-shadow:0 10px 40px rgba(0,0,0,.3)}
-h1{font-size:1.4rem;margin:0 0 8px;color:#f1f5f9;text-align:center}
-.subtitle{color:#94a3b8;font-size:.85rem;text-align:center;margin-bottom:24px}
-.field{margin-bottom:16px}
-label{display:block;color:#cbd5e1;font-size:.85rem;margin-bottom:6px;font-weight:600}
-input{width:100%;background:#0f172a;border:1px solid #334155;color:#f1f5f9;padding:11px 12px;border-radius:8px;font-size:.9rem;font-family:inherit;box-sizing:border-box}
-input:focus{outline:none;border-color:#3b82f6;background:#1e293b}
-.hint{color:#64748b;font-size:.75rem;margin-top:4px}
-.captcha{background:#0f172a;border:1px dashed #475569;padding:10px 14px;border-radius:8px;color:#fde68a;font-weight:700;text-align:center;margin-bottom:8px;font-size:1rem}
-.btn{width:100%;background:#3b82f6;color:#fff;border:none;padding:12px;border-radius:8px;font-weight:700;font-size:.95rem;cursor:pointer;font-family:inherit;margin-top:8px}
-.btn:hover{background:#2563eb}
-.err{background:#7f1d1d;color:#fee2e2;padding:10px 14px;border-radius:8px;margin-bottom:16px;font-size:.85rem;text-align:center}
-.links{text-align:center;margin-top:18px;font-size:.85rem;color:#94a3b8}
-.links a{color:#3b82f6;text-decoration:none;font-weight:600}
+<?= getAuthSharedCss() ?>
 </style>
 </head>
 <body>
-<div class="card">
+<div class="bg-glow bg-glow-1"></div>
+<div class="bg-glow bg-glow-2"></div>
+<div class="auth-card">
   <h1>📝 ثبت‌نام در XCloud</h1>
-  <div class="subtitle">با تأیید ایمیل، حساب جدید بسازید</div>
-  <?php if ($errMsg): ?><div class="err"><?= $errMsg ?></div><?php endif; ?>
+  <div class="auth-subtitle">با تأیید ایمیل، حساب جدید بسازید</div>
+  <?php if ($errMsg): ?><div class="alert-err"><?= $errMsg ?></div><?php endif; ?>
+  <div class="alert-info">
+    💡 <b>توصیه می‌شود</b> از ایمیل‌های ایرانی استفاده کنید (mail.ir، chmail.ir، mailfa.com).
+    تأیید این ایمیل‌ها سریع‌تر و قابل‌اعتمادتر است. سایر ایمیل‌ها هم پذیرفته می‌شوند.
+  </div>
   <form method="POST" action="?action=register_step1_process">
     <input type="hidden" name="csrf_token" value="<?= h($csrf) ?>">
     <div class="field">
@@ -3543,13 +3883,14 @@ input:focus{outline:none;border-color:#3b82f6;background:#1e293b}
     </div>
     <div class="field">
       <label>پاسخ این محاسبه چیست؟</label>
-      <div class="captcha-box" style="background:#0f172a;border:1px solid #334155;padding:8px;border-radius:8px;margin-bottom:8px;text-align:center"><img src="?action=captcha_image&amp;v=<?= time() ?>" alt="کپچا" width="160" height="50" style="display:inline-block"></div>
+      <div class="captcha-box"><img src="?action=captcha_image&amp;v=<?= time() ?>" alt="کپچا" width="160" height="50"></div>
       <input type="text" name="captcha" required inputmode="numeric" autocomplete="off">
     </div>
-    <button type="submit" class="btn">ارسال کد تأیید</button>
+    <button type="submit" class="btn-primary">ارسال کد تأیید</button>
   </form>
-  <div class="links">
-    قبلاً ثبت‌نام کرده‌اید؟ <a href="index.php">ورود</a>
+  <div class="links-row" style="justify-content:center">
+    <span style="color:#94a3b8">قبلاً ثبت‌نام کرده‌اید؟</span>
+    <a href="index.php">ورود</a>
   </div>
 </div>
 </body>
@@ -3689,102 +4030,119 @@ if ($action == 'register_step2') {
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>تأیید ایمیل — XCloud</title>
+<?= renderHeadAssets() ?>
 <style>
-body{margin:0;font-family:Tahoma,system-ui,sans-serif;background:#0f172a;color:#e2e8f0;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:20px}
-.card{max-width:520px;width:100%;background:#1e293b;border:1px solid #334155;border-radius:14px;padding:28px;box-shadow:0 10px 40px rgba(0,0,0,.3)}
-h1{font-size:1.35rem;margin:0 0 8px;color:#f1f5f9;text-align:center}
-.subtitle{color:#94a3b8;font-size:.85rem;text-align:center;margin-bottom:18px;line-height:1.8}
-.info-block{background:#0f172a;border:1px solid #334155;border-radius:10px;padding:12px 14px;margin-bottom:10px;display:flex;align-items:center;justify-content:space-between;gap:10px}
-.info-label{color:#94a3b8;font-size:.75rem;font-weight:600;min-width:48px}
-.info-value{flex:1;color:#fde68a;font-family:Consolas,monospace;font-size:.95rem;direction:ltr;text-align:left;overflow-wrap:anywhere}
-.info-value.token{color:#a5b4fc;font-weight:700;font-size:1.05rem;letter-spacing:.05em}
-.copy-btn{background:#334155;color:#e2e8f0;border:none;border-radius:6px;padding:6px 10px;font-size:.72rem;cursor:pointer;font-family:inherit;flex-shrink:0}
-.copy-btn:hover{background:#475569}
-.copy-btn.copied{background:#14532d;color:#bbf7d0}
-.btn{display:block;width:100%;background:#3b82f6;color:#fff;border:none;padding:12px;border-radius:8px;font-weight:700;font-size:.95rem;cursor:pointer;font-family:inherit;margin-top:12px;text-decoration:none;text-align:center;box-sizing:border-box}
-.btn:hover{background:#2563eb}
-.btn-secondary{background:#475569;margin-top:8px}
-.btn-secondary:hover{background:#334155}
-.status{margin-top:16px;padding:12px;background:#0f172a;border:1px solid #334155;border-radius:8px;text-align:center;font-size:.88rem;color:#cbd5e1;display:flex;align-items:center;justify-content:center;gap:10px}
-.spinner{width:14px;height:14px;border:2px solid #334155;border-top-color:#3b82f6;border-radius:50%;animation:spin .8s linear infinite}
-@keyframes spin{to{transform:rotate(360deg)}}
-.status.ok{background:#14532d;color:#bbf7d0;border-color:#166534}
-.status.fail{background:#7f1d1d;color:#fee2e2;border-color:#991b1b}
-.err{background:#7f1d1d;color:#fee2e2;padding:10px 14px;border-radius:8px;margin-bottom:16px;font-size:.85rem;text-align:center}
-.ok{background:#14532d;color:#bbf7d0;padding:10px 14px;border-radius:8px;margin-bottom:16px;font-size:.85rem;text-align:center}
-.timer{text-align:center;color:#94a3b8;font-size:.78rem;margin-top:8px}
-.links-row{display:flex;justify-content:space-between;margin-top:14px;font-size:.82rem;color:#94a3b8}
-.links-row a{color:#3b82f6;text-decoration:none;font-weight:600}
-.hint{color:#64748b;font-size:.78rem;text-align:center;margin-top:14px;line-height:1.7}
+<?= getAuthSharedCss() ?>
 </style>
 </head>
 <body>
-<div class="card">
+<div class="bg-glow bg-glow-1"></div>
+<div class="bg-glow bg-glow-2"></div>
+<div class="auth-card verify-card">
   <h1>📨 تأیید ایمیل</h1>
-  <div class="subtitle">برای تایید ایمیلت، یک پیام از همان آدرس به ما بفرست — موضوع و گیرنده را از کادرهای زیر بردار.</div>
-  <?php if ($errMsg): ?><div class="err"><?= $errMsg ?></div><?php endif; ?>
-  <?php if ($msgText): ?><div class="ok"><?= $msgText ?></div><?php endif; ?>
+  <div class="auth-subtitle">یک ایمیل از آدرس زیر به ما بفرست — موضوع همان کد تأیید است.</div>
+  <?php if ($errMsg): ?><div class="alert-err"><?= $errMsg ?></div><?php endif; ?>
+  <?php if ($msgText): ?><div class="alert-ok"><?= $msgText ?></div><?php endif; ?>
 
-  <div class="info-block">
-    <span class="info-label">به:</span>
-    <span class="info-value" id="infoTo"><?= h($toAddr) ?></span>
-    <button type="button" class="copy-btn" data-target="infoTo">کپی</button>
-  </div>
-  <div class="info-block">
-    <span class="info-label">موضوع:</span>
-    <span class="info-value token" id="infoSubject"><?= h($token) ?></span>
-    <button type="button" class="copy-btn" data-target="infoSubject">کپی</button>
-  </div>
-  <div class="info-block">
-    <span class="info-label">از:</span>
-    <span class="info-value" id="infoFrom"><?= h($pending['email']) ?></span>
-    <button type="button" class="copy-btn" data-target="infoFrom">کپی</button>
+  <!-- TOP: XCloud email -->
+  <div class="verify-block top">
+    <span class="block-label">📬 ایمیل ما (گیرنده)</span>
+    <div class="block-value-row">
+      <span class="block-value" id="xcloudEmail"><?= h($toAddr) ?></span>
+      <button type="button" class="copy-btn" data-target="xcloudEmail" aria-label="کپی">📋</button>
+    </div>
   </div>
 
-  <a class="btn" href="<?= h($mailtoHref) ?>">📧 باز کردن برنامهٔ ایمیل</a>
+  <!-- CENTER: Big code -->
+  <div class="verify-block center">
+    <span class="block-label">🔑 کد تأیید (موضوع ایمیل)</span>
+    <div class="code-display" id="verifyCode"><?= h($token) ?></div>
+    <button type="button" class="copy-btn-wide" data-target="verifyCode">📋 کپی کد</button>
+  </div>
 
-  <form method="POST" action="?action=inbound_check_now" style="margin:0">
+  <!-- BOTTOM: User email -->
+  <div class="verify-block bottom">
+    <span class="block-label">از</span>
+    <span class="block-value-plain"><?= h($pending['email']) ?></span>
+  </div>
+
+  <!-- Internal email hint -->
+  <div class="alert-info" style="margin-top:14px">
+    💡 توصیه: از ایمیل‌های ایرانی (mail.ir، chmail.ir، mailfa.com) استفاده کنید — تأییدشان سریع‌تر است.
+  </div>
+
+  <a class="btn-primary" href="<?= h($mailtoHref) ?>">📧 باز کردن برنامهٔ ایمیل</a>
+
+  <form method="POST" action="?action=inbound_check_now" id="manualCheckForm" style="margin:0">
     <input type="hidden" name="csrf_token" value="<?= h($csrf) ?>">
     <input type="hidden" name="redirect" value="register_step2">
-    <button type="submit" class="btn btn-secondary">🔄 چک کردن دستی</button>
+    <button type="submit" class="btn-secondary check-btn" id="manualCheckBtn">
+      <span class="check-btn-default">🔄 چک کردن دستی</span>
+      <span class="check-btn-loading" hidden><span class="spinner-sm"></span> در حال بررسی...</span>
+      <span class="check-btn-cooldown" hidden>⏳ <span id="cooldownNum">10</span> ثانیه...</span>
+    </button>
   </form>
 
-  <div class="status" id="statusLine">
+  <div class="status-line" id="statusLine">
     <span class="spinner" id="statusSpin"></span>
     <span id="statusText">منتظر دریافت ایمیلت هستیم...</span>
   </div>
-  <div class="timer" id="otpTimer"></div>
+
+  <div class="timer-wrap">
+    <svg class="timer-ring" viewBox="0 0 100 100" width="80" height="80">
+      <defs>
+        <linearGradient id="timerGrad" x1="0" y1="0" x2="1" y2="1">
+          <stop offset="0%" stop-color="#3b82f6"/>
+          <stop offset="100%" stop-color="#8b5cf6"/>
+        </linearGradient>
+      </defs>
+      <circle class="timer-track" cx="50" cy="50" r="42" />
+      <circle class="timer-progress" cx="50" cy="50" r="42" id="timerCircle"/>
+    </svg>
+    <div class="timer-text" id="timerText">--:--</div>
+  </div>
 
   <div class="links-row">
     <a href="?action=register_step1">تغییر ایمیل</a>
     <form method="POST" action="?action=register_resend_otp" style="display:inline;margin:0">
       <input type="hidden" name="csrf_token" value="<?= h($csrf) ?>">
-      <button type="submit" style="background:none;border:none;color:#3b82f6;font-weight:600;cursor:pointer;font-family:inherit;font-size:inherit;padding:0">صدور توکن جدید</button>
+      <button type="submit" class="text-link">صدور کد جدید</button>
     </form>
   </div>
-
-  <div class="hint">پیام را از همان آدرسی که بالا نشان داده شده بفرست. تا ۱ دقیقه بعد از رسیدن، حسابت ساخته می‌شود.</div>
 </div>
 <script>
 (function(){
   var expires = <?= (int)$expiresAtTs ?>;
-  var timerEl = document.getElementById('otpTimer');
-  function tick(){
-    var s = expires - Math.floor(Date.now()/1000);
-    if (s <= 0){ timerEl.textContent = '⏰ توکن منقضی شد — صدور توکن جدید لازم است.'; timerEl.style.color='#fca5a5'; return; }
-    var m = Math.floor(s/60), r = s%60;
-    timerEl.textContent = 'اعتبار توکن: ' + m + ':' + (r<10?'0':'') + r;
-    setTimeout(tick, 1000);
-  } tick();
+  var totalSec = 30 * 60;
+
+  // Timer ring
+  function tickTimer(){
+    var nowSec = Math.floor(Date.now()/1000);
+    var leftSec = Math.max(0, expires - nowSec);
+    var m = Math.floor(leftSec/60), r = leftSec%60;
+    var timerText = document.getElementById('timerText');
+    var timerCircle = document.getElementById('timerCircle');
+    if (leftSec <= 0) {
+      timerText.textContent = 'منقضی';
+      timerText.style.color = '#fca5a5';
+      if (timerCircle) timerCircle.style.strokeDashoffset = 264;
+      return;
+    }
+    timerText.textContent = m + ':' + (r<10?'0':'') + r;
+    var pct = leftSec / totalSec;
+    if (timerCircle) timerCircle.style.strokeDashoffset = (264 - 264 * pct);
+    setTimeout(tickTimer, 1000);
+  }
+  tickTimer();
 
   // Copy buttons
-  document.querySelectorAll('.copy-btn').forEach(function(btn){
+  document.querySelectorAll('.copy-btn, .copy-btn-wide').forEach(function(btn){
     btn.addEventListener('click', function(){
       var t = document.getElementById(btn.getAttribute('data-target'));
       if (!t) return;
       var txt = t.textContent.trim();
       if (navigator.clipboard && window.isSecureContext) {
-        navigator.clipboard.writeText(txt).then(showCopied);
+        navigator.clipboard.writeText(txt).then(showCopied, showCopied);
       } else {
         var ta = document.createElement('textarea');
         ta.value = txt; ta.style.position='fixed'; ta.style.opacity=0;
@@ -3794,15 +4152,52 @@ h1{font-size:1.35rem;margin:0 0 8px;color:#f1f5f9;text-align:center}
         showCopied();
       }
       function showCopied(){
-        var orig = btn.textContent;
-        btn.classList.add('copied'); btn.textContent = '✓';
-        setTimeout(function(){ btn.classList.remove('copied'); btn.textContent = orig; }, 1200);
+        var orig = btn.innerHTML;
+        btn.classList.add('copied');
+        btn.innerHTML = btn.classList.contains('copy-btn-wide') ? '✓ کپی شد' : '✓';
+        setTimeout(function(){ btn.classList.remove('copied'); btn.innerHTML = orig; }, 1200);
       }
     });
   });
 
+  // Manual check button with 10s rate limit + animated states
+  var checkForm = document.getElementById('manualCheckForm');
+  var checkBtn = document.getElementById('manualCheckBtn');
+  var lastClick = parseInt(localStorage.getItem('xc_last_check') || '0', 10);
+  var cooldownMs = 10000;
+
+  function showCooldown(){
+    checkBtn.disabled = true;
+    checkBtn.querySelector('.check-btn-default').hidden = true;
+    checkBtn.querySelector('.check-btn-loading').hidden = true;
+    var cd = checkBtn.querySelector('.check-btn-cooldown');
+    cd.hidden = false;
+    var num = document.getElementById('cooldownNum');
+    var timer = setInterval(function(){
+      var left = Math.ceil((cooldownMs - (Date.now() - lastClick)) / 1000);
+      if (left <= 0) {
+        clearInterval(timer);
+        checkBtn.disabled = false;
+        cd.hidden = true;
+        checkBtn.querySelector('.check-btn-default').hidden = false;
+      } else {
+        num.textContent = left;
+      }
+    }, 250);
+  }
+  if (Date.now() - lastClick < cooldownMs) showCooldown();
+
+  if (checkForm) {
+    checkForm.addEventListener('submit', function(e){
+      if (Date.now() - lastClick < cooldownMs) { e.preventDefault(); return; }
+      lastClick = Date.now();
+      localStorage.setItem('xc_last_check', lastClick.toString());
+      checkBtn.querySelector('.check-btn-default').hidden = true;
+      checkBtn.querySelector('.check-btn-loading').hidden = false;
+    });
+  }
+
   // Status polling
-  var pollTimer = null;
   var spin = document.getElementById('statusSpin');
   var txt  = document.getElementById('statusText');
   var line = document.getElementById('statusLine');
@@ -3824,12 +4219,12 @@ h1{font-size:1.35rem;margin:0 0 8px;color:#f1f5f9;text-align:center}
         setTimeout(function(){ window.location = j.redirect || '?action=dashboard'; }, 800);
         return;
       }
-      if (j.status === 'expired') { stopped = true; setState('fail', '⏰ توکن منقضی شده است.'); return; }
+      if (j.status === 'expired') { stopped = true; setState('fail', '⏰ کد منقضی شده است.'); return; }
       if (j.status === 'race_error') { stopped = true; setState('fail', j.message || 'خطا در ساخت حساب — لطفاً دوباره تلاش کن.'); return; }
       if (j.status === 'no_session') { stopped = true; setState('fail', 'نشست منقضی شد.'); return; }
-      pollTimer = setTimeout(poll, 5000);
+      setTimeout(poll, 5000);
     } catch (e) {
-      pollTimer = setTimeout(poll, 8000);
+      setTimeout(poll, 8000);
     }
   }
   poll();
@@ -3910,24 +4305,16 @@ if ($action == 'forgot_password_step1') {
     ][$err] ?? '';
 ?>
 <!DOCTYPE html><html lang="fa" dir="rtl"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>بازیابی رمز عبور — XCloud</title>
+<?= renderHeadAssets() ?>
 <style>
-body{margin:0;font-family:Tahoma,sans-serif;background:#0f172a;color:#e2e8f0;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:20px}
-.card{max-width:440px;width:100%;background:#1e293b;border:1px solid #334155;border-radius:14px;padding:32px}
-h1{font-size:1.4rem;margin:0 0 8px;color:#f1f5f9;text-align:center}
-.subtitle{color:#94a3b8;font-size:.85rem;text-align:center;margin-bottom:24px}
-.field{margin-bottom:16px}
-label{display:block;color:#cbd5e1;font-size:.85rem;margin-bottom:6px;font-weight:600}
-input{width:100%;background:#0f172a;border:1px solid #334155;color:#f1f5f9;padding:11px 12px;border-radius:8px;font-size:.9rem;font-family:inherit;box-sizing:border-box}
-.captcha{background:#0f172a;border:1px dashed #475569;padding:10px 14px;border-radius:8px;color:#fde68a;font-weight:700;text-align:center;margin-bottom:8px}
-.btn{width:100%;background:#3b82f6;color:#fff;border:none;padding:12px;border-radius:8px;font-weight:700;cursor:pointer;font-family:inherit}
-.err{background:#7f1d1d;color:#fee2e2;padding:10px 14px;border-radius:8px;margin-bottom:16px;font-size:.85rem;text-align:center}
-.links{text-align:center;margin-top:18px;font-size:.85rem;color:#94a3b8}
-.links a{color:#3b82f6;text-decoration:none;font-weight:600}
+<?= getAuthSharedCss() ?>
 </style></head><body>
-<div class="card">
+<div class="bg-glow bg-glow-1"></div>
+<div class="bg-glow bg-glow-2"></div>
+<div class="auth-card">
   <h1>🔑 بازیابی رمز عبور</h1>
-  <div class="subtitle">ایمیل خود را وارد کنید تا کد بازیابی برایتان ارسال شود</div>
-  <?php if ($errMsg): ?><div class="err"><?= $errMsg ?></div><?php endif; ?>
+  <div class="auth-subtitle">ایمیل خود را وارد کنید تا کد بازیابی برایتان ارسال شود</div>
+  <?php if ($errMsg): ?><div class="alert-err"><?= $errMsg ?></div><?php endif; ?>
   <form method="POST" action="?action=forgot_password_step1_process">
     <input type="hidden" name="csrf_token" value="<?= h($csrf) ?>">
     <div class="field">
@@ -3936,12 +4323,12 @@ input{width:100%;background:#0f172a;border:1px solid #334155;color:#f1f5f9;paddi
     </div>
     <div class="field">
       <label>پاسخ این محاسبه چیست؟</label>
-      <div class="captcha-box" style="background:#0f172a;border:1px solid #334155;padding:8px;border-radius:8px;margin-bottom:8px;text-align:center"><img src="?action=captcha_image&amp;v=<?= time() ?>" alt="کپچا" width="160" height="50" style="display:inline-block"></div>
+      <div class="captcha-box"><img src="?action=captcha_image&amp;v=<?= time() ?>" alt="کپچا" width="160" height="50"></div>
       <input type="text" name="captcha" required inputmode="numeric" autocomplete="off">
     </div>
-    <button class="btn">ارسال کد بازیابی</button>
+    <button class="btn-primary">ارسال کد بازیابی</button>
   </form>
-  <div class="links"><a href="index.php">بازگشت به ورود</a></div>
+  <div class="links-row" style="justify-content:center"><a href="index.php">بازگشت به ورود</a></div>
 </div></body></html>
 <?php
     exit;
@@ -4038,117 +4425,173 @@ if ($action == 'forgot_password_step2') {
         . '&body=' . rawurlencode('بازیابی رمز عبور XCloud');
 ?>
 <!DOCTYPE html><html lang="fa" dir="rtl"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>بازیابی رمز — XCloud</title>
+<?= renderHeadAssets() ?>
 <style>
-body{margin:0;font-family:Tahoma,sans-serif;background:#0f172a;color:#e2e8f0;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:20px}
-.card{max-width:520px;width:100%;background:#1e293b;border:1px solid #334155;border-radius:14px;padding:28px}
-h1{font-size:1.35rem;margin:0 0 8px;color:#f1f5f9;text-align:center}
-.subtitle{color:#94a3b8;font-size:.85rem;text-align:center;margin-bottom:18px;line-height:1.8}
-.info-block{background:#0f172a;border:1px solid #334155;border-radius:10px;padding:12px 14px;margin-bottom:10px;display:flex;align-items:center;justify-content:space-between;gap:10px}
-.info-label{color:#94a3b8;font-size:.75rem;font-weight:600;min-width:48px}
-.info-value{flex:1;color:#fde68a;font-family:Consolas,monospace;font-size:.95rem;direction:ltr;text-align:left;overflow-wrap:anywhere}
-.info-value.token{color:#a5b4fc;font-weight:700;font-size:1.05rem;letter-spacing:.05em}
-.copy-btn{background:#334155;color:#e2e8f0;border:none;border-radius:6px;padding:6px 10px;font-size:.72rem;cursor:pointer;font-family:inherit;flex-shrink:0}
-.copy-btn.copied{background:#14532d;color:#bbf7d0}
-.btn{display:block;width:100%;background:#3b82f6;color:#fff;border:none;padding:12px;border-radius:8px;font-weight:700;font-size:.95rem;cursor:pointer;font-family:inherit;margin-top:12px;text-decoration:none;text-align:center;box-sizing:border-box}
-.btn-secondary{background:#475569;margin-top:8px}
-.status{margin-top:16px;padding:12px;background:#0f172a;border:1px solid #334155;border-radius:8px;text-align:center;font-size:.88rem;color:#cbd5e1;display:flex;align-items:center;justify-content:center;gap:10px}
-.spinner{width:14px;height:14px;border:2px solid #334155;border-top-color:#3b82f6;border-radius:50%;animation:spin .8s linear infinite}
-@keyframes spin{to{transform:rotate(360deg)}}
-.status.ok{background:#14532d;color:#bbf7d0;border-color:#166534}
-.status.fail{background:#7f1d1d;color:#fee2e2;border-color:#991b1b}
-.err{background:#7f1d1d;color:#fee2e2;padding:10px 14px;border-radius:8px;margin-bottom:16px;font-size:.85rem;text-align:center}
-.ok{background:#14532d;color:#bbf7d0;padding:10px 14px;border-radius:8px;margin-bottom:16px;font-size:.85rem;text-align:center}
-.timer{text-align:center;color:#94a3b8;font-size:.78rem;margin-top:8px}
-.links-row{display:flex;justify-content:space-between;margin-top:14px;font-size:.82rem;color:#94a3b8}
-.links-row a{color:#3b82f6;text-decoration:none;font-weight:600}
-.hint{color:#64748b;font-size:.78rem;text-align:center;margin-top:14px;line-height:1.7}
+<?= getAuthSharedCss() ?>
 </style></head><body>
-<div class="card">
+<div class="bg-glow bg-glow-1"></div>
+<div class="bg-glow bg-glow-2"></div>
+<div class="auth-card verify-card">
   <h1>🔑 بازیابی رمز عبور</h1>
-  <div class="subtitle">برای تایید مالکیت ایمیلت، یک پیام از همان آدرس به ما بفرست.</div>
-  <?php if ($errMsg): ?><div class="err"><?= $errMsg ?></div><?php endif; ?>
-  <?php if ($msgText): ?><div class="ok"><?= $msgText ?></div><?php endif; ?>
+  <div class="auth-subtitle">برای تأیید مالکیت ایمیلت، یک پیام با همین کد به ما بفرست.</div>
+  <?php if ($errMsg): ?><div class="alert-err"><?= $errMsg ?></div><?php endif; ?>
+  <?php if ($msgText): ?><div class="alert-ok"><?= $msgText ?></div><?php endif; ?>
 
-  <div class="info-block">
-    <span class="info-label">به:</span>
-    <span class="info-value" id="infoTo"><?= h($toAddr) ?></span>
-    <button type="button" class="copy-btn" data-target="infoTo">کپی</button>
-  </div>
-  <div class="info-block">
-    <span class="info-label">موضوع:</span>
-    <span class="info-value token" id="infoSubject"><?= h($token) ?></span>
-    <button type="button" class="copy-btn" data-target="infoSubject">کپی</button>
-  </div>
-  <div class="info-block">
-    <span class="info-label">از:</span>
-    <span class="info-value" id="infoFrom"><?= h($pending['email']) ?></span>
-    <button type="button" class="copy-btn" data-target="infoFrom">کپی</button>
+  <div class="verify-block top">
+    <span class="block-label">📬 ایمیل ما (گیرنده)</span>
+    <div class="block-value-row">
+      <span class="block-value" id="xcloudEmail"><?= h($toAddr) ?></span>
+      <button type="button" class="copy-btn" data-target="xcloudEmail" aria-label="کپی">📋</button>
+    </div>
   </div>
 
-  <a class="btn" href="<?= h($mailtoHref) ?>">📧 باز کردن برنامهٔ ایمیل</a>
+  <div class="verify-block center">
+    <span class="block-label">🔑 کد بازیابی (موضوع ایمیل)</span>
+    <div class="code-display" id="verifyCode"><?= h($token) ?></div>
+    <button type="button" class="copy-btn-wide" data-target="verifyCode">📋 کپی کد</button>
+  </div>
 
-  <form method="POST" action="?action=inbound_check_now" style="margin:0">
+  <div class="verify-block bottom">
+    <span class="block-label">از</span>
+    <span class="block-value-plain"><?= h($pending['email']) ?></span>
+  </div>
+
+  <div class="alert-info" style="margin-top:14px">
+    💡 توصیه: از ایمیل‌های ایرانی (mail.ir، chmail.ir، mailfa.com) استفاده کنید — تأییدشان سریع‌تر است.
+  </div>
+
+  <a class="btn-primary" href="<?= h($mailtoHref) ?>">📧 باز کردن برنامهٔ ایمیل</a>
+
+  <form method="POST" action="?action=inbound_check_now" id="manualCheckForm" style="margin:0">
     <input type="hidden" name="csrf_token" value="<?= h($csrf) ?>">
     <input type="hidden" name="redirect" value="forgot_password_step2">
-    <button type="submit" class="btn btn-secondary">🔄 چک کردن دستی</button>
+    <button type="submit" class="btn-secondary check-btn" id="manualCheckBtn">
+      <span class="check-btn-default">🔄 چک کردن دستی</span>
+      <span class="check-btn-loading" hidden><span class="spinner-sm"></span> در حال بررسی...</span>
+      <span class="check-btn-cooldown" hidden>⏳ <span id="cooldownNum">10</span> ثانیه...</span>
+    </button>
   </form>
 
-  <div class="status" id="statusLine">
+  <div class="status-line" id="statusLine">
     <span class="spinner" id="statusSpin"></span>
     <span id="statusText">منتظر دریافت ایمیلت هستیم...</span>
   </div>
-  <div class="timer" id="otpTimer"></div>
+
+  <div class="timer-wrap">
+    <svg class="timer-ring" viewBox="0 0 100 100" width="80" height="80">
+      <defs>
+        <linearGradient id="timerGrad" x1="0" y1="0" x2="1" y2="1">
+          <stop offset="0%" stop-color="#3b82f6"/>
+          <stop offset="100%" stop-color="#8b5cf6"/>
+        </linearGradient>
+      </defs>
+      <circle class="timer-track" cx="50" cy="50" r="42" />
+      <circle class="timer-progress" cx="50" cy="50" r="42" id="timerCircle"/>
+    </svg>
+    <div class="timer-text" id="timerText">--:--</div>
+  </div>
 
   <div class="links-row">
     <a href="?action=forgot_password_step1">تغییر ایمیل</a>
     <form method="POST" action="?action=forgot_password_resend" style="display:inline;margin:0">
       <input type="hidden" name="csrf_token" value="<?= h($csrf) ?>">
-      <button type="submit" style="background:none;border:none;color:#3b82f6;font-weight:600;cursor:pointer;font-family:inherit;font-size:inherit;padding:0">صدور توکن جدید</button>
+      <button type="submit" class="text-link">صدور کد جدید</button>
     </form>
   </div>
-
-  <div class="hint">پیام را از همان آدرس بالا بفرست. بعد از دریافت، صفحهٔ تنظیم رمز جدید برایت باز می‌شود.</div>
 </div>
 <script>
 (function(){
   var expires = <?= (int)$expiresAtTs ?>;
-  var t = document.getElementById('otpTimer');
-  function tick(){
-    var s = expires - Math.floor(Date.now()/1000);
-    if (s <= 0){ t.textContent = '⏰ توکن منقضی شد.'; t.style.color='#fca5a5'; return; }
-    var m = Math.floor(s/60), r = s%60;
-    t.textContent = 'اعتبار توکن: ' + m + ':' + (r<10?'0':'') + r;
-    setTimeout(tick, 1000);
-  } tick();
+  var totalSec = 30 * 60;
 
-  document.querySelectorAll('.copy-btn').forEach(function(btn){
+  function tickTimer(){
+    var nowSec = Math.floor(Date.now()/1000);
+    var leftSec = Math.max(0, expires - nowSec);
+    var m = Math.floor(leftSec/60), r = leftSec%60;
+    var timerText = document.getElementById('timerText');
+    var timerCircle = document.getElementById('timerCircle');
+    if (leftSec <= 0) {
+      timerText.textContent = 'منقضی';
+      timerText.style.color = '#fca5a5';
+      if (timerCircle) timerCircle.style.strokeDashoffset = 264;
+      return;
+    }
+    timerText.textContent = m + ':' + (r<10?'0':'') + r;
+    var pct = leftSec / totalSec;
+    if (timerCircle) timerCircle.style.strokeDashoffset = (264 - 264 * pct);
+    setTimeout(tickTimer, 1000);
+  }
+  tickTimer();
+
+  document.querySelectorAll('.copy-btn, .copy-btn-wide').forEach(function(btn){
     btn.addEventListener('click', function(){
       var el = document.getElementById(btn.getAttribute('data-target'));
       if (!el) return;
       var txt = el.textContent.trim();
-      var done = function(){ var o=btn.textContent; btn.classList.add('copied'); btn.textContent='✓';
-        setTimeout(function(){ btn.classList.remove('copied'); btn.textContent=o; }, 1200); };
-      if (navigator.clipboard && window.isSecureContext) navigator.clipboard.writeText(txt).then(done);
-      else { var ta=document.createElement('textarea'); ta.value=txt; ta.style.position='fixed'; ta.style.opacity=0;
-        document.body.appendChild(ta); ta.select(); try{document.execCommand('copy');}catch(e){}
+      var done = function(){
+        var o = btn.innerHTML;
+        btn.classList.add('copied');
+        btn.innerHTML = btn.classList.contains('copy-btn-wide') ? '✓ کپی شد' : '✓';
+        setTimeout(function(){ btn.classList.remove('copied'); btn.innerHTML = o; }, 1200);
+      };
+      if (navigator.clipboard && window.isSecureContext) navigator.clipboard.writeText(txt).then(done, done);
+      else { var ta = document.createElement('textarea'); ta.value = txt; ta.style.position = 'fixed'; ta.style.opacity = 0;
+        document.body.appendChild(ta); ta.select(); try { document.execCommand('copy'); } catch(e){}
         document.body.removeChild(ta); done(); }
     });
   });
 
-  var spin=document.getElementById('statusSpin'), txt=document.getElementById('statusText'), line=document.getElementById('statusLine'), stopped=false, pt=null;
-  function setState(s,m){ line.classList.remove('ok','fail'); if(s==='ok'){line.classList.add('ok'); if(spin)spin.style.display='none';} else if(s==='fail'){line.classList.add('fail'); if(spin)spin.style.display='none';} txt.textContent=m; }
+  // Manual check button with 10s rate limit + animated states
+  var checkForm = document.getElementById('manualCheckForm');
+  var checkBtn = document.getElementById('manualCheckBtn');
+  var lastClick = parseInt(localStorage.getItem('xc_last_check') || '0', 10);
+  var cooldownMs = 10000;
+
+  function showCooldown(){
+    checkBtn.disabled = true;
+    checkBtn.querySelector('.check-btn-default').hidden = true;
+    checkBtn.querySelector('.check-btn-loading').hidden = true;
+    var cd = checkBtn.querySelector('.check-btn-cooldown');
+    cd.hidden = false;
+    var num = document.getElementById('cooldownNum');
+    var timer = setInterval(function(){
+      var left = Math.ceil((cooldownMs - (Date.now() - lastClick)) / 1000);
+      if (left <= 0) {
+        clearInterval(timer);
+        checkBtn.disabled = false;
+        cd.hidden = true;
+        checkBtn.querySelector('.check-btn-default').hidden = false;
+      } else {
+        num.textContent = left;
+      }
+    }, 250);
+  }
+  if (Date.now() - lastClick < cooldownMs) showCooldown();
+
+  if (checkForm) {
+    checkForm.addEventListener('submit', function(e){
+      if (Date.now() - lastClick < cooldownMs) { e.preventDefault(); return; }
+      lastClick = Date.now();
+      localStorage.setItem('xc_last_check', lastClick.toString());
+      checkBtn.querySelector('.check-btn-default').hidden = true;
+      checkBtn.querySelector('.check-btn-loading').hidden = false;
+    });
+  }
+
+  var spin = document.getElementById('statusSpin'), txt = document.getElementById('statusText'), line = document.getElementById('statusLine'), stopped = false;
+  function setState(s, m){ line.classList.remove('ok','fail'); if (s === 'ok') { line.classList.add('ok'); if (spin) spin.style.display='none'; } else if (s === 'fail') { line.classList.add('fail'); if (spin) spin.style.display='none'; } txt.textContent = m; }
   async function poll(){
     if (stopped) return;
     try {
-      var r=await fetch('?action=inbound_status',{credentials:'same-origin',headers:{'Accept':'application/json'}});
-      var j=await r.json();
-      if(j.status==='verified'){ stopped=true; setState('ok','✓ تایید شد — در حال انتقال به صفحهٔ تنظیم رمز جدید...');
+      var r = await fetch('?action=inbound_status', {credentials:'same-origin', headers:{'Accept':'application/json'}});
+      var j = await r.json();
+      if (j.status === 'verified') { stopped = true; setState('ok', '✓ تایید شد — در حال انتقال به صفحهٔ تنظیم رمز جدید...');
         setTimeout(function(){ window.location = j.redirect || '?action=forgot_password_step3'; }, 800); return; }
-      if(j.status==='expired'){ stopped=true; setState('fail','⏰ توکن منقضی شده است.'); return; }
-      if(j.status==='race_error'){ stopped=true; setState('fail', j.message || 'خطا در پردازش — لطفاً دوباره تلاش کن.'); return; }
-      if(j.status==='no_session'){ stopped=true; setState('fail','نشست منقضی شد.'); return; }
-      pt=setTimeout(poll,5000);
-    } catch(e){ pt=setTimeout(poll,8000); }
+      if (j.status === 'expired') { stopped = true; setState('fail', '⏰ کد منقضی شده است.'); return; }
+      if (j.status === 'race_error') { stopped = true; setState('fail', j.message || 'خطا در پردازش — لطفاً دوباره تلاش کن.'); return; }
+      if (j.status === 'no_session') { stopped = true; setState('fail', 'نشست منقضی شد.'); return; }
+      setTimeout(poll, 5000);
+    } catch (e) { setTimeout(poll, 8000); }
   }
   poll();
 })();
@@ -4177,24 +4620,17 @@ if ($action == 'forgot_password_step3') {
     ][$err] ?? '';
 ?>
 <!DOCTYPE html><html lang="fa" dir="rtl"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>تنظیم رمز جدید — XCloud</title>
+<?= renderHeadAssets() ?>
 <style>
-body{margin:0;font-family:Tahoma,sans-serif;background:#0f172a;color:#e2e8f0;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:20px}
-.card{max-width:440px;width:100%;background:#1e293b;border:1px solid #334155;border-radius:14px;padding:32px}
-h1{font-size:1.35rem;margin:0 0 8px;color:#f1f5f9;text-align:center}
-.subtitle{color:#94a3b8;font-size:.85rem;text-align:center;margin-bottom:18px}
-.field{margin-bottom:14px}
-label{display:block;color:#cbd5e1;font-size:.85rem;margin-bottom:6px;font-weight:600}
-input{width:100%;background:#0f172a;border:1px solid #334155;color:#f1f5f9;padding:11px 12px;border-radius:8px;font-family:inherit;box-sizing:border-box}
-.btn{width:100%;background:#3b82f6;color:#fff;border:none;padding:12px;border-radius:8px;font-weight:700;cursor:pointer;font-family:inherit;margin-top:8px}
-.err{background:#7f1d1d;color:#fee2e2;padding:10px 14px;border-radius:8px;margin-bottom:16px;font-size:.85rem;text-align:center}
-.hint{color:#64748b;font-size:.75rem;margin-top:4px}
-.ok-banner{background:#14532d;color:#bbf7d0;padding:10px 14px;border-radius:8px;margin-bottom:16px;font-size:.85rem;text-align:center}
+<?= getAuthSharedCss() ?>
 </style></head><body>
-<div class="card">
-  <h1>✅ ایمیل تایید شد</h1>
-  <div class="subtitle">حالا رمز عبور جدید را وارد کن</div>
-  <div class="ok-banner">مالکیت ایمیل تایید شده. این فرم ۵ دقیقه اعتبار دارد.</div>
-  <?php if ($errMsg): ?><div class="err"><?= $errMsg ?></div><?php endif; ?>
+<div class="bg-glow bg-glow-1"></div>
+<div class="bg-glow bg-glow-2"></div>
+<div class="auth-card">
+  <h1>✅ ایمیل تأیید شد</h1>
+  <div class="auth-subtitle">حالا رمز عبور جدید را وارد کن</div>
+  <div class="alert-ok">مالکیت ایمیل تأیید شده. این فرم ۵ دقیقه اعتبار دارد.</div>
+  <?php if ($errMsg): ?><div class="alert-err"><?= $errMsg ?></div><?php endif; ?>
   <form method="POST" action="?action=forgot_password_step3_process">
     <input type="hidden" name="csrf_token" value="<?= h($csrf) ?>">
     <div class="field">
@@ -4208,10 +4644,10 @@ input{width:100%;background:#0f172a;border:1px solid #334155;color:#f1f5f9;paddi
     </div>
     <div class="field">
       <label>پاسخ این محاسبه چیست؟</label>
-      <div class="captcha-box" style="background:#0f172a;border:1px solid #334155;padding:8px;border-radius:8px;margin-bottom:8px;text-align:center"><img src="?action=captcha_image&amp;v=<?= time() ?>" alt="کپچا" width="160" height="50" style="display:inline-block"></div>
+      <div class="captcha-box"><img src="?action=captcha_image&amp;v=<?= time() ?>" alt="کپچا" width="160" height="50"></div>
       <input type="text" name="captcha" required inputmode="numeric" autocomplete="off">
     </div>
-    <button class="btn">تغییر رمز عبور</button>
+    <button class="btn-primary">تغییر رمز عبور</button>
   </form>
 </div></body></html>
 <?php
@@ -4423,7 +4859,7 @@ if ($action == 'inbound_check_now') {
     if (!in_array($redirect, $allowedRedirects, true)) $redirect = 'register_step2';
 
     $last = (int)($_SESSION['inbound_check_last'] ?? 0);
-    if (time() - $last < 15) {
+    if (time() - $last < 10) {
         header("Location: ?action=$redirect&error=rate_limit"); exit;
     }
     $_SESSION['inbound_check_last'] = time();

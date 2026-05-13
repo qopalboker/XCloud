@@ -440,21 +440,25 @@ function inbound_parse_auth_results($raw, $expectedMta) {
 }
 
 /**
- * Extract an XV-XXXXXXXX token from a subject. Strips common forward/reply
- * prefixes and decodes MIME-encoded words. Returns uppercase token or null.
+ * Extract a 6-char Base32 token from a subject. Strips common forward/reply
+ * prefixes. Returns uppercase token or null.
  */
 function inbound_extract_token($subject) {
     if ($subject === '' || $subject === null) return null;
-    // Strip Re:/Fwd:/[Tag] prefixes iteratively
     $s = trim($subject);
+    // Strip Re:/Fwd:/[Tag] prefixes iteratively
     for ($i = 0; $i < 8; $i++) {
         $before = $s;
         $s = preg_replace('/^\s*(re|fw|fwd|پاسخ|ارجاع)\s*:\s*/iu', '', $s);
         $s = preg_replace('/^\s*\[[^\]]{1,40}\]\s*/u', '', $s);
         if ($s === $before) break;
     }
-    if (preg_match('/\bXV-([A-Z2-9]{8})\b/i', $s, $m)) {
-        return 'XV-' . strtoupper($m[1]);
+    // Match exactly 6 Base32 chars (no 0/O/1/I/L) — case insensitive
+    if (preg_match('/\b([A-Z2-9]{6})\b/i', $s, $m)) {
+        $token = strtoupper($m[1]);
+        // Reject if it contains forbidden chars (defensive — shouldn't match anyway)
+        if (preg_match('/[01OIL]/', $token)) return null;
+        return $token;
     }
     return null;
 }
@@ -727,18 +731,18 @@ function inbound_run($pdo, $maxOverride = null) {
 // ================================================================
 
 /**
- * Generate an inbound-verification token in the form XV-XXXXXXXX.
+ * Generate an inbound-verification token (6 chars, Base32-style).
  * Alphabet drops ambiguous chars (0/O/1/I/L) so users can hand-copy
- * the token if they need to.
+ * the token if they need to. The subject is just the 6 chars — no prefix.
  */
-function generate_otp_code($length = 8) {
-    $alphabet = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789'; // 31 chars
+function generate_otp_code($length = 6) {
+    $alphabet = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789'; // 31 chars, no 0/O/1/I/L
+    $out = '';
     $max = strlen($alphabet) - 1;
-    $body = '';
     for ($i = 0; $i < $length; $i++) {
-        $body .= $alphabet[random_int(0, $max)];
+        $out .= $alphabet[random_int(0, $max)];
     }
-    return 'XV-' . $body;
+    return $out;
 }
 
 function hash_otp($pdo, $code) {
@@ -847,7 +851,7 @@ function request_email_otp($pdo, $email, $purpose = 'register', $payload = null)
 
     $ttlMin     = max(1, min(120, (int)getSetting($pdo, 'otp_ttl_minutes', 30)));
     $maxAttempt = max(3, min(10, (int)getSetting($pdo, 'otp_max_attempts', 5)));
-    $token      = generate_otp_code(8);
+    $token      = generate_otp_code();
     $hash       = hash_otp($pdo, $token);
     $expiresAt  = date('Y-m-d H:i:s', time() + $ttlMin * 60);
 
@@ -882,8 +886,8 @@ function verify_email_otp($pdo, $email, $code, $purpose = 'register') {
     $email = trim(mb_strtolower($email));
     $code  = strtoupper(trim($code));
 
-    // Accept XV- inbound tokens (post-Phase 3) only.
-    if (!preg_match('/^XV-[A-Z2-9]{8}$/', $code)) {
+    // Accept 6-char Base32 inbound tokens only (no 0/O/1/I/L).
+    if (!preg_match('/^[A-Z2-9]{6}$/', $code)) {
         return ['ok' => false, 'reason' => 'invalid_format'];
     }
 
@@ -1085,6 +1089,16 @@ $pdo->exec("CREATE TABLE IF NOT EXISTS email_otps (
     INDEX idx_email_purpose (email, purpose),
     INDEX idx_expires (expires_at)
 )");
+
+// One-time migration: existing pending OTPs use the legacy XV-XXXXXXXX hash
+// format. After switching to 6-char tokens those rows can never be matched, so
+// mark them consumed and force a fresh OTP issuance.
+try {
+    if (getSetting($pdo, 'otp_format_v2_migrated', '0') !== '1') {
+        $pdo->exec("UPDATE email_otps SET consumed_at = NOW() WHERE consumed_at IS NULL");
+        setSetting($pdo, 'otp_format_v2_migrated', '1');
+    }
+} catch (Exception $e) {}
 
 $pdo->exec("CREATE TABLE IF NOT EXISTS email_send_log (
     id INT AUTO_INCREMENT PRIMARY KEY,
@@ -3588,7 +3602,7 @@ if ($action == 'register_step1_process') {
     if ($existing) {
         // Anti-enumeration: show step 2 with a fake token. The user will never
         // be able to verify it because the OTP table has no matching row.
-        $fakeToken = generate_otp_code(8);
+        $fakeToken = generate_otp_code();
         $_SESSION['pending_registration'] = [
             'email'         => $email,
             'username'      => $username,
@@ -3844,7 +3858,7 @@ if ($action == 'register_resend_otp') {
 
     if (!empty($pending['fake'])) {
         // Anti-enumeration: pretend success, rotate the displayed fake token
-        $_SESSION['pending_registration']['token']      = generate_otp_code(8);
+        $_SESSION['pending_registration']['token']      = generate_otp_code();
         $_SESSION['pending_registration']['expires_at'] = date('Y-m-d H:i:s', time() + 1800);
         $_SESSION['pending_register_otp_id']            = -1;
         $_SESSION['pending_fake_expires_at']            = time() + 1800;
@@ -3979,7 +3993,7 @@ if ($action == 'forgot_password_step1_process') {
         // status poller keeps reporting "pending" until the fake expiry.
         $_SESSION['pending_password_reset'] = [
             'email' => $email, 'fake' => true,
-            'token' => generate_otp_code(8),
+            'token' => generate_otp_code(),
             'expires_at' => date('Y-m-d H:i:s', time() + 1800),
         ];
         $_SESSION['pending_reset_otp_id'] = -1;
@@ -4269,7 +4283,7 @@ if ($action == 'forgot_password_resend') {
     }
 
     if (!empty($pending['fake'])) {
-        $_SESSION['pending_password_reset']['token']      = generate_otp_code(8);
+        $_SESSION['pending_password_reset']['token']      = generate_otp_code();
         $_SESSION['pending_password_reset']['expires_at'] = date('Y-m-d H:i:s', time() + 1800);
         $_SESSION['pending_reset_otp_id']                 = -1;
         $_SESSION['pending_fake_expires_at']              = time() + 1800;

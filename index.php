@@ -1775,6 +1775,66 @@ body {
     line-height: 1.6;
 }
 .alert-info b { color: #93c5fd; }
+/* How-to-send instructions on verify card */
+.verify-howto {
+    background: linear-gradient(135deg, rgba(30,58,138,.25), rgba(67,56,202,.18));
+    border: 1px solid rgba(99,102,241,.35);
+    border-radius: 12px;
+    padding: 14px 16px;
+    margin: 4px 0 14px;
+    text-align: right;
+}
+.verify-howto .howto-title {
+    font-size: .82rem;
+    font-weight: 700;
+    color: #c7d2fe;
+    margin-bottom: 10px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+.verify-howto ol {
+    margin: 0;
+    padding: 0;
+    list-style: none;
+    counter-reset: howto;
+}
+.verify-howto ol li {
+    counter-increment: howto;
+    position: relative;
+    padding: 6px 34px 6px 4px;
+    font-size: .82rem;
+    line-height: 1.7;
+    color: #dbeafe;
+}
+.verify-howto ol li::before {
+    content: counter(howto);
+    position: absolute;
+    right: 0;
+    top: 6px;
+    width: 24px;
+    height: 24px;
+    border-radius: 50%;
+    background: linear-gradient(135deg, #3b82f6, #8b5cf6);
+    color: #fff;
+    font-size: .72rem;
+    font-weight: 700;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+.verify-howto ol li b {
+    color: #fff;
+    font-weight: 700;
+}
+.verify-howto ol li + li {
+    border-top: 1px solid rgba(99,102,241,.12);
+}
+@media (max-width: 480px) {
+    .verify-howto { padding: 12px 14px; }
+    .verify-howto ol li { font-size: .78rem; padding: 5px 30px 5px 2px; }
+    .verify-howto ol li::before { width: 22px; height: 22px; font-size: .68rem; }
+}
 .links-row {
     display: flex;
     justify-content: space-between;
@@ -3421,7 +3481,7 @@ section[data-view].is-entering{
 <section data-view="verify" class="<?= $view==='verify'?'':'is-hidden' ?>">
   <div class="auth-card verify-card">
     <h1>📨 تأیید ایمیل</h1>
-    <div class="auth-subtitle">یک ایمیل از آدرس خود به کد زیر بفرستید.</div>
+    <div class="auth-subtitle">با ایمیل خودت یک پیام به ما بفرست — کد تأیید را در «موضوع» بگذار.</div>
     <div class="alert-err" data-err-slot hidden></div>
     <div class="alert-ok" data-ok-slot hidden></div>
 
@@ -3442,6 +3502,16 @@ section[data-view].is-entering{
     <div class="verify-block bottom">
       <span class="block-label">از</span>
       <span class="block-value-plain" id="vfEmail"><?= h($verifyEmailJs) ?></span>
+    </div>
+
+    <div class="verify-howto">
+      <div class="howto-title">📝 چطور کد را برای ما بفرستی؟</div>
+      <ol>
+        <li>برنامهٔ ایمیلت را باز کن و یک پیام <b>جدید</b> بساز</li>
+        <li>از همان ایمیلِ خودت (<b>پایین صفحه</b>) به آدرسِ ما (<b>بالای صفحه</b>) بفرست</li>
+        <li><b>کد تأیید</b> را فقط در قسمت <b>موضوع (Subject)</b> بنویس</li>
+        <li>متن ایمیل را <b>خالی</b> بگذار و دکمهٔ ارسال را بزن</li>
+      </ol>
     </div>
 
     <div class="alert-info" style="margin-top:14px">
@@ -5532,7 +5602,7 @@ if ($action == 'register_step2') {
 <div class="bg-glow bg-glow-2"></div>
 <div class="auth-card verify-card">
   <h1>📨 تأیید ایمیل</h1>
-  <div class="auth-subtitle">یک ایمیل از آدرس زیر به ما بفرست — موضوع همان کد تأیید است.</div>
+  <div class="auth-subtitle">با ایمیل خودت یک پیام به ما بفرست — کد تأیید را در «موضوع» بگذار.</div>
   <?php if ($errMsg): ?><div class="alert-err"><?= $errMsg ?></div><?php endif; ?>
   <?php if ($msgText): ?><div class="alert-ok"><?= $msgText ?></div><?php endif; ?>
 
@@ -5556,6 +5626,16 @@ if ($action == 'register_step2') {
   <div class="verify-block bottom">
     <span class="block-label">از</span>
     <span class="block-value-plain"><?= h($pending['email']) ?></span>
+  </div>
+
+  <div class="verify-howto">
+    <div class="howto-title">📝 چطور کد را برای ما بفرستی؟</div>
+    <ol>
+      <li>برنامهٔ ایمیلت را باز کن و یک پیام <b>جدید</b> بساز</li>
+      <li>از همان ایمیلِ خودت (<b>پایین صفحه</b>) به آدرسِ ما (<b>بالای صفحه</b>) بفرست</li>
+      <li><b>کد تأیید</b> را فقط در قسمت <b>موضوع (Subject)</b> بنویس</li>
+      <li>متن ایمیل را <b>خالی</b> بگذار و دکمهٔ ارسال را بزن</li>
+    </ol>
   </div>
 
   <!-- Internal email hint -->
@@ -5939,7 +6019,7 @@ if ($action == 'forgot_password_step2') {
 <div class="bg-glow bg-glow-2"></div>
 <div class="auth-card verify-card">
   <h1>🔑 بازیابی رمز عبور</h1>
-  <div class="auth-subtitle">برای تأیید مالکیت ایمیلت، یک پیام با همین کد به ما بفرست.</div>
+  <div class="auth-subtitle">برای تأیید مالکیت ایمیلت، با همان ایمیل یک پیام به ما بفرست — کد را در «موضوع» بگذار.</div>
   <?php if ($errMsg): ?><div class="alert-err"><?= $errMsg ?></div><?php endif; ?>
   <?php if ($msgText): ?><div class="alert-ok"><?= $msgText ?></div><?php endif; ?>
 
@@ -5960,6 +6040,16 @@ if ($action == 'forgot_password_step2') {
   <div class="verify-block bottom">
     <span class="block-label">از</span>
     <span class="block-value-plain"><?= h($pending['email']) ?></span>
+  </div>
+
+  <div class="verify-howto">
+    <div class="howto-title">📝 چطور کد را برای ما بفرستی؟</div>
+    <ol>
+      <li>برنامهٔ ایمیلت را باز کن و یک پیام <b>جدید</b> بساز</li>
+      <li>از همان ایمیلِ خودت (<b>پایین صفحه</b>) به آدرسِ ما (<b>بالای صفحه</b>) بفرست</li>
+      <li><b>کد تأیید</b> را فقط در قسمت <b>موضوع (Subject)</b> بنویس</li>
+      <li>متن ایمیل را <b>خالی</b> بگذار و دکمهٔ ارسال را بزن</li>
+    </ol>
   </div>
 
   <div class="alert-info" style="margin-top:14px">

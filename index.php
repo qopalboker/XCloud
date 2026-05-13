@@ -556,6 +556,17 @@ function inbound_apply_payload($pdo, array $otpRow) {
              can_download, can_change_password, can_delete, can_share)
             VALUES (?, ?, ?, 1, NOW(), 'user', 1, 1, 1, 1)");
         $ins->execute([$username, $payload['password_hash'], $email]);
+        // Record referral use if the request carried a validated code id.
+        if (!empty($payload['referral_code_id'])) {
+            $rid = (int)$payload['referral_code_id'];
+            $ip  = $payload['referral_ip'] ?? null;
+            try {
+                $pdo->prepare("INSERT INTO referral_uses (referral_code_id, used_by_username, used_by_email, ip_address) VALUES (?,?,?,?)")
+                    ->execute([$rid, $username, $email, $ip]);
+                $pdo->prepare("UPDATE referral_codes SET use_count = use_count + 1 WHERE id = ?")
+                    ->execute([$rid]);
+            } catch (Exception $e) { /* code may have been revoked between issue and verify */ }
+        }
         logActivity($pdo, $username, 'inbound_register_completed', $email);
     } elseif ($purpose === 'email_add') {
         // Admin-only flow in Phase 10; supports legacy email_add OTPs too.
@@ -743,6 +754,43 @@ function generate_otp_code($length = 6) {
         $out .= $alphabet[random_int(0, $max)];
     }
     return $out;
+}
+
+/**
+ * Generate a fresh 8-char referral code from the same Base32-style alphabet.
+ * Caller is responsible for collision check on insert.
+ */
+function generate_referral_code() {
+    $alphabet = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
+    $max = strlen($alphabet) - 1;
+    $out = '';
+    for ($i = 0; $i < 8; $i++) {
+        $out .= $alphabet[random_int(0, $max)];
+    }
+    return $out;
+}
+
+/**
+ * Validate a user-submitted referral code. Returns ['ok'=>true,'id'=>...] on
+ * success, or ['ok'=>false,'reason'=>...] (empty|invalid|expired|used).
+ */
+function validate_referral_code($pdo, $code) {
+    $code = strtoupper(trim((string)$code));
+    if ($code === '') return ['ok' => false, 'reason' => 'empty'];
+    $st = $pdo->prepare("SELECT * FROM referral_codes WHERE code = ? AND revoked_at IS NULL");
+    $st->execute([$code]);
+    $row = $st->fetch();
+    if (!$row) return ['ok' => false, 'reason' => 'invalid'];
+    if (!empty($row['expires_at']) && strtotime($row['expires_at']) < time()) {
+        return ['ok' => false, 'reason' => 'expired'];
+    }
+    if ($row['code_type'] === 'single' && (int)$row['use_count'] >= 1) {
+        return ['ok' => false, 'reason' => 'used'];
+    }
+    if ($row['code_type'] === 'multi' && (int)$row['use_count'] >= (int)$row['max_uses']) {
+        return ['ok' => false, 'reason' => 'used'];
+    }
+    return ['ok' => true, 'id' => (int)$row['id'], 'code' => $row['code']];
 }
 
 function hash_otp($pdo, $code) {
@@ -1124,6 +1172,32 @@ $pdo->exec("CREATE TABLE IF NOT EXISTS email_inbound_processed (
     UNIQUE KEY uq_message_id (message_id),
     INDEX idx_processed_at (processed_at),
     INDEX idx_outcome (outcome)
+)");
+
+// Referral / invite codes
+$pdo->exec("CREATE TABLE IF NOT EXISTS referral_codes (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    code VARCHAR(20) UNIQUE NOT NULL,
+    code_type ENUM('single','multi','unlimited') NOT NULL DEFAULT 'single',
+    max_uses INT DEFAULT NULL,
+    use_count INT NOT NULL DEFAULT 0,
+    expires_at TIMESTAMP NULL DEFAULT NULL,
+    label VARCHAR(100) DEFAULT NULL,
+    created_by VARCHAR(50) NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    revoked_at TIMESTAMP NULL DEFAULT NULL,
+    INDEX idx_code (code),
+    INDEX idx_created_by (created_by)
+)");
+$pdo->exec("CREATE TABLE IF NOT EXISTS referral_uses (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    referral_code_id INT NOT NULL,
+    used_by_username VARCHAR(50) NOT NULL,
+    used_by_email VARCHAR(255) NOT NULL,
+    used_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    ip_address VARCHAR(45) DEFAULT NULL,
+    INDEX idx_code_id (referral_code_id),
+    FOREIGN KEY (referral_code_id) REFERENCES referral_codes(id) ON DELETE CASCADE
 )");
 
 // Add can_share permission for users
@@ -2112,6 +2186,8 @@ $defaultSettings = [
     'inbound_max_messages_per_run'    => '50',
     'inbound_last_cron_run_at'        => '',
     'inbound_last_cron_result'        => '',
+    // Referral / invite codes
+    'registration_requires_referral'  => '0',
 ];
 foreach($defaultSettings as $k=>$v){
     $pdo->prepare("INSERT IGNORE INTO settings (setting_key,setting_value) VALUES(?,?)")
@@ -3713,6 +3789,75 @@ if ($action == 'admin_unlock_setup') {
     header("Location: ?action=setup_wizard"); exit;
 }
 
+if ($action == 'referral_create') {
+    if (!isset($_SESSION['user']) || $_SESSION['role'] !== 'admin') { header("Location: ?action=dashboard"); exit; }
+    verifyCsrf();
+    $type = $_POST['code_type'] ?? 'single';
+    if (!in_array($type, ['single','multi','unlimited'], true)) $type = 'single';
+    $label = trim($_POST['label'] ?? '');
+    $maxUses = null;
+    if ($type === 'multi') {
+        $maxUses = (int)($_POST['max_uses'] ?? 0);
+        if ($maxUses < 2) $maxUses = 2;
+    }
+    $expiresAt = null;
+    $exp = trim($_POST['expires_at'] ?? '');
+    if ($exp !== '') {
+        $ts = strtotime($exp);
+        if ($ts) $expiresAt = date('Y-m-d H:i:s', $ts);
+    }
+    // Generate with collision retry
+    $code = null;
+    for ($i = 0; $i < 5; $i++) {
+        $candidate = generate_referral_code();
+        $st = $pdo->prepare("SELECT id FROM referral_codes WHERE code = ?");
+        $st->execute([$candidate]);
+        if (!$st->fetch()) { $code = $candidate; break; }
+    }
+    if ($code === null) {
+        header("Location: ?action=referrals&msg=create_error"); exit;
+    }
+    $ins = $pdo->prepare("INSERT INTO referral_codes (code, code_type, max_uses, expires_at, label, created_by) VALUES (?,?,?,?,?,?)");
+    $ins->execute([$code, $type, $maxUses, $expiresAt, $label !== '' ? $label : null, $_SESSION['user']]);
+    logActivity($pdo, $_SESSION['user'], 'referral_create', $code, "type=$type");
+    header("Location: ?action=referrals&msg=created&new=" . urlencode($code)); exit;
+}
+
+if ($action == 'referral_revoke') {
+    if (!isset($_SESSION['user']) || $_SESSION['role'] !== 'admin') { header("Location: ?action=dashboard"); exit; }
+    verifyCsrf();
+    $rid = (int)($_POST['referral_id'] ?? 0);
+    if ($rid > 0) {
+        $pdo->prepare("UPDATE referral_codes SET revoked_at = NOW() WHERE id = ? AND revoked_at IS NULL")->execute([$rid]);
+        logActivity($pdo, $_SESSION['user'], 'referral_revoke', "id=$rid");
+    }
+    header("Location: ?action=referrals&msg=revoked"); exit;
+}
+
+if ($action == 'referral_delete') {
+    if (!isset($_SESSION['user']) || $_SESSION['role'] !== 'admin') { header("Location: ?action=dashboard"); exit; }
+    verifyCsrf();
+    $rid = (int)($_POST['referral_id'] ?? 0);
+    if ($rid > 0) {
+        $pdo->prepare("DELETE FROM referral_codes WHERE id = ?")->execute([$rid]);
+        logActivity($pdo, $_SESSION['user'], 'referral_delete', "id=$rid");
+    }
+    header("Location: ?action=referrals&msg=deleted"); exit;
+}
+
+if ($action == 'admin_toggle_referral_required') {
+    if (!isset($_SESSION['user']) || $_SESSION['role'] !== 'admin') {
+        header("Location: ?action=dashboard"); exit;
+    }
+    verifyCsrf();
+    $current = getSetting($pdo, 'registration_requires_referral', '0');
+    $new = $current === '1' ? '0' : '1';
+    setSetting($pdo, 'registration_requires_referral', $new);
+    logActivity($pdo, $_SESSION['user'], 'admin_toggle_referral_required', null,
+                "Set to: " . ($new === '1' ? 'required' : 'optional'));
+    header("Location: ?action=referrals&msg=" . ($new === '1' ? 'required_on' : 'required_off')); exit;
+}
+
 // ================================================================
 // ADMIN DB BACKUP (downloadable .sql dump)
 // ================================================================
@@ -3837,7 +3982,12 @@ if ($action == 'register_step1') {
         'cooldown'           => '⏳ اخیراً درخواست داده‌اید. لطفاً چند ثانیه صبر کنید.',
         'email_quota'        => '⛔ تعداد درخواست‌های شما برای این ایمیل از حد مجاز بیشتر شده.',
         'ip_quota'           => '⛔ تعداد درخواست‌ها از این IP از حد مجاز بیشتر شده.',
+        'referral_required'  => '⚠️ کد معرف لازم است.',
+        'referral_invalid'   => '⚠️ کد معرف معتبر نیست.',
+        'referral_expired'   => '⚠️ کد معرف منقضی شده است.',
+        'referral_used'      => '⚠️ کد معرف قبلاً استفاده شده یا به سقف رسیده است.',
     ][$err] ?? '';
+    $requiresReferral = getSetting($pdo, 'registration_requires_referral', '0') === '1';
 ?>
 <!DOCTYPE html>
 <html lang="fa" dir="rtl">
@@ -3881,6 +4031,13 @@ if ($action == 'register_step1') {
       <label for="password_confirm">تکرار رمز عبور</label>
       <input type="password" id="password_confirm" name="password_confirm" required autocomplete="new-password" minlength="8">
     </div>
+    <?php if ($requiresReferral): ?>
+    <div class="field">
+      <label for="referral_code">کد معرف</label>
+      <input type="text" id="referral_code" name="referral_code" required autocomplete="off" style="direction:ltr;text-transform:uppercase;letter-spacing:.08em" value="<?= h($_GET['ref'] ?? '') ?>">
+      <div class="hint">برای ثبت‌نام به یک کد معرف معتبر نیاز دارید.</div>
+    </div>
+    <?php endif; ?>
     <div class="field">
       <label>پاسخ این محاسبه چیست؟</label>
       <div class="captcha-box"><img src="?action=captcha_image&amp;v=<?= time() ?>" alt="کپچا" width="160" height="50"></div>
@@ -3927,6 +4084,22 @@ if ($action == 'register_step1_process') {
         header("Location: ?action=register_step1&error=weak_password&email=" . urlencode($email) . "&username=" . urlencode($username)); exit;
     }
 
+    // Referral code (if globally required)
+    $referralId = null;
+    if (getSetting($pdo, 'registration_requires_referral', '0') === '1') {
+        $code = strtoupper(trim($_POST['referral_code'] ?? ''));
+        if ($code === '') {
+            header("Location: ?action=register_step1&error=referral_required&email=" . urlencode($email) . "&username=" . urlencode($username)); exit;
+        }
+        $rv = validate_referral_code($pdo, $code);
+        if (!$rv['ok']) {
+            $reason = $rv['reason'];
+            $err = $reason === 'invalid' ? 'referral_invalid' : ($reason === 'expired' ? 'referral_expired' : 'referral_used');
+            header("Location: ?action=register_step1&error={$err}&email=" . urlencode($email) . "&username=" . urlencode($username) . "&ref=" . urlencode($code)); exit;
+        }
+        $referralId = $rv['id'];
+    }
+
     // Username availability
     $st = $pdo->prepare("SELECT id FROM users WHERE username = ?");
     $st->execute([$username]);
@@ -3964,10 +4137,15 @@ if ($action == 'register_step1_process') {
     // Issue inbound-verification token. The OTP payload carries the future
     // user record so the inbound cron can create the account on match.
     $passwordHash = password_hash($password, PASSWORD_DEFAULT);
-    $payload = json_encode([
+    $payloadArr = [
         'username'      => $username,
         'password_hash' => $passwordHash,
-    ]);
+    ];
+    if ($referralId !== null) {
+        $payloadArr['referral_code_id'] = $referralId;
+        $payloadArr['referral_ip'] = $_SERVER['REMOTE_ADDR'] ?? null;
+    }
+    $payload = json_encode($payloadArr);
     $result = request_email_otp($pdo, $email, 'register', $payload);
     if (!$result['ok']) {
         $err = $result['reason'] ?? 'send_failed';
@@ -7162,6 +7340,13 @@ elseif($action=='users'){
         </div>
         <div style="background:#1e293b;border:1px solid #334155;border-radius:10px;padding:14px 20px;margin-bottom:16px;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px" dir="rtl">
           <div>
+            <strong style="color:#f1f5f9">کدهای معرف</strong>
+            <p style="margin:4px 0 0;color:#94a3b8;font-size:.85rem">مدیریت کدهای دعوت و الزام ثبت‌نام با کد معرف.</p>
+          </div>
+          <a href="?action=referrals" style="background:#7c3aed;color:#fff;padding:9px 18px;border-radius:6px;text-decoration:none;font-weight:600;font-size:.85rem">🎟️ مدیریت کدهای معرف</a>
+        </div>
+        <div style="background:#1e293b;border:1px solid #334155;border-radius:10px;padding:14px 20px;margin-bottom:16px;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px" dir="rtl">
+          <div>
             <strong style="color:#f1f5f9">پشتیبان‌گیری دیتابیس</strong>
             <p style="margin:4px 0 0;color:#94a3b8;font-size:.85rem">قبل از هر بار آپلود نسخه‌ی جدید کد، یک نسخه‌ی پشتیبان دانلود کنید.</p>
           </div>
@@ -7369,6 +7554,202 @@ elseif($action=='users'){
     })();
     </script>
     </body></html><?php
+}
+
+// ================================================================
+// REFERRAL CODES (Admin)
+// ================================================================
+elseif($action=='referrals'){
+    if(!isset($_SESSION['user'])||$_SESSION['role']!=='admin'){header("Location: index.php");exit;}
+    $csrf = generateCsrfToken();
+    $requiresReferral = getSetting($pdo, 'registration_requires_referral', '0') === '1';
+    $codes = $pdo->query("SELECT * FROM referral_codes ORDER BY id DESC")->fetchAll();
+    $msg = $_GET['msg'] ?? '';
+    $newCode = $_GET['new'] ?? '';
+    $msgMap = [
+        'created'      => ['✅', 'کد جدید ساخته شد'],
+        'create_error' => ['❌', 'خطا در ساخت کد'],
+        'revoked'      => ['🚫', 'کد باطل شد'],
+        'deleted'      => ['🗑️', 'کد حذف شد'],
+        'required_on'  => ['✅', 'ثبت‌نام با کد معرف اجباری شد'],
+        'required_off' => ['ℹ️', 'ثبت‌نام دیگر نیاز به کد معرف ندارد'],
+    ];
+?>
+<!DOCTYPE html><html lang="fa" dir="rtl"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>XCloud — کدهای معرف</title>
+<?= renderHeadAssets() ?>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'Dana','JetBrains Mono',sans-serif;background:#0a0e1a;color:#e2e8f0;min-height:100vh}
+.app-header{position:sticky;top:0;z-index:1000;background:rgba(10,14,26,.94);backdrop-filter:blur(16px);padding:12px 20px;display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid #1e293b}
+.back-link{color:#3b82f6;text-decoration:none;font-size:.85rem;font-weight:600}
+.brand-title{font-weight:900;font-size:1rem;background:linear-gradient(135deg,#3b82f6,#8b5cf6);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
+.container{padding:20px;max-width:1100px;margin:0 auto}
+.card{background:#111827;border-radius:14px;padding:18px;border:1px solid #1e293b;margin-bottom:16px}
+.card h3{font-size:.95rem;margin-bottom:14px;color:#f1f5f9}
+.toggle-row{display:flex;justify-content:space-between;align-items:center;gap:14px;flex-wrap:wrap}
+.toggle-row .desc{color:#94a3b8;font-size:.82rem;margin-top:4px}
+.toggle-btn{padding:10px 18px;border:none;border-radius:8px;cursor:pointer;font-weight:700;font-family:inherit;font-size:.85rem}
+.toggle-on{background:#dc2626;color:#fff}
+.toggle-off{background:#16a34a;color:#fff}
+.create-form .row{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:10px}
+.create-form .row > *{flex:1;min-width:140px}
+.create-form input[type="text"],.create-form input[type="datetime-local"],.create-form input[type="number"],.create-form select{background:rgba(15,23,42,.5);border:1.5px solid #1e293b;padding:10px 14px;border-radius:10px;color:#e2e8f0;font-family:inherit;font-size:.84rem;outline:none;width:100%}
+.create-form input:focus,.create-form select:focus{border-color:#3b82f6}
+.type-radios{display:flex;gap:10px;flex-wrap:wrap}
+.type-radios label{display:flex;align-items:center;gap:6px;padding:8px 12px;border:1.5px solid #1e293b;border-radius:10px;cursor:pointer;font-size:.82rem;background:rgba(15,23,42,.4);flex:1;justify-content:center}
+.type-radios input{accent-color:#3b82f6}
+.type-radios label.active{border-color:#3b82f6;background:rgba(59,130,246,.1)}
+.create-btn{padding:12px 22px;background:linear-gradient(135deg,#3b82f6,#6366f1);color:#fff;border:none;border-radius:10px;font-weight:700;cursor:pointer;font-family:inherit;font-size:.88rem}
+table.codes{width:100%;border-collapse:collapse;font-size:.82rem}
+table.codes th{padding:10px 12px;color:#94a3b8;font-size:.7rem;text-transform:uppercase;letter-spacing:.05em;border-bottom:1px solid #1e293b;text-align:right;font-weight:700}
+table.codes td{padding:10px 12px;border-bottom:1px solid rgba(30,41,59,.5)}
+table.codes tbody tr:hover{background:rgba(30,41,59,.3)}
+.code-cell{font-family:'JetBrains Mono',Consolas,monospace;font-weight:700;color:#a5b4fc;direction:ltr;letter-spacing:.08em}
+.type-badge{padding:2px 8px;border-radius:6px;font-size:.7rem;font-weight:700}
+.type-single{background:rgba(59,130,246,.2);color:#93c5fd}
+.type-multi{background:rgba(168,85,247,.2);color:#d8b4fe}
+.type-unlimited{background:rgba(34,197,94,.18);color:#4ade80}
+.status-badge{padding:2px 8px;border-radius:6px;font-size:.7rem;font-weight:700}
+.status-active{background:rgba(34,197,94,.18);color:#4ade80}
+.status-expired{background:rgba(100,116,139,.18);color:#94a3b8}
+.status-revoked{background:rgba(239,68,68,.15);color:#fca5a5}
+.status-used{background:rgba(249,115,22,.18);color:#fdba74}
+.row-actions{display:flex;gap:6px}
+.row-action-btn{display:inline-flex;align-items:center;justify-content:center;border:none;border-radius:6px;padding:6px 10px;font-size:.74rem;font-weight:700;cursor:pointer;font-family:inherit;background:rgba(59,130,246,.12);color:#93c5fd}
+.row-action-btn:hover{filter:brightness(1.3)}
+.row-action-btn.ra-rev{background:rgba(249,115,22,.15);color:#fdba74}
+.row-action-btn.ra-del{background:rgba(239,68,68,.12);color:#f87171}
+.empty{text-align:center;color:#64748b;padding:30px;font-size:.85rem}
+.banner{background:rgba(30,58,138,.3);border:1px solid rgba(59,130,246,.3);color:#bfdbfe;padding:10px 14px;border-radius:10px;margin-bottom:14px;font-size:.85rem;display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}
+.banner.new{background:rgba(20,83,45,.4);border-color:rgba(34,197,94,.3);color:#bbf7d0}
+.banner code{font-family:'JetBrains Mono',Consolas,monospace;font-size:1rem;letter-spacing:.08em;background:rgba(0,0,0,.3);padding:4px 10px;border-radius:6px}
+.copy-mini{background:rgba(51,65,85,.6);color:#e2e8f0;border:none;border-radius:6px;padding:5px 10px;font-size:.74rem;cursor:pointer;font-family:inherit}
+.toast{position:fixed;top:72px;left:50%;transform:translateX(-50%) translateY(-16px);background:#1a2235;border:1px solid #1e293b;border-radius:12px;padding:12px 20px;z-index:3000;font-size:.82rem;font-weight:600;box-shadow:0 12px 40px rgba(0,0,0,.4);opacity:0;pointer-events:none;transition:all .4s cubic-bezier(.16,1,.3,1);display:flex;align-items:center;gap:8px}
+.toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+</style></head><body>
+<header class="app-header">
+    <a href="?action=dashboard" class="back-link">← بازگشت</a>
+    <span class="brand-title">کدهای معرف</span>
+</header>
+<div class="container">
+    <?php if($msg && isset($msgMap[$msg])): ?>
+    <div class="banner<?= $msg==='created'?' new':'' ?>">
+        <span><?= h($msgMap[$msg][0].' '.$msgMap[$msg][1]) ?><?php if($msg==='created' && $newCode): ?> — <code id="newCode"><?= h($newCode) ?></code> <button type="button" class="copy-mini" onclick="navigator.clipboard&&navigator.clipboard.writeText('<?= h($newCode) ?>');this.textContent='✓ کپی شد'">کپی</button><?php endif; ?></span>
+    </div>
+    <?php endif; ?>
+
+    <div class="card">
+        <div class="toggle-row">
+            <div>
+                <h3 style="margin:0">🔒 ثبت‌نام فقط با کد معرف</h3>
+                <div class="desc">
+                    <?= $requiresReferral
+                        ? 'فعال — برای ثبت‌نام جدید کد معرف معتبر لازم است.'
+                        : 'غیرفعال — کاربران می‌توانند بدون کد معرف ثبت‌نام کنند.' ?>
+                </div>
+            </div>
+            <form method="POST" action="?action=admin_toggle_referral_required" style="margin:0">
+                <input type="hidden" name="csrf_token" value="<?= h($csrf) ?>">
+                <button type="submit" class="toggle-btn <?= $requiresReferral ? 'toggle-on' : 'toggle-off' ?>">
+                    <?= $requiresReferral ? 'غیرفعال کردن' : 'فعال کردن' ?>
+                </button>
+            </form>
+        </div>
+    </div>
+
+    <div class="card">
+        <h3>➕ ساخت کد معرف جدید</h3>
+        <form method="POST" action="?action=referral_create" class="create-form">
+            <input type="hidden" name="csrf_token" value="<?= h($csrf) ?>">
+            <div class="type-radios" id="typeRadios">
+                <label class="active"><input type="radio" name="code_type" value="single" checked> یکبار مصرف</label>
+                <label><input type="radio" name="code_type" value="multi"> چندبار مصرف</label>
+                <label><input type="radio" name="code_type" value="unlimited"> نامحدود</label>
+            </div>
+            <div class="row" style="margin-top:10px">
+                <input type="text" name="label" placeholder="برچسب (اختیاری) — مثل: کمپین تابستان">
+                <input type="number" name="max_uses" id="maxUsesInput" min="2" placeholder="سقف استفاده (فقط چندبار مصرف)" disabled>
+                <input type="datetime-local" name="expires_at" placeholder="تاریخ انقضا (اختیاری)">
+            </div>
+            <button type="submit" class="create-btn">ساخت کد</button>
+        </form>
+    </div>
+
+    <div class="card">
+        <h3>📋 کدهای موجود (<?= count($codes) ?>)</h3>
+        <?php if(empty($codes)): ?>
+        <div class="empty">هنوز هیچ کدی ساخته نشده است.</div>
+        <?php else: ?>
+        <div style="overflow-x:auto">
+        <table class="codes">
+            <thead><tr>
+                <th>کد</th><th>نوع</th><th>برچسب</th><th>استفاده / سقف</th><th>انقضا</th><th>سازنده</th><th>وضعیت</th><th>عملیات</th>
+            </tr></thead>
+            <tbody>
+            <?php foreach($codes as $c):
+                $isRevoked = !empty($c['revoked_at']);
+                $isExpired = !empty($c['expires_at']) && strtotime($c['expires_at']) < time();
+                $isExhausted = false;
+                if ($c['code_type'] === 'single' && (int)$c['use_count'] >= 1) $isExhausted = true;
+                if ($c['code_type'] === 'multi' && (int)$c['use_count'] >= (int)$c['max_uses']) $isExhausted = true;
+                $statusKey = $isRevoked ? 'revoked' : ($isExpired ? 'expired' : ($isExhausted ? 'used' : 'active'));
+                $statusLabel = ['active'=>'فعال','expired'=>'منقضی','revoked'=>'باطل شده','used'=>'به سقف رسیده'][$statusKey];
+                $limitText = $c['code_type']==='unlimited' ? '∞' : ($c['code_type']==='single' ? '1' : (int)$c['max_uses']);
+            ?>
+            <tr>
+                <td><span class="code-cell"><?= h($c['code']) ?></span> <button type="button" class="copy-mini" onclick="navigator.clipboard&&navigator.clipboard.writeText('<?= h($c['code']) ?>');this.textContent='✓'">📋</button></td>
+                <td><span class="type-badge type-<?= h($c['code_type']) ?>"><?= ['single'=>'یکبار مصرف','multi'=>'چندبار','unlimited'=>'نامحدود'][$c['code_type']] ?></span></td>
+                <td><?= h($c['label'] ?: '—') ?></td>
+                <td><?= (int)$c['use_count'] ?> / <?= h($limitText) ?></td>
+                <td><?= !empty($c['expires_at']) ? h(to_jalali($c['expires_at'])) : '—' ?></td>
+                <td><?= h($c['created_by']) ?></td>
+                <td><span class="status-badge status-<?= $statusKey ?>"><?= $statusLabel ?></span></td>
+                <td>
+                    <div class="row-actions">
+                        <?php if(!$isRevoked): ?>
+                        <form method="POST" action="?action=referral_revoke" style="margin:0" onsubmit="return confirm('باطل کردن کد «<?= h($c['code']) ?>»؟ پس از این قابل استفاده نخواهد بود.')">
+                            <input type="hidden" name="csrf_token" value="<?= h($csrf) ?>">
+                            <input type="hidden" name="referral_id" value="<?= (int)$c['id'] ?>">
+                            <button type="submit" class="row-action-btn ra-rev" title="باطل کردن">🚫</button>
+                        </form>
+                        <?php endif; ?>
+                        <form method="POST" action="?action=referral_delete" style="margin:0" onsubmit="return confirm('حذف دائم کد «<?= h($c['code']) ?>»؟ تاریخچهٔ استفاده هم پاک می‌شود.')">
+                            <input type="hidden" name="csrf_token" value="<?= h($csrf) ?>">
+                            <input type="hidden" name="referral_id" value="<?= (int)$c['id'] ?>">
+                            <button type="submit" class="row-action-btn ra-del" title="حذف">🗑</button>
+                        </form>
+                    </div>
+                </td>
+            </tr>
+            <?php endforeach; ?>
+            </tbody>
+        </table>
+        </div>
+        <?php endif; ?>
+    </div>
+</div>
+<div class="toast" id="toast"></div>
+<script>
+(function(){
+    var radios = document.querySelectorAll('#typeRadios input[type="radio"]');
+    var maxInput = document.getElementById('maxUsesInput');
+    function sync(){
+        document.querySelectorAll('#typeRadios label').forEach(function(l){
+            l.classList.toggle('active', l.querySelector('input').checked);
+        });
+        var checked = document.querySelector('#typeRadios input[type="radio"]:checked');
+        var isMulti = checked && checked.value === 'multi';
+        maxInput.disabled = !isMulti;
+        if (!isMulti) maxInput.value = '';
+        maxInput.required = isMulti;
+    }
+    radios.forEach(function(r){ r.addEventListener('change', sync); });
+    sync();
+})();
+</script>
+</body></html><?php
 }
 
 // ================================================================

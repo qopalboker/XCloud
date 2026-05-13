@@ -1497,11 +1497,11 @@ function spa_verify_snapshot(): ?array {
 function getAuthSharedCss(): string {
     return getDanaFontFaceCss() . <<<'CSS'
 html, body {
+    margin: 0;
     height: 100%;
     overflow: hidden;
 }
 body {
-    margin: 0;
     font-family: 'Dana', -apple-system, system-ui, Tahoma, sans-serif;
     background: #0a0e1a;
     color: #e2e8f0;
@@ -1509,7 +1509,7 @@ body {
     display: flex;
     align-items: center;
     justify-content: center;
-    padding: 16px;
+    padding: 24px;
     position: relative;
 }
 *, *::before, *::after { box-sizing: border-box; }
@@ -1533,18 +1533,18 @@ body {
 .auth-card {
     position: relative;
     z-index: 1;
-    max-width: 420px;
-    width: 100%;
-    max-height: calc(100dvh - 32px);
+    width: min(92vw, 380px);
+    max-height: min(92dvh, 720px);
     overflow-y: auto;
     overflow-x: hidden;
     scrollbar-width: thin;
     scrollbar-color: rgba(255,255,255,.1) transparent;
     background: rgba(17,24,39,.85);
     backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
     border: 1.5px solid rgba(255,255,255,.06);
-    border-radius: 20px;
-    padding: 36px 32px;
+    border-radius: 18px;
+    padding: 28px 24px;
     box-shadow: 0 20px 60px rgba(0,0,0,.4);
 }
 .auth-card::-webkit-scrollbar { width: 4px; }
@@ -1886,13 +1886,20 @@ body {
 .pk-status.ok { color: #34d399; }
 .pk-status.e { color: #fca5a5; }
 @media (max-width: 480px) {
-    body { padding: 8px; }
-    .auth-card { padding: 22px 18px; border-radius: 16px; }
-    .auth-card h1, .logo-title { font-size: 1.2rem; }
+    body { padding: 12px; }
+    .auth-card {
+        width: 100%;
+        padding: 22px 18px;
+        border-radius: 14px;
+    }
+    .auth-card h1, .logo-title { font-size: 1.15rem; }
+    .auth-subtitle { font-size: .78rem; }
+    .field { margin-bottom: 12px; }
     .field input { padding: 10px 12px; font-size: .88rem; }
     .btn-primary, .btn-secondary { padding: 11px; font-size: .9rem; }
-    .code-display { font-size: 2rem !important; }
-    .timer-ring { width: 64px !important; height: 64px !important; }
+    .code-display { font-size: 1.9rem !important; letter-spacing: .12em; }
+    .timer-ring { width: 56px !important; height: 56px !important; }
+    .logo-icon img { width: 60px !important; height: 60px !important; }
 }
 @media (max-height: 700px) {
     .auth-card-hero { padding-top: 20px; }
@@ -2752,8 +2759,32 @@ if ($action == 'auth_shell') {
 <?= renderHeadAssets() ?>
 <style>
 <?= getAuthSharedCss() ?>
-section[data-view]{transition:opacity .25s ease;opacity:1}
-section[data-view].is-hidden{opacity:0;pointer-events:none;position:absolute;visibility:hidden;left:-9999px;top:-9999px}
+section[data-view]{
+    transition: opacity .28s ease, transform .28s ease;
+    opacity: 1;
+    transform: translateY(0);
+}
+section[data-view].is-hidden{
+    opacity: 0;
+    transform: translateY(8px);
+    pointer-events: none;
+    position: absolute;
+    visibility: hidden;
+    left: -9999px;
+    top: -9999px;
+}
+section[data-view].is-leaving{
+    opacity: 0;
+    transform: translateY(-8px);
+    pointer-events: none;
+}
+section[data-view].is-entering{
+    opacity: 0;
+    transform: translateY(8px);
+}
+.auth-card {
+    transition: max-height .35s ease;
+}
 .auth-link-row{margin-top:14px;text-align:center;font-size:.82rem;color:#94a3b8}
 .auth-link-row a,.auth-link-row button.text-link{color:#3b82f6;text-decoration:none;font-weight:600;background:none;border:none;font-family:inherit;font-size:inherit;cursor:pointer;padding:0}
 .spa-noscript{background:rgba(127,29,29,.4);border:1px solid rgba(239,68,68,.3);color:#fee2e2;padding:10px 14px;border-radius:10px;margin-bottom:16px;font-size:.85rem;text-align:center}
@@ -3041,24 +3072,48 @@ section[data-view].is-hidden{opacity:0;pointer-events:none;position:absolute;vis
         },
         show: function(view, opts){
             opts = opts || {};
-            if (!this.sectionFor(view)) return;
-            if (this.current === view && !opts.force) return;
-            var prev = this.sectionFor(this.current);
             var next = this.sectionFor(view);
+            if (!next) return;
+            if (this.current === view && !opts.force) return;
+
+            var prev = this.current ? this.sectionFor(this.current) : null;
+            var self = this;
+            var doEnter = function(){
+                next.classList.remove('is-hidden');
+                next.classList.add('is-entering');
+                // Force reflow so the entering state paints
+                void next.offsetHeight;
+                next.classList.remove('is-entering');
+                self.refreshCaptchas(next);
+                self.clearError(next);
+            };
+
             if (prev && prev !== next) {
-                prev.style.opacity = '0';
-                setTimeout(function(){ prev.classList.add('is-hidden'); prev.style.opacity = ''; }, 250);
+                prev.classList.add('is-leaving');
+                setTimeout(function(){
+                    prev.classList.remove('is-leaving');
+                    prev.classList.add('is-hidden');
+                    doEnter();
+                }, 220);
+            } else {
+                doEnter();
             }
-            next.classList.remove('is-hidden');
-            next.style.opacity = '0';
-            requestAnimationFrame(function(){ next.style.opacity = '1'; });
-            this.refreshCaptchas(next);
-            this.clearError(next);
+
             this.current = view;
             if (!opts.fromPop) {
-                history.pushState({view: view}, '', '?action=auth_shell&view=' + view);
+                var qs = new URLSearchParams(location.search);
+                qs.set('action', 'auth_shell');
+                qs.set('view', view);
+                history.pushState({view: view}, '', '?' + qs.toString());
             }
-            if (view === 'verify') this.initVerify();
+
+            if (view === 'verify' && !this._verifyInit) this.initVerify();
+
+            // Move focus to first input of new section (accessibility + UX)
+            setTimeout(function(){
+                var firstInput = next.querySelector('input:not([type=hidden]):not([disabled])');
+                if (firstInput && view !== 'verify') firstInput.focus();
+            }, 250);
         },
         applyVerify: function(data){
             if (!data) return;

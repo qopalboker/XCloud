@@ -2233,6 +2233,204 @@ function renderHeadAssets() {
 HTML;
 }
 
+function renderPwaInstallPopup() {
+    return <<<'HTML'
+<style>
+/* ---- shared ---- */
+#xcloud-pwa-overlay {
+    display: none;
+    position: fixed;
+    inset: 0;
+    z-index: 9998;
+    background: rgba(0,0,0,0);
+    transition: background .3s ease;
+    pointer-events: none;
+}
+#xcloud-pwa-overlay.visible {
+    background: rgba(0,0,0,.45);
+    pointer-events: auto;
+}
+#xcloud-pwa-popup {
+    display: none;
+    position: fixed;
+    z-index: 9999;
+    box-sizing: border-box;
+    font-family: 'Dana','JetBrains Mono',sans-serif;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    width: 100%;
+    background: #131c2e;
+    border-top: 1px solid rgba(59,130,246,.25);
+    border-radius: 24px 24px 0 0;
+    padding: 10px 20px 32px;
+    transform: translateY(110%);
+    transition: transform .4s cubic-bezier(.16,1,.3,1), opacity .4s;
+    opacity: 0;
+    pointer-events: none;
+}
+#xcloud-pwa-popup.visible { opacity: 1; pointer-events: auto; transform: translateY(0); }
+.xpwa-handle { width: 40px; height: 4px; background: #2a3a50; border-radius: 2px; margin: 0 auto 18px; }
+.xpwa-row { display: flex; align-items: center; gap: 14px; margin-bottom: 18px; }
+.xpwa-icon { width: 52px; height: 52px; border-radius: 15px; background: linear-gradient(135deg, #3b82f6, #8b5cf6); display: flex; align-items: center; justify-content: center; flex-shrink: 0; box-shadow: 0 4px 16px rgba(59,130,246,.3); }
+.xpwa-info { flex: 1; min-width: 0; }
+.xpwa-title { font-size: .92rem; font-weight: 800; color: #f1f5f9; margin: 0 0 4px; line-height: 1.2; }
+.xpwa-sub { font-size: .76rem; color: #64748b; margin: 0; line-height: 1.5; }
+.xpwa-actions { display: flex; gap: 10px; }
+.xpwa-btn-install { flex: 1; padding: 13px; border: none; border-radius: 13px; background: linear-gradient(135deg, #3b82f6, #6366f1); color: white; font-size: .88rem; font-weight: 800; cursor: pointer; transition: opacity .2s, transform .15s; box-shadow: 0 4px 16px rgba(59,130,246,.25); }
+.xpwa-btn-install:hover { opacity: .9; }
+.xpwa-btn-install:active { transform: scale(.97); }
+.xpwa-btn-later { padding: 13px 18px; border: 1px solid #1e293b; border-radius: 13px; background: transparent; color: #475569; font-size: .88rem; font-weight: 700; cursor: pointer; transition: background .2s, color .2s; white-space: nowrap; }
+.xpwa-btn-later:hover { background: #1e293b; color: #94a3b8; }
+#xcloud-pwa-close { position: absolute; top: 16px; left: 16px; width: 28px; height: 28px; border-radius: 50%; background: #1e293b; border: none; color: #475569; font-size: .8rem; cursor: pointer; display: flex; align-items: center; justify-content: center; transition: background .2s, color .2s; padding: 0; line-height: 1; }
+#xcloud-pwa-close:hover { background: #374151; color: #e2e8f0; }
+@media (min-width: 640px) {
+    #xcloud-pwa-overlay { display: none !important; }
+    #xcloud-pwa-popup { bottom: 24px; left: 24px; right: auto; width: 300px; border-radius: 20px; border: 1px solid rgba(59,130,246,.2); padding: 18px; transform: translateY(16px); box-shadow: 0 16px 48px rgba(0,0,0,.5); }
+    #xcloud-pwa-popup.visible { transform: translateY(0); }
+    .xpwa-handle { display: none; }
+    .xpwa-icon { width: 46px; height: 46px; border-radius: 13px; }
+    .xpwa-title { font-size: .86rem; }
+    .xpwa-sub { font-size: .73rem; }
+    .xpwa-divider { height: 1px; background: #1e293b; margin: 14px 0; }
+    .xpwa-btn-install { padding: 10px; font-size: .8rem; border-radius: 10px; }
+    .xpwa-btn-later  { padding: 10px 14px; font-size: .8rem; border-radius: 10px; }
+    #xcloud-pwa-close { top: 12px; left: 12px; width: 24px; height: 24px; font-size: .72rem; }
+}
+</style>
+<div id="xcloud-pwa-overlay"></div>
+<div id="xcloud-pwa-popup" role="dialog" aria-label="نصب اپ XCloud">
+    <button id="xcloud-pwa-close" aria-label="بستن">✕</button>
+    <div class="xpwa-handle"></div>
+    <div class="xpwa-row">
+        <div class="xpwa-icon">
+            <img src="/icons/web-app-manifest-512x512.png" alt="XCloud" style="width:38px;height:38px;border-radius:10px;object-fit:contain;">
+        </div>
+        <div class="xpwa-info">
+            <p class="xpwa-title">نصب XCloud</p>
+            <p class="xpwa-sub">اپ را به صفحه اصلی اضافه کنید<br>و بدون مرورگر استفاده کنید</p>
+        </div>
+    </div>
+    <div class="xpwa-divider"></div>
+    <div class="xpwa-actions">
+        <button class="xpwa-btn-install" id="xcloud-pwa-install">نصب اپ</button>
+        <button class="xpwa-btn-later"   id="xcloud-pwa-later">بعداً</button>
+    </div>
+</div>
+<script>
+(function () {
+    if (window.__xcloudPwaPopupInit) return;
+    window.__xcloudPwaPopupInit = true;
+
+    var REMIND_AFTER_DAYS = 1;
+    var SHOW_DELAY_MS     = 2500;
+    var STORAGE_KEY       = 'xcloud_pwa_dismissed';
+    var INSTALLED_KEY     = 'xcloud_pwa_installed';
+
+    var popup      = document.getElementById('xcloud-pwa-popup');
+    var overlay    = document.getElementById('xcloud-pwa-overlay');
+    var btnClose   = document.getElementById('xcloud-pwa-close');
+    var btnInstall = document.getElementById('xcloud-pwa-install');
+    var btnLater   = document.getElementById('xcloud-pwa-later');
+    if (!popup || !overlay || !btnClose || !btnInstall || !btnLater) return;
+    var deferredPrompt = null;
+
+    var isStandalone = window.matchMedia('(display-mode: standalone)').matches || window.navigator.standalone === true;
+    if (isStandalone) return;
+
+    var isIOS = /iphone|ipad|ipod/i.test(navigator.userAgent) && !window.MSStream;
+
+    function shouldShow() {
+        if (localStorage.getItem(INSTALLED_KEY)) return false;
+        var raw = localStorage.getItem(STORAGE_KEY);
+        if (!raw) return true;
+        try {
+            var days = (Date.now() - JSON.parse(raw).ts) / 86400000;
+            return days >= REMIND_AFTER_DAYS;
+        } catch (e) { return true; }
+    }
+
+    function isMobile() { return window.innerWidth < 640; }
+
+    function showPopup() {
+        if (!shouldShow()) return;
+        popup.style.display = 'block';
+        if (isMobile()) overlay.style.display = 'block';
+        requestAnimationFrame(function () {
+            requestAnimationFrame(function () {
+                popup.classList.add('visible');
+                if (isMobile()) overlay.classList.add('visible');
+            });
+        });
+    }
+
+    function hidePopup(permanent) {
+        popup.classList.remove('visible');
+        overlay.classList.remove('visible');
+        setTimeout(function () {
+            popup.style.display = 'none';
+            overlay.style.display = 'none';
+        }, 420);
+        if (permanent) {
+            localStorage.setItem(INSTALLED_KEY, '1');
+        } else {
+            localStorage.setItem(STORAGE_KEY, JSON.stringify({ ts: Date.now() }));
+        }
+    }
+
+    btnClose.addEventListener('click', function () { hidePopup(false); });
+    btnLater.addEventListener('click', function () { hidePopup(false); });
+    overlay.addEventListener('click', function (e) { if (e.target === overlay) hidePopup(false); });
+
+    if (isIOS) {
+        var titleEl = popup.querySelector('.xpwa-title');
+        var subEl   = popup.querySelector('.xpwa-sub');
+        if (titleEl) titleEl.textContent = 'نصب روی iPhone / iPad';
+        if (subEl)   subEl.innerHTML = 'دکمه <strong>اشتراک‌گذاری</strong> 🔗 را بزنید<br>سپس <strong>«Add to Home Screen»</strong> را انتخاب کنید';
+        if (btnInstall) {
+            btnInstall.textContent = 'متوجه شدم ✓';
+            btnInstall.addEventListener('click', function () { hidePopup(true); });
+        }
+        setTimeout(showPopup, SHOW_DELAY_MS);
+        return;
+    }
+
+    btnInstall.addEventListener('click', function () {
+        if (!deferredPrompt) return;
+        deferredPrompt.prompt();
+        deferredPrompt.userChoice.then(function (r) {
+            if (r.outcome === 'accepted') hidePopup(true);
+            deferredPrompt = null;
+        });
+    });
+
+    window.addEventListener('beforeinstallprompt', function (e) {
+        e.preventDefault();
+        deferredPrompt = e;
+        var headerBtn = document.getElementById('pwa-install-btn');
+        if (headerBtn) headerBtn.style.display = 'inline-flex';
+        setTimeout(showPopup, SHOW_DELAY_MS);
+    });
+
+    window.addEventListener('appinstalled', function () {
+        hidePopup(true);
+        var headerBtn = document.getElementById('pwa-install-btn');
+        if (headerBtn) headerBtn.style.display = 'none';
+    });
+
+    window.installPWA = function () {
+        if (!deferredPrompt) return;
+        deferredPrompt.prompt();
+        deferredPrompt.userChoice.then(function (r) {
+            if (r.outcome === 'accepted') hidePopup(true);
+            deferredPrompt = null;
+        });
+    };
+})();
+</script>
+HTML;
+}
+
 function renderInAppHeader($title, $backUrl = '?action=dashboard', $backLabel = '← بازگشت') {
     return '<header class="app-header">'
          . '<a href="' . h($backUrl) . '" class="back-link">' . h($backLabel) . '</a>'
@@ -3707,6 +3905,7 @@ section[data-view].is-entering{
     if (pkBtn) pkBtn.addEventListener('click', pkLogin);
 })();
 </script>
+<?= renderPwaInstallPopup() ?>
 </body></html>
 <?php
     exit;

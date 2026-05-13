@@ -545,15 +545,13 @@ function inbound_apply_payload($pdo, array $otpRow) {
         $st = $pdo->prepare("SELECT id FROM users WHERE username = ? OR email = ?");
         $st->execute([$username, $email]);
         if ($st->fetch()) return;
-        $cd   = (int)getSetting($pdo, 'default_user_can_download', 1);
-        $ccp  = (int)getSetting($pdo, 'default_user_can_change_password', 1);
-        $cdel = (int)getSetting($pdo, 'default_user_can_delete', 0);
-        $csh  = (int)getSetting($pdo, 'default_user_can_share', 0);
+        // Email-verified self-registered users get full permissions by design.
+        // Admin-created users continue to use default_user_can_* settings.
         $ins = $pdo->prepare("INSERT INTO users
             (username, password, email, email_verified, email_verified_at, role,
              can_download, can_change_password, can_delete, can_share)
-            VALUES (?, ?, ?, 1, NOW(), 'user', ?, ?, ?, ?)");
-        $ins->execute([$username, $payload['password_hash'], $email, $cd, $ccp, $cdel, $csh]);
+            VALUES (?, ?, ?, 1, NOW(), 'user', 1, 1, 1, 1)");
+        $ins->execute([$username, $payload['password_hash'], $email]);
         logActivity($pdo, $username, 'inbound_register_completed', $email);
     } elseif ($purpose === 'email_add') {
         // Admin-only flow in Phase 10; supports legacy email_add OTPs too.
@@ -1020,7 +1018,8 @@ catch(PDOException $e){die("خطا در ارتباط با دیتابیس");}
 // Create tables
 $pdo->exec("CREATE TABLE IF NOT EXISTS users (id INT AUTO_INCREMENT PRIMARY KEY,username VARCHAR(50) UNIQUE NOT NULL,password VARCHAR(255) NOT NULL,role VARCHAR(20) DEFAULT 'user',can_download TINYINT(1) NOT NULL DEFAULT 0,can_change_password TINYINT(1) NOT NULL DEFAULT 0,can_delete TINYINT(1) NOT NULL DEFAULT 0,created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)");
 $pdo->exec("CREATE TABLE IF NOT EXISTS activity_log (id INT AUTO_INCREMENT PRIMARY KEY,username VARCHAR(50) NOT NULL,action_type VARCHAR(30) NOT NULL,target VARCHAR(500) DEFAULT NULL,details TEXT DEFAULT NULL,ip_address VARCHAR(45) DEFAULT NULL,created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,INDEX idx_username(username),INDEX idx_action(action_type),INDEX idx_created(created_at))");
-$pdo->exec("CREATE TABLE IF NOT EXISTS trash_items (id INT AUTO_INCREMENT PRIMARY KEY,original_owner VARCHAR(50) NOT NULL,original_filename VARCHAR(500) NOT NULL,trash_filename VARCHAR(600) NOT NULL,deleted_by VARCHAR(50) NOT NULL,file_size BIGINT DEFAULT 0,deleted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,INDEX idx_owner(original_owner),INDEX idx_deleted(deleted_at))");
+$pdo->exec("CREATE TABLE IF NOT EXISTS trash_items (id INT AUTO_INCREMENT PRIMARY KEY,original_owner VARCHAR(50) NOT NULL,original_filename VARCHAR(500) NOT NULL,trash_filename VARCHAR(600) NOT NULL,deleted_by VARCHAR(50) NOT NULL,file_size BIGINT DEFAULT 0,is_public TINYINT(1) NOT NULL DEFAULT 0,deleted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,INDEX idx_owner(original_owner),INDEX idx_deleted(deleted_at))");
+try{$pdo->exec("ALTER TABLE trash_items ADD COLUMN is_public TINYINT(1) NOT NULL DEFAULT 0");}catch(Exception $e){}
 $pdo->exec("CREATE TABLE IF NOT EXISTS settings (id INT AUTO_INCREMENT PRIMARY KEY,setting_key VARCHAR(100) UNIQUE NOT NULL,setting_value TEXT,updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP)");
 
 $pdo->exec("CREATE TABLE IF NOT EXISTS passkeys (
@@ -2278,12 +2277,6 @@ if($action=='public_upload_process'){
         if(move_uploaded_file($f["tmp_name"],$tf)){
             $st=$pdo->prepare("INSERT INTO public_files (filename,uploaded_by,file_size) VALUES(?,?,?)");
             $st->execute([$finalName,$_SESSION['user'],$f["size"]]);
-            $fileId=$pdo->lastInsertId();
-            foreach($selectedUsers as $su){
-                $su=trim($su);if(empty($su))continue;
-                $ins=$pdo->prepare("INSERT IGNORE INTO public_file_access (file_id,username) VALUES(?,?)");
-                $ins->execute([$fileId,$su]);
-            }
             logActivity($pdo,$_SESSION['user'],'public_upload',$finalName,"حجم: ".formatBytes($f["size"]));
             $ok++;
         }else{$fail++;}
@@ -2291,35 +2284,28 @@ if($action=='public_upload_process'){
     header("Location: ?action=dashboard&tab=public&".buildUploadStatusQuery($ok,$fail,$tooLarge,0));exit;
 }
 
-// ── Update public file access ──
+// ── Update public file access (deprecated: public files are now visible to all users) ──
 if($action=='update_public_access'){
     if(!isset($_SESSION['user'])||$_SESSION['role']!=='admin')die("دسترسی غیرمجاز!");verifyCsrf();
-    $fileId=(int)($_POST['file_id']??0);
-    if($fileId>0){
-        $pdo->prepare("DELETE FROM public_file_access WHERE file_id=?")->execute([$fileId]);
-        $selectedUsers=$_POST['access_users']??[];
-        if(is_array($selectedUsers)){
-            foreach($selectedUsers as $su){
-                $su=trim($su);if(empty($su))continue;
-                $ins=$pdo->prepare("INSERT IGNORE INTO public_file_access (file_id,username) VALUES(?,?)");
-                $ins->execute([$fileId,$su]);
-            }
-        }
-        logActivity($pdo,$_SESSION['user'],'update_public_access',"file_id=$fileId");
-    }
     header("Location: ?action=dashboard&tab=public&msg=access_updated");exit;
 }
 
 // ── Delete public file (admin only) ──
 if($action=='delete_public_file'){
     if(!isset($_SESSION['user'])||$_SESSION['role']!=='admin')die("دسترسی غیرمجاز!");
-    global $public_base;
+    global $public_base,$trash_base;
     $fid=(int)($_GET['file_id']??0);
     $st=$pdo->prepare("SELECT * FROM public_files WHERE id=?");$st->execute([$fid]);$pf=$st->fetch();
     if($pf){
         $fp=$public_base.$pf['filename'];
-        if(file_exists($fp))@unlink($fp);
-        $pdo->prepare("DELETE FROM public_file_access WHERE file_id=?")->execute([$fid]);
+        if(file_exists($fp)){
+            $trashFn=time().'_PUBLIC_'.preg_replace('/[^a-zA-Z0-9_-]/','_',$pf['filename']);
+            $tp=$trash_base.$trashFn;
+            if(rename($fp,$tp)){
+                $st=$pdo->prepare("INSERT INTO trash_items (original_owner,original_filename,trash_filename,deleted_by,file_size,is_public) VALUES('__public__',?,?,?,?,1)");
+                $st->execute([$pf['filename'],$trashFn,$_SESSION['user'],filesize($tp)]);
+            }
+        }
         $pdo->prepare("DELETE FROM public_files WHERE id=?")->execute([$fid]);
         logActivity($pdo,$_SESSION['user'],'delete_public',$pf['filename']);
     }
@@ -2605,11 +2591,9 @@ if($action=='unshare_file'){
     header("Location: ?action=dashboard&msg=unshared");exit;
 }
 
-// ── Remove self from public file access ──
+// ── Remove self from public file access (deprecated: public files are now visible to all users) ──
 if($action=='remove_public_access'){
     if(!isset($_SESSION['user']))die("خطای امنیتی!");
-    $fid=(int)($_GET['file_id']??0);
-    $pdo->prepare("DELETE FROM public_file_access WHERE file_id=? AND username=?")->execute([$fid,$_SESSION['user']]);
     header("Location: ?action=dashboard&tab=public&msg=removed");exit;
 }
 
@@ -2623,13 +2607,10 @@ if($action=='get_shares'){
     echo json_encode(['shares'=>$st->fetchAll(PDO::FETCH_ASSOC)]);exit;
 }
 
-// ── Get public file access list (AJAX) ──
+// ── Get public file access list (AJAX, deprecated: public files are visible to all users) ──
 if($action=='get_public_access'){
     header('Content-Type: application/json');
-    if(!isset($_SESSION['user'])||$_SESSION['role']!=='admin'){echo json_encode(['users'=>[]]);exit;}
-    $fid=(int)($_GET['file_id']??0);
-    $st=$pdo->prepare("SELECT username FROM public_file_access WHERE file_id=?");$st->execute([$fid]);
-    echo json_encode(['users'=>$st->fetchAll(PDO::FETCH_COLUMN)]);exit;
+    echo json_encode(['users'=>[]]);exit;
 }
 
 if($action=='download'){
@@ -2644,15 +2625,11 @@ if($action=='download'){
         $pfid=(int)$_GET['public_file_id'];
         $pfs=$pdo->prepare("SELECT * FROM public_files WHERE id=?");$pfs->execute([$pfid]);$pf=$pfs->fetch();
         if($pf){
-            $hasAccess=$_SESSION['role']==='admin';
-            if(!$hasAccess){$ac=$pdo->prepare("SELECT id FROM public_file_access WHERE file_id=? AND username=?");$ac->execute([$pfid,$_SESSION['user']]);$hasAccess=(bool)$ac->fetch();}
-            if($hasAccess){
-                $fp=$public_base.$pf['filename'];
-                if(file_exists($fp)){
-                    logActivity($pdo,$_SESSION['user'],'download',$pf['filename'],'فایل عمومی');
-                    header('Content-Type: application/octet-stream');header('Content-Disposition: attachment; filename="'.$pf['filename'].'"');
-                    header('Content-Length: '.filesize($fp));readfile($fp);exit;
-                }
+            $fp=$public_base.$pf['filename'];
+            if(file_exists($fp)){
+                logActivity($pdo,$_SESSION['user'],'download',$pf['filename'],'فایل عمومی');
+                header('Content-Type: application/octet-stream');header('Content-Disposition: attachment; filename="'.$pf['filename'].'"');
+                header('Content-Length: '.filesize($fp));readfile($fp);exit;
             }
         }
         header("Location: ?action=dashboard&tab=public&msg=not_found");exit;
@@ -3301,12 +3278,28 @@ if($action=='trash_restore'){
     $s=$pdo->prepare("SELECT * FROM trash_items WHERE id=?");$s->execute([$tid]);$item=$s->fetch();
     if($item){
         $tp=$trash_base.$item['trash_filename'];
-        $rp=getUserUploadPath($item['original_owner']).$item['original_filename'];
-        if(file_exists($rp)){$ext=pathinfo($item['original_filename'],PATHINFO_EXTENSION);$nm=pathinfo($item['original_filename'],PATHINFO_FILENAME);$rp=getUserUploadPath($item['original_owner']).$nm.'_restored_'.time().($ext?".$ext":'');}
-        if(file_exists($tp)&&rename($tp,$rp)){
-            $pdo->prepare("DELETE FROM trash_items WHERE id=?")->execute([$tid]);
-            logActivity($pdo,$_SESSION['user'],'trash_restore',$item['original_filename'],"به: ".$item['original_owner']);
-            header("Location: ?action=trash&msg=restored");exit;}}
+        $isPublic=!empty($item['is_public'])||$item['original_owner']==='__public__';
+        if($isPublic){
+            $rp=$public_base.$item['original_filename'];
+            if(file_exists($rp)){$ext=pathinfo($item['original_filename'],PATHINFO_EXTENSION);$nm=pathinfo($item['original_filename'],PATHINFO_FILENAME);$rp=$public_base.$nm.'_restored_'.time().($ext?".$ext":'');}
+            if(file_exists($tp)&&rename($tp,$rp)){
+                $restoredName=basename($rp);
+                $ins=$pdo->prepare("INSERT INTO public_files (filename,uploaded_by,file_size) VALUES(?,?,?)");
+                $ins->execute([$restoredName,$_SESSION['user'],filesize($rp)]);
+                $pdo->prepare("DELETE FROM trash_items WHERE id=?")->execute([$tid]);
+                logActivity($pdo,$_SESSION['user'],'trash_restore',$item['original_filename'],'فایل عمومی');
+                header("Location: ?action=trash&msg=restored");exit;
+            }
+        }else{
+            $rp=getUserUploadPath($item['original_owner']).$item['original_filename'];
+            if(file_exists($rp)){$ext=pathinfo($item['original_filename'],PATHINFO_EXTENSION);$nm=pathinfo($item['original_filename'],PATHINFO_FILENAME);$rp=getUserUploadPath($item['original_owner']).$nm.'_restored_'.time().($ext?".$ext":'');}
+            if(file_exists($tp)&&rename($tp,$rp)){
+                $pdo->prepare("DELETE FROM trash_items WHERE id=?")->execute([$tid]);
+                logActivity($pdo,$_SESSION['user'],'trash_restore',$item['original_filename'],"به: ".$item['original_owner']);
+                header("Location: ?action=trash&msg=restored");exit;
+            }
+        }
+    }
     header("Location: ?action=trash&msg=restore_error");exit;
 }
 
@@ -4831,15 +4824,10 @@ elseif($action=='dashboard'){
     $ss=$pdo->prepare("SELECT fs.*, fs.id as share_id FROM file_shares fs WHERE fs.shared_with=? ORDER BY fs.created_at DESC");
     $ss->execute([$viewUser]);$sharedWithMe=$ss->fetchAll(PDO::FETCH_ASSOC);
 
-    // Public files
+    // Public files (visible to all logged-in users)
     $publicFiles=[];
     if($activeTab==='public'){
-        if($role==='admin'){
-            $pfs=$pdo->query("SELECT * FROM public_files ORDER BY created_at DESC");$publicFiles=$pfs->fetchAll(PDO::FETCH_ASSOC);
-        }else{
-            $pfs=$pdo->prepare("SELECT pf.* FROM public_files pf INNER JOIN public_file_access pfa ON pf.id=pfa.file_id WHERE pfa.username=? ORDER BY pf.created_at DESC");
-            $pfs->execute([$_SESSION['user']]);$publicFiles=$pfs->fetchAll(PDO::FETCH_ASSOC);
-        }
+        $pfs=$pdo->query("SELECT * FROM public_files ORDER BY id DESC");$publicFiles=$pfs->fetchAll(PDO::FETCH_ASSOC);
     }
     // Folder management
     $userFolders = getUserFolders($pdo, $viewUser);
@@ -6511,7 +6499,11 @@ elseif($action=='trash'){
             <div class="trash-meta">
                 <div class="trash-name" title="<?php echo h($it['original_filename']);?>"><?php echo h($it['original_filename']);?></div>
                 <div class="trash-details">
-                    <span>👤 <?php echo h($it['original_owner']);?></span>
+                    <?php if(!empty($it['is_public'])||$it['original_owner']==='__public__'):?>
+                        <span style="background:#dbeafe;color:#1e40af;padding:1px 6px;border-radius:4px">📢 عمومی</span>
+                    <?php else:?>
+                        <span>👤 <?php echo h($it['original_owner']);?></span>
+                    <?php endif;?>
                     <span>🗑 <?php echo h($it['deleted_by']);?></span>
                     <span>📅 <?php echo to_jalali($it['deleted_at']);?></span>
                     <span>💾 <?php echo formatBytes($it['file_size']);?></span>

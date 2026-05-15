@@ -544,8 +544,19 @@ function inbound_apply_payload($pdo, array $otpRow) {
 
     if ($purpose === 'register') {
         if (empty($payload['username']) || empty($payload['password_hash'])) return;
-        $username = $payload['username'];
-        // Race-check: skip if username or email already taken
+        // Normalize + strict validate even though register_step1_process already
+        // validated at form-submit time. Defense-in-depth: payload could have
+        // been crafted before validateUsernameStrict was deployed, or could come
+        // from a future caller. Also ensures the stored row is lowercase.
+        $username = normalizeUsername($payload['username']);
+        $err = validateUsernameStrict($pdo, $username);
+        if ($err !== null) {
+            logActivity($pdo, 'system', 'inbound_register_rejected', $email, "invalid_username: $err");
+            return;
+        }
+        // Race-check: skip if email already taken. Username uniqueness is already
+        // covered by validateUsernameStrict, but the OR-clause is kept for the
+        // email leg (cheaper than a separate query).
         $st = $pdo->prepare("SELECT id FROM users WHERE username = ? OR email = ?");
         $st->execute([$username, $email]);
         if ($st->fetch()) return;
@@ -5171,7 +5182,12 @@ if($action=='set_caption'){
 
 if($action=='add_user'){
     if(!isset($_SESSION['user'])||$_SESSION['role']!=='admin')die("دسترسی غیرمجاز!");verifyCsrf();
-    $nu=trim($_POST['new_username']??'');$np=$_POST['new_password']??'';
+    $nu=normalizeUsername($_POST['new_username']??'');$np=$_POST['new_password']??'';
+    // Strict validation surfaces a Persian error covering length, regex,
+    // reserved words, and uniqueness. The legacy strlen($nu)>=3 + duplicate
+    // SELECT below become redundant but are left in as defense-in-depth.
+    $err=validateUsernameStrict($pdo,$nu);
+    if($err!==null){header("Location: ?action=users&error=".urlencode($err));exit;}
     $nr=in_array($_POST['new_role']??'',['admin','user'])?$_POST['new_role']:'user';
     $cd=isset($_POST['can_download'])?1:0;$ccp=isset($_POST['can_change_password'])?1:0;$cdel=isset($_POST['can_delete'])?1:0;$csh=isset($_POST['can_share'])?1:0;
     if($nr==='admin'){$cd=1;$ccp=1;$cdel=1;$csh=1;}
@@ -5620,7 +5636,7 @@ if ($action == 'register_step1_process') {
     $json = wants_json();
 
     $email           = trim(mb_strtolower($_POST['email'] ?? ''));
-    $username        = trim($_POST['username'] ?? '');
+    $username        = normalizeUsername($_POST['username'] ?? '');
     $password        = $_POST['password'] ?? '';
     $passwordConfirm = $_POST['password_confirm'] ?? '';
     $captchaAnswer   = $_POST['captcha'] ?? '';
@@ -5633,7 +5649,11 @@ if ($action == 'register_step1_process') {
     // Captcha first (always invalidates regardless of outcome)
     if (!math_captcha_verify($captchaAnswer)) { $regErr('captcha_wrong'); }
     if (!validate_email_address($email))      { $regErr('invalid_email'); }
-    if (!validate_username($username))        { $regErr('invalid_username'); }
+    // Strict validation collapses to the existing 'invalid_username' short code
+    // so the register_step1 renderer's Persian-message map stays unchanged.
+    // The four reasons (length / regex / reserved / taken) are intentionally
+    // merged at this layer; granular codes can be added in a follow-up.
+    if (validateUsernameStrict($pdo, $username) !== null) { $regErr('invalid_username'); }
     if ($password !== $passwordConfirm)       { $regErr('password_mismatch'); }
     if (!validate_password_strength($password)) { $regErr('weak_password'); }
 
@@ -9153,6 +9173,10 @@ elseif($action=='users'){
         'perms_error'=>['❌','خطا در تغییر دسترسی'],'password_changed'=>['✅','رمز تغییر کرد'],'password_error'=>['❌','خطا در تغییر رمز'],
         'email_set'=>['✅','ایمیل به‌روز شد'],'email_invalid'=>['❌','فرمت ایمیل نامعتبر'],'email_taken'=>['⚠️','این ایمیل برای کاربر دیگری ثبت شده'],'email_error'=>['❌','خطا در ثبت ایمیل']];
     $msg=$_GET['msg']??'';
+    // Free-form Persian error from validateUsernameStrict (add_user etc.).
+    // Surfaced via the toast IIFE near the end of this page.
+    $errText=(string)($_GET['error']??'');
+    if(mb_strlen($errText)>500)$errText=mb_substr($errText,0,500);
     ?><!DOCTYPE html><html lang="fa" dir="rtl"><head>
     <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
     <title>XCloud — کاربران</title>
@@ -9473,7 +9497,15 @@ elseif($action=='users'){
     function closeEmailModal(){document.getElementById('emailModal').classList.remove('open');}
     document.getElementById('emailModal').addEventListener('click',function(e){if(e.target===this)closeEmailModal();});
     (function(){const msgs=<?php echo json_encode($umsgs);?>;const msg='<?php echo h($msg);?>';
-        if(msg&&msgs[msg]){const t=document.getElementById('toast');t.innerHTML='<span>'+msgs[msg][0]+'</span><span>'+msgs[msg][1]+'</span>';
+        const errText=<?php echo json_encode($errText, JSON_UNESCAPED_UNICODE|JSON_HEX_TAG|JSON_HEX_QUOT|JSON_HEX_APOS|JSON_HEX_AMP);?>;
+        const t=document.getElementById('toast');
+        if(errText){
+            // Build with textContent to neutralize any markup in the error string.
+            const icon=document.createElement('span');icon.textContent='❌';
+            const body=document.createElement('span');body.textContent=errText;
+            t.innerHTML='';t.appendChild(icon);t.appendChild(body);
+            setTimeout(()=>t.classList.add('show'),80);setTimeout(()=>t.classList.remove('show'),5000);
+        }else if(msg&&msgs[msg]){t.innerHTML='<span>'+msgs[msg][0]+'</span><span>'+msgs[msg][1]+'</span>';
             setTimeout(()=>t.classList.add('show'),80);setTimeout(()=>t.classList.remove('show'),3200);}
     })();
 

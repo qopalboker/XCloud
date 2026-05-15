@@ -2737,6 +2737,36 @@ try { $pdo->exec("ALTER TABLE raw_tokens MODIFY COLUMN file_type ENUM('user','pu
 try { $pdo->exec("ALTER TABLE share_links ADD COLUMN tab_id INT NULL DEFAULT NULL"); } catch (Exception $e) {}
 try { $pdo->exec("ALTER TABLE share_links ADD INDEX idx_tab_id (tab_id)"); } catch (Exception $e) {}
 
+// ─── One-shot defensive audit of legacy non-conforming usernames ─────
+// Mirrors the maybeRunTrashCleanup gate pattern at line ~1000. Runs at
+// most once (gated by settings.username_audit_v1_done). Read-only:
+// surfaces non-canonical rows via error_log without mutating data.
+// To re-run after data migration: DELETE FROM settings WHERE setting_key='username_audit_v1_done'.
+if (getSetting($pdo, 'username_audit_v1_done', '0') !== '1') {
+    $checks = [
+        "users"                        => "SELECT username FROM users WHERE username != LOWER(username) OR username NOT REGEXP '^[a-z][a-z0-9]{2,29}$'",
+        "activity_log.username"        => "SELECT DISTINCT username FROM activity_log WHERE username NOT IN ('system','unknown','__public__') AND username != LOWER(username)",
+        "file_shares.shared_with"      => "SELECT DISTINCT shared_with FROM file_shares WHERE shared_with != LOWER(shared_with)",
+        "file_shares.shared_by"        => "SELECT DISTINCT shared_by   FROM file_shares WHERE shared_by   != LOWER(shared_by)",
+        "public_files.uploaded_by"     => "SELECT DISTINCT uploaded_by FROM public_files WHERE uploaded_by != LOWER(uploaded_by)",
+        "trash_items.original_owner"   => "SELECT DISTINCT original_owner FROM trash_items WHERE original_owner != '__public__' AND original_owner != LOWER(original_owner)",
+        "trash_items.deleted_by"       => "SELECT DISTINCT deleted_by  FROM trash_items WHERE deleted_by  != LOWER(deleted_by)",
+        "share_links.owner"            => "SELECT DISTINCT owner       FROM share_links  WHERE owner       != LOWER(owner)",
+        "folders.owner"                => "SELECT DISTINCT owner       FROM folders      WHERE owner       != LOWER(owner)",
+        "file_folders.owner"           => "SELECT DISTINCT owner       FROM file_folders WHERE owner       != LOWER(owner)",
+        "file_captions.owner"          => "SELECT DISTINCT owner       FROM file_captions WHERE owner      != LOWER(owner)",
+        "raw_tokens.created_by"        => "SELECT DISTINCT created_by  FROM raw_tokens   WHERE created_by  != LOWER(created_by)",
+        "raw_tokens.file_owner"        => "SELECT DISTINCT file_owner  FROM raw_tokens   WHERE file_owner  != '__public__' AND file_owner != LOWER(file_owner)",
+    ];
+    foreach ($checks as $label => $sql) {
+        try {
+            $rows = $pdo->query($sql)->fetchAll(PDO::FETCH_COLUMN);
+            if (!empty($rows)) error_log("XCloud non-conforming username in $label: " . implode(',', $rows));
+        } catch (Exception $e) { /* table or column may not exist on fresh install */ }
+    }
+    setSetting($pdo, 'username_audit_v1_done', '1');
+}
+
 $pdo->exec("UPDATE users SET can_download=1,can_change_password=1,can_delete=1,can_share=1 WHERE role='admin'");
 
 $defaultSettings = [
@@ -3070,7 +3100,7 @@ if ($action === 'raw_mint') {
         $mint = raw_mint_token($pdo, '__public__', $pf['filename'], 'public', (int)$pf['file_size']);
         $logTarget = $pf['filename'];
     } else {
-        $owner = $_POST['owner'] ?? $_SESSION['user'];
+        $owner = normalizeUsername($_POST['owner'] ?? $_SESSION['user']);
         $name  = basename($_POST['name'] ?? '');
         if ($name === '') { echo json_encode(['ok'=>false,'error'=>'invalid_name']); exit; }
         $isAdmin = ($_SESSION['role'] ?? '') === 'admin';
@@ -4158,7 +4188,7 @@ section[data-view].is-entering{
 
 if ($action == 'login_process') {
     verifyCsrf();
-    $identifier = trim($_POST['username'] ?? '');
+    $identifier = normalizeUsername($_POST['username'] ?? '');
     $p = $_POST['password'] ?? '';
     $json = wants_json();
 
@@ -4167,9 +4197,14 @@ if ($action == 'login_process') {
         header("Location: index.php?error=1"); exit;
     }
 
-    // Lookup by username OR email (case-insensitive for email)
+    // Lookup by username OR email (case-insensitive). Username column is
+    // utf8mb4_unicode_ci so plain `username = ?` matches case-insensitively;
+    // $identifier is already lowercased by normalizeUsername() at line 4161.
+    // Email branch uses LOWER(email) so any rare mixed-case email row still
+    // matches; a username can never be a valid email (no '@' allowed by
+    // validateUsernameStrict's regex), so no false-match risk.
     $st = $pdo->prepare("SELECT username, password, role FROM users
-        WHERE username = ? OR email = LOWER(?) LIMIT 1");
+        WHERE username = ? OR LOWER(email) = ? LIMIT 1");
     $st->execute([$identifier, $identifier]);
     $ud = $st->fetch();
 
@@ -4213,7 +4248,7 @@ if($action=='upload_process'){
 
 if($action=='admin_upload_process'){
     if(!isset($_SESSION['user'])||$_SESSION['role']!=='admin')die("دسترسی غیرمجاز!");verifyCsrf();
-    $tu=trim($_POST['target_user']??'');
+    $tu=normalizeUsername($_POST['target_user']??'');
     $cu=$pdo->prepare("SELECT username FROM users WHERE username=?");$cu->execute([$tu]);
     if(empty($tu)||!$cu->fetch()){header("Location: ?action=dashboard&msg=upload_error");exit;}
     $up=getUserUploadPath($tu);
@@ -4246,7 +4281,7 @@ if($action=='upload_text_process'){
 
 if($action=='admin_upload_text_process'){
     if(!isset($_SESSION['user'])||$_SESSION['role']!=='admin')die("دسترسی غیرمجاز!");verifyCsrf();
-    $tu=trim($_POST['target_user']??'');
+    $tu=normalizeUsername($_POST['target_user']??'');
     $cu=$pdo->prepare("SELECT username FROM users WHERE username=?");$cu->execute([$tu]);
     if(empty($tu)||!$cu->fetch()){header("Location: ?action=dashboard&msg=upload_error");exit;}
     $tc=$_POST['pastedText']??'';
@@ -4497,7 +4532,7 @@ if($action==='share_create'){
     if(!$u||(!$u['can_share']&&$u['role']!=='admin')){$forbid('share_forbidden');}
 
     $fileName=basename($_POST['file_name']??'');
-    $owner=$_POST['owner']??$_SESSION['user'];
+    $owner=normalizeUsername($_POST['owner']??$_SESSION['user']);
     if($owner!==$_SESSION['user']&&$u['role']!=='admin'){$forbid('share_forbidden');}
 
     $filePath=getUserUploadPath($owner).$fileName;
@@ -4561,12 +4596,12 @@ if($action==='share_revoke'){
 if($action=='share_file'){
     if(!isset($_SESSION['user']))die("خطای امنیتی!");verifyCsrf();
     if(($_SESSION['role']??'')!=='admin'){header("Location: ?action=dashboard&msg=no_permission");exit;}
-    $fn=basename($_POST['filename']??'');$owner=$_POST['owner']??'';$targets=$_POST['share_with']??[];
+    $fn=basename($_POST['filename']??'');$owner=normalizeUsername($_POST['owner']??'');$targets=$_POST['share_with']??[];
     if(!empty($fn)&&!empty($owner)&&is_array($targets)){
         $fp=getUserUploadPath($owner).$fn;
         if(file_exists($fp)){
             foreach($targets as $tgt){
-                $tgt=trim($tgt);if(empty($tgt)||$tgt===$owner)continue;
+                $tgt=normalizeUsername($tgt);if(empty($tgt)||$tgt===$owner)continue;
                 $ins=$pdo->prepare("INSERT IGNORE INTO file_shares (original_owner,filename,shared_with,shared_by) VALUES(?,?,?,?)");
                 $ins->execute([$owner,$fn,$tgt,$_SESSION['user']]);
             }
@@ -4603,7 +4638,7 @@ if($action=='remove_public_access'){
 if($action=='get_shares'){
     header('Content-Type: application/json');
     if(!isset($_SESSION['user'])||($_SESSION['role']??'')!=='admin'){echo json_encode(['shares'=>[]]);exit;}
-    $fn=basename($_GET['filename']??'');$owner=$_GET['owner']??'';
+    $fn=basename($_GET['filename']??'');$owner=normalizeUsername($_GET['owner']??'');
     $st=$pdo->prepare("SELECT id,shared_with,shared_by,created_at FROM file_shares WHERE original_owner=? AND filename=?");
     $st->execute([$owner,$fn]);
     echo json_encode(['shares'=>$st->fetchAll(PDO::FETCH_ASSOC)]);exit;
@@ -4617,7 +4652,7 @@ if($action=='get_public_access'){
 
 if($action=='download'){
     if(!isset($_SESSION['user']))die("خطای امنیتی!");
-    $fn=basename($_GET['name']??'');$owner=$_GET['owner']??$_SESSION['user'];
+    $fn=basename($_GET['name']??'');$owner=normalizeUsername($_GET['owner']??$_SESSION['user']);
     $isPublicDl=isset($_GET['public_file_id']);
     $ps=$pdo->prepare("SELECT can_download,role FROM users WHERE username=?");$ps->execute([$_SESSION['user']]);$pr=$ps->fetch();
     if(!$pr||($pr['role']!=='admin'&&!$pr['can_download'])){header("Location: ?action=dashboard&msg=no_permission");exit;}
@@ -4656,7 +4691,7 @@ if($action=='download'){
 
 if($action=='delete_file'){
     if(!isset($_SESSION['user']))die("خطای امنیتی!");
-    $fn=basename($_GET['name']??'');$owner=$_GET['owner']??$_SESSION['user'];
+    $fn=basename($_GET['name']??'');$owner=normalizeUsername($_GET['owner']??$_SESSION['user']);
     if($_SESSION['role']!=='admin'){
         if($owner!==$_SESSION['user'])die("دسترسی غیرمجاز!");
         $dc=$pdo->prepare("SELECT can_delete FROM users WHERE username=?");$dc->execute([$_SESSION['user']]);$dr=$dc->fetch();
@@ -4681,7 +4716,7 @@ if($action=='delete_file'){
 
 if($action=='rename_file'){
     if(!isset($_SESSION['user'])||$_SESSION['role']!=='admin')die("دسترسی غیرمجاز!");verifyCsrf();
-    $on=basename($_POST['old_name']??'');$nn=basename($_POST['new_name']??'');$owner=$_POST['owner']??$_SESSION['user'];
+    $on=basename($_POST['old_name']??'');$nn=basename($_POST['new_name']??'');$owner=normalizeUsername($_POST['owner']??$_SESSION['user']);
     if(!empty($on)&&!empty($nn)){
         $op=getUserUploadPath($owner).$on;$np=getUserUploadPath($owner).$nn;
         if(file_exists($op)&&!file_exists($np)){
@@ -4697,7 +4732,7 @@ if($action=='rename_file'){
 
 if($action=='file_info'){
     if(!isset($_SESSION['user']))die("خطای امنیتی!");
-    $fn=basename($_GET['name']??'');$owner=$_GET['owner']??$_SESSION['user'];
+    $fn=basename($_GET['name']??'');$owner=normalizeUsername($_GET['owner']??$_SESSION['user']);
     if($_SESSION['role']!=='admin'&&$owner!==$_SESSION['user'])die("دسترسی غیرمجاز!");
     $fp=getUserUploadPath($owner).$fn;
     if(!file_exists($fp)||!is_file($fp)){header("Location: ?action=dashboard&msg=not_found");exit;}
@@ -5070,7 +5105,7 @@ if($action=='file_info'){
 if($action=='create_folder'){
     if(!isset($_SESSION['user']))die("خطای امنیتی!");verifyCsrf();
     $name=trim($_POST['folder_name']??'');
-    $owner=trim($_POST['owner']??$_SESSION['user']);
+    $owner=normalizeUsername($_POST['owner']??$_SESSION['user']);
     if($_SESSION['role']!=='admin'&&$owner!==$_SESSION['user'])die("دسترسی غیرمجاز!");
     $name=preg_replace('/\s+/',' ',$name);
     if($name===''||mb_strlen($name)>40){
@@ -5132,7 +5167,7 @@ if($action=='delete_folder'){
 if($action=='move_file'){
     if(!isset($_SESSION['user']))die("خطای امنیتی!");verifyCsrf();
     $fn=basename($_POST['filename']??'');
-    $owner=trim($_POST['owner']??$_SESSION['user']);
+    $owner=normalizeUsername($_POST['owner']??$_SESSION['user']);
     $folderId=(int)($_POST['folder_id']??0);
     if($_SESSION['role']!=='admin'&&$owner!==$_SESSION['user'])die("دسترسی غیرمجاز!");
     if($fn===''){header("Location: ?action=dashboard&msg=not_found".($owner!==$_SESSION['user']?'&view_user='.urlencode($owner):''));exit;}
@@ -5155,7 +5190,7 @@ if($action=='move_file'){
 if($action=='set_caption'){
     if(!isset($_SESSION['user']))die("خطای امنیتی!");verifyCsrf();
     $fn=basename($_POST['filename']??'');
-    $owner=trim($_POST['owner']??$_SESSION['user']);
+    $owner=normalizeUsername($_POST['owner']??$_SESSION['user']);
     $caption=trim((string)($_POST['caption']??''));
     if($_SESSION['role']!=='admin'&&$owner!==$_SESSION['user'])die("دسترسی غیرمجاز!");
     if($fn===''||!file_exists(getUserUploadPath($owner).$fn)){header("Location: ?action=dashboard&msg=not_found".($owner!==$_SESSION['user']?'&view_user='.urlencode($owner):''));exit;}
@@ -5589,7 +5624,7 @@ if ($action == 'register_step1') {
     </div>
     <div class="field">
       <label for="username">نام کاربری</label>
-      <input type="text" id="username" name="username" required autocomplete="username" value="<?= h($_GET['username'] ?? '') ?>">
+      <input type="text" id="username" name="username" required autocomplete="username" value="<?= h(normalizeUsername($_GET['username'] ?? '')) ?>">
       <div class="hint">شروع با حرف انگلیسی، ۳ تا ۳۰ کاراکتر، شامل حروف/اعداد/_/-</div>
     </div>
     <div class="field">
@@ -7189,7 +7224,7 @@ elseif($action=='dashboard'){
     cleanupExpiredOneTimeShares($pdo);
     $role=$_SESSION['role'];$csrf=generateCsrfToken();$search=trim($_GET['search']??'');
     $activeTab=$_GET['tab']??'private';if(!in_array($activeTab,['private','public']))$activeTab='private';
-    $viewUser=($role==='admin'&&isset($_GET['view_user']))?trim($_GET['view_user']):$_SESSION['user'];
+    $viewUser=($role==='admin'&&isset($_GET['view_user']))?normalizeUsername($_GET['view_user']):$_SESSION['user'];
     $upload_path=getUserUploadPath($viewUser);
     $allUsernames=($role==='admin')?$pdo->query("SELECT username FROM users ORDER BY username ASC")->fetchAll(PDO::FETCH_COLUMN):[];
     $allUsernamesAll=$pdo->query("SELECT username FROM users ORDER BY username ASC")->fetchAll(PDO::FETCH_COLUMN);
@@ -9759,7 +9794,7 @@ table.codes tbody tr:hover{background:rgba(30,41,59,.3)}
 elseif($action=='activity_log'){
     if(!isset($_SESSION['user'])||$_SESSION['role']!=='admin'){header("Location: index.php");exit;}
     $page=max(1,(int)($_GET['page']??1));$perPage=50;$offset=($page-1)*$perPage;
-    $fu=trim($_GET['filter_user']??'');$fa=trim($_GET['filter_action']??'');
+    $fu=normalizeUsername($_GET['filter_user']??'');$fa=trim($_GET['filter_action']??'');
     $w=[];$p2=[];if($fu!==''){$w[]="username=?";$p2[]=$fu;}if($fa!==''){$w[]="action_type=?";$p2[]=$fa;}
     $wc=!empty($w)?'WHERE '.implode(' AND ',$w):'';
     $cs=$pdo->prepare("SELECT COUNT(*) FROM activity_log $wc");$cs->execute($p2);$tot=$cs->fetchColumn();$tpg=max(1,ceil($tot/$perPage));
@@ -9816,7 +9851,7 @@ elseif($action=='my_shares'){
     $userRow->execute([$_SESSION['user']]);
     $u=$userRow->fetch(PDO::FETCH_ASSOC);
     $isAdmin=($u['role']??'')==='admin';
-    $filterOwner=trim($_GET['owner']??'');
+    $filterOwner=normalizeUsername($_GET['owner']??'');
 
     if($isAdmin){
         if($filterOwner!==''){

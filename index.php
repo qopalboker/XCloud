@@ -5372,6 +5372,170 @@ if($action=='update_settings'){
     header("Location: ?action=trash&msg=settings_saved");exit;
 }
 
+// ─── Tab CRUD: create | rename | delete | reorder | add_member | remove_member ───
+// Admin-only handlers for custom collaboration tabs. UI (admin_tabs page) lands in Phase 5.
+
+// Tab CRUD: create
+if($action=='tab_create'){
+    if(!isset($_SESSION['user'])||$_SESSION['role']!=='admin')die("دسترسی غیرمجاز!");verifyCsrf();
+    global $tabs_base;
+    $name=trim($_POST['name']??'');
+    if($name===''||mb_strlen($name)>100){header("Location: ?action=admin_tabs&msg=invalid_name");exit;}
+    $baseSlug=generateTabSlug($pdo,$name);
+    $sortOrder=(int)$pdo->query("SELECT COALESCE(MAX(sort_order),-1)+1 FROM custom_tabs WHERE deleted_at IS NULL")->fetchColumn();
+    // Slug collision retry: base, base-2..base-10, then random hex fallback.
+    // Only PDOException with SQLSTATE 23000 (UNIQUE violation) triggers retry.
+    $slug=$baseSlug;$inserted=false;
+    for($attempt=1;$attempt<=10&&!$inserted;$attempt++){
+        if($attempt>1){$suffix='-'.$attempt;$slug=substr($baseSlug,0,40-strlen($suffix)).$suffix;}
+        try{
+            $pdo->prepare("INSERT INTO custom_tabs (name,slug,sort_order,created_by) VALUES (?,?,?,?)")
+                ->execute([$name,$slug,$sortOrder,$_SESSION['user']]);
+            $inserted=true;
+        }catch(PDOException $e){if($e->getCode()!=='23000')throw $e;}
+    }
+    if(!$inserted){
+        $slug='tab-'.bin2hex(random_bytes(4));
+        $pdo->prepare("INSERT INTO custom_tabs (name,slug,sort_order,created_by) VALUES (?,?,?,?)")
+            ->execute([$name,$slug,$sortOrder,$_SESSION['user']]);
+    }
+    $newTabId=(int)$pdo->lastInsertId();
+    try{getTabUploadPath($pdo,$slug);}catch(InvalidArgumentException $e){/* unreachable: slug regex enforced */}
+    $memberCount=0;
+    foreach((array)($_POST['members']??[]) as $entry){
+        $u=normalizeUsername($entry);
+        if($u===''||$u===$_SESSION['user'])continue;
+        $ex=$pdo->prepare("SELECT 1 FROM users WHERE username=? LIMIT 1");$ex->execute([$u]);
+        if(!$ex->fetchColumn())continue;
+        $pdo->prepare("INSERT IGNORE INTO custom_tab_members (tab_id,username,added_by,added_at) VALUES (?,?,?,NOW())")
+            ->execute([$newTabId,$u,$_SESSION['user']]);
+        $memberCount++;
+    }
+    logActivity($pdo,$_SESSION['user'],'tab_create',$slug,"name=$name members=$memberCount");
+    header("Location: ?action=admin_tabs&msg=tab_created");exit;
+}
+
+// Tab CRUD: rename (name only; slug is immutable)
+if($action=='tab_rename'){
+    if(!isset($_SESSION['user'])||$_SESSION['role']!=='admin')die("دسترسی غیرمجاز!");verifyCsrf();
+    $tab=getTabById($pdo,(int)($_POST['tab_id']??0));
+    if(!$tab){header("Location: ?action=admin_tabs&msg=tab_not_found");exit;}
+    $newName=trim($_POST['new_name']??'');
+    if($newName===''||mb_strlen($newName)>100){header("Location: ?action=admin_tabs&msg=invalid_name");exit;}
+    $pdo->prepare("UPDATE custom_tabs SET name=? WHERE id=?")->execute([$newName,(int)$tab['id']]);
+    logActivity($pdo,$_SESSION['user'],'tab_rename',$tab['slug'],"old={$tab['name']} new=$newName");
+    header("Location: ?action=admin_tabs&msg=tab_renamed");exit;
+}
+
+// Tab CRUD: delete (soft — moves each file individually into flat trash/, soft-deletes tab row)
+if($action=='tab_delete'){
+    if(!isset($_SESSION['user'])||$_SESSION['role']!=='admin')die("دسترسی غیرمجاز!");verifyCsrf();
+    global $tabs_base,$trash_base;
+    $tab=getTabById($pdo,(int)($_POST['tab_id']??0));
+    if(!$tab){header("Location: ?action=admin_tabs&msg=tab_not_found");exit;}
+    try{$tabDir=getTabUploadPath($pdo,$tab['slug']);}catch(InvalidArgumentException $e){header("Location: ?action=admin_tabs&msg=tab_not_found");exit;}
+    $fs=$pdo->prepare("SELECT * FROM custom_tab_files WHERE tab_id=?");
+    $fs->execute([(int)$tab['id']]);$files=$fs->fetchAll(PDO::FETCH_ASSOC);
+    // DB writes are transactional; filesystem rename failures are tolerated
+    // (partial trash) per spec — don't rollback when only an FS leg fails.
+    $pdo->beginTransaction();
+    try{
+        $movedCount=0;
+        foreach($files as $f){
+            $physical=$tabDir.$f['filename'];
+            $trashFn=time().'_tab_'.preg_replace('/[^a-zA-Z0-9_-]/','_',$tab['slug']).'_'.$f['filename'];
+            if(file_exists($physical)&&rename($physical,$trash_base.$trashFn)){
+                $pdo->prepare("INSERT INTO trash_items (original_owner,original_filename,trash_filename,deleted_by,file_size,tab_id) VALUES (?,?,?,?,?,?)")
+                    ->execute([$f['uploaded_by'],$f['filename'],$trashFn,$_SESSION['user'],(int)$f['file_size'],(int)$tab['id']]);
+                $movedCount++;
+            }
+        }
+        $pdo->prepare("DELETE FROM custom_tab_files WHERE tab_id=?")->execute([(int)$tab['id']]);
+        $pdo->prepare("UPDATE custom_tabs SET deleted_at=NOW() WHERE id=?")->execute([(int)$tab['id']]);
+        $pdo->commit();
+    }catch(Exception $e){$pdo->rollBack();header("Location: ?action=admin_tabs&msg=delete_error");exit;}
+    @rmdir($tabs_base.$tab['slug']);
+    logActivity($pdo,$_SESSION['user'],'tab_delete',$tab['slug'],"files=".count($files)." moved=$movedCount");
+    header("Location: ?action=admin_tabs&msg=tab_deleted");exit;
+}
+
+// Tab CRUD: reorder (POST order[] = array of tab_ids in desired display order)
+if($action=='tab_reorder'){
+    if(!isset($_SESSION['user'])||$_SESSION['role']!=='admin')die("دسترسی غیرمجاز!");verifyCsrf();
+    $order=$_POST['order']??[];
+    if(!is_array($order)){header("Location: ?action=admin_tabs&msg=reorder_error");exit;}
+    $pdo->beginTransaction();
+    try{
+        $applied=[];
+        foreach($order as $i=>$tabIdRaw){
+            $tabId=(int)$tabIdRaw;
+            if($tabId<=0)continue;
+            $pdo->prepare("UPDATE custom_tabs SET sort_order=? WHERE id=? AND deleted_at IS NULL")->execute([(int)$i,$tabId]);
+            $applied[]=$tabId;
+        }
+        $pdo->commit();
+    }catch(Exception $e){$pdo->rollBack();header("Location: ?action=admin_tabs&msg=reorder_error");exit;}
+    logActivity($pdo,$_SESSION['user'],'tab_reorder',null,"order=".implode(',',$applied));
+    header("Location: ?action=admin_tabs&msg=tab_reordered");exit;
+}
+
+// Tab CRUD: add_member (dual-mode AJAX, mirrors share_create pattern at line ~4527)
+if($action=='tab_add_member'){
+    if(!isset($_SESSION['user'])||$_SESSION['role']!=='admin')die("دسترسی غیرمجاز!");verifyCsrf();
+    $tab=getTabById($pdo,(int)($_POST['tab_id']??0));
+    $isAjax=!empty($_POST['ajax']);
+    $jsonErr=function($err)use($isAjax){
+        if($isAjax){header('Content-Type: application/json');echo json_encode(['ok'=>false,'error'=>$err]);exit;}
+        header("Location: ?action=admin_tabs&msg=$err");exit;
+    };
+    if(!$tab)$jsonErr('tab_not_found');
+    $username=normalizeUsername($_POST['username']??'');
+    if($username==='')$jsonErr('user_not_found');
+    $ex=$pdo->prepare("SELECT 1 FROM users WHERE username=? LIMIT 1");$ex->execute([$username]);
+    if(!$ex->fetchColumn())$jsonErr('user_not_found');
+    $pdo->prepare("INSERT IGNORE INTO custom_tab_members (tab_id,username,added_by,added_at) VALUES (?,?,?,NOW())")
+        ->execute([(int)$tab['id'],$username,$_SESSION['user']]);
+    logActivity($pdo,$_SESSION['user'],'tab_add_member',$tab['slug'],"user=$username");
+    if($isAjax){
+        $ms=$pdo->prepare("SELECT username,added_by,added_at FROM custom_tab_members WHERE tab_id=? ORDER BY added_at DESC");
+        $ms->execute([(int)$tab['id']]);$rows=$ms->fetchAll(PDO::FETCH_ASSOC);
+        foreach($rows as &$r){$r['added_at_jalali']=to_jalali($r['added_at']);}unset($r);
+        $nm=$pdo->prepare("SELECT username FROM users WHERE username NOT IN (SELECT username FROM custom_tab_members WHERE tab_id=?) ORDER BY username");
+        $nm->execute([(int)$tab['id']]);
+        header('Content-Type: application/json');
+        echo json_encode(['ok'=>true,'members'=>$rows,'non_members'=>$nm->fetchAll(PDO::FETCH_COLUMN)],JSON_UNESCAPED_UNICODE);
+        exit;
+    }
+    header("Location: ?action=admin_tabs&msg=member_added&tab=".(int)$tab['id']);exit;
+}
+
+// Tab CRUD: remove_member (dual-mode AJAX)
+if($action=='tab_remove_member'){
+    if(!isset($_SESSION['user'])||$_SESSION['role']!=='admin')die("دسترسی غیرمجاز!");verifyCsrf();
+    $tab=getTabById($pdo,(int)($_POST['tab_id']??0));
+    $isAjax=!empty($_POST['ajax']);
+    $jsonErr=function($err)use($isAjax){
+        if($isAjax){header('Content-Type: application/json');echo json_encode(['ok'=>false,'error'=>$err]);exit;}
+        header("Location: ?action=admin_tabs&msg=$err");exit;
+    };
+    if(!$tab)$jsonErr('tab_not_found');
+    $username=normalizeUsername($_POST['username']??'');
+    $pdo->prepare("DELETE FROM custom_tab_members WHERE tab_id=? AND username=?")
+        ->execute([(int)$tab['id'],$username]);
+    logActivity($pdo,$_SESSION['user'],'tab_remove_member',$tab['slug'],"user=$username");
+    if($isAjax){
+        $ms=$pdo->prepare("SELECT username,added_by,added_at FROM custom_tab_members WHERE tab_id=? ORDER BY added_at DESC");
+        $ms->execute([(int)$tab['id']]);$rows=$ms->fetchAll(PDO::FETCH_ASSOC);
+        foreach($rows as &$r){$r['added_at_jalali']=to_jalali($r['added_at']);}unset($r);
+        $nm=$pdo->prepare("SELECT username FROM users WHERE username NOT IN (SELECT username FROM custom_tab_members WHERE tab_id=?) ORDER BY username");
+        $nm->execute([(int)$tab['id']]);
+        header('Content-Type: application/json');
+        echo json_encode(['ok'=>true,'members'=>$rows,'non_members'=>$nm->fetchAll(PDO::FETCH_COLUMN)],JSON_UNESCAPED_UNICODE);
+        exit;
+    }
+    header("Location: ?action=admin_tabs&msg=member_removed&tab=".(int)$tab['id']);exit;
+}
+
 if ($action == 'admin_toggle_registration') {
     if (!isset($_SESSION['user']) || $_SESSION['role'] !== 'admin') {
         header("Location: ?action=dashboard"); exit;

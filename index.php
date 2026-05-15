@@ -844,6 +844,39 @@ function validate_username($username) {
     return (bool)preg_match('/^[a-zA-Z][a-zA-Z0-9_-]{2,29}$/', $username);
 }
 
+function normalizeUsername(string $input): string {
+    return strtolower(trim($input));
+}
+
+function validateUsernameStrict(PDO $pdo, string $normalized): ?string {
+    // Length check first (so length errors win over regex errors).
+    if (strlen($normalized) < 3 || strlen($normalized) > 30) {
+        return 'نام کاربری باید بین ۳ تا ۳۰ کاراکتر باشد.';
+    }
+    // Strict regex: lowercase ASCII letter first, alphanumeric only thereafter.
+    if (!preg_match('/^[a-z][a-z0-9]{2,29}$/', $normalized)) {
+        return 'نام کاربری فقط می‌تواند شامل حروف انگلیسی (a–z) و اعداد (0–9) باشد و حتماً باید با یک حرف شروع شود. استفاده از فاصله، خط تیره (-)، آندرلاین (_)، نقطه (.) یا حروف فارسی مجاز نیست.';
+    }
+    // Reserved word check. Underscore-prefixed names are blocked structurally
+    // by the regex above (underscore not allowed) so not repeated here.
+    // 'admin' is in the blocklist; the existing admin seed (line ~2699) is
+    // grandfathered because this check only fires on NEW INSERTs.
+    $reserved = [
+        'public', 'private', 'admin', 'trash', 'system', 'unknown',
+        'tabs', 'backgrounds', 'root', 'null', 'undefined',
+    ];
+    if (in_array($normalized, $reserved, true)) {
+        return 'این نام کاربری رزرو شده است. لطفاً نام دیگری انتخاب کنید.';
+    }
+    // Uniqueness — surface Persian error rather than SQLSTATE 23000.
+    $st = $pdo->prepare("SELECT 1 FROM users WHERE username = ? LIMIT 1");
+    $st->execute([$normalized]);
+    if ($st->fetchColumn()) {
+        return 'این نام کاربری قبلاً انتخاب شده است.';
+    }
+    return null;
+}
+
 function validate_password_strength($password) {
     if (strlen($password) < 8 || strlen($password) > 128) return false;
     if (!preg_match('/[a-zA-Z]/', $password)) return false;
@@ -1312,6 +1345,42 @@ try {
     }
 } catch (Exception $e) {}
 try { $pdo->exec("DELETE FROM raw_tokens WHERE created_at < DATE_SUB(NOW(), INTERVAL 7 DAY)"); } catch (Exception $e) {}
+
+// ─── Custom collaboration tabs (admin-defined shared scopes) ────────
+$pdo->exec("CREATE TABLE IF NOT EXISTS custom_tabs (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    name VARCHAR(100) NOT NULL,
+    slug VARCHAR(40) NOT NULL UNIQUE,
+    sort_order INT NOT NULL DEFAULT 0,
+    created_by VARCHAR(50) NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    deleted_at TIMESTAMP NULL DEFAULT NULL,
+    INDEX idx_sort (sort_order),
+    INDEX idx_deleted (deleted_at)
+)");
+
+$pdo->exec("CREATE TABLE IF NOT EXISTS custom_tab_members (
+    tab_id INT NOT NULL,
+    username VARCHAR(50) NOT NULL,
+    added_by VARCHAR(50) NOT NULL,
+    added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (tab_id, username),
+    INDEX idx_username (username),
+    FOREIGN KEY (tab_id) REFERENCES custom_tabs(id) ON DELETE CASCADE
+)");
+
+$pdo->exec("CREATE TABLE IF NOT EXISTS custom_tab_files (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    tab_id INT NOT NULL,
+    filename VARCHAR(500) NOT NULL,
+    uploaded_by VARCHAR(50) NOT NULL,
+    file_size BIGINT DEFAULT 0,
+    caption TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_tab (tab_id),
+    INDEX idx_uploaded_by (uploaded_by),
+    FOREIGN KEY (tab_id) REFERENCES custom_tabs(id) ON DELETE CASCADE
+)");
 
 define('XCLOUD_MAX_FOLDERS_PER_USER', 5);
 
@@ -2649,6 +2718,14 @@ function pk_origin(){
 // Migrations
 foreach(['ALTER TABLE users MODIFY COLUMN password VARCHAR(255) NOT NULL','ALTER TABLE users ADD COLUMN created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP','ALTER TABLE users ADD COLUMN can_download TINYINT(1) NOT NULL DEFAULT 0','ALTER TABLE users ADD COLUMN can_change_password TINYINT(1) NOT NULL DEFAULT 0','ALTER TABLE users ADD COLUMN can_delete TINYINT(1) NOT NULL DEFAULT 0','ALTER TABLE users ADD COLUMN email VARCHAR(255) DEFAULT NULL','ALTER TABLE users ADD COLUMN email_verified TINYINT(1) NOT NULL DEFAULT 0','ALTER TABLE users ADD COLUMN email_verified_at TIMESTAMP NULL DEFAULT NULL','ALTER TABLE users ADD UNIQUE KEY uq_email (email)'] as $q){try{$pdo->exec($q);}catch(Exception $e){}}
 
+// Custom collaboration tabs — ALTERs on existing tables (idempotent).
+try { $pdo->exec("ALTER TABLE trash_items ADD COLUMN tab_id INT NULL DEFAULT NULL"); } catch (Exception $e) {}
+try { $pdo->exec("ALTER TABLE trash_items ADD INDEX idx_tab_id (tab_id)"); } catch (Exception $e) {}
+try { $pdo->exec("ALTER TABLE raw_tokens ADD COLUMN tab_slug VARCHAR(40) NULL DEFAULT NULL"); } catch (Exception $e) {}
+try { $pdo->exec("ALTER TABLE raw_tokens MODIFY COLUMN file_type ENUM('user','public','tab') NOT NULL DEFAULT 'user'"); } catch (Exception $e) {}
+try { $pdo->exec("ALTER TABLE share_links ADD COLUMN tab_id INT NULL DEFAULT NULL"); } catch (Exception $e) {}
+try { $pdo->exec("ALTER TABLE share_links ADD INDEX idx_tab_id (tab_id)"); } catch (Exception $e) {}
+
 $pdo->exec("UPDATE users SET can_download=1,can_change_password=1,can_delete=1,can_share=1 WHERE role='admin'");
 
 $defaultSettings = [
@@ -2793,6 +2870,12 @@ if(!is_dir($bg_base)){
     @file_put_contents($bg_base.'.htaccess', "Options -ExecCGI\nphp_flag engine off\n");
 }
 
+$tabs_base = $upload_base . '_tabs/';
+if (!is_dir($tabs_base)) {
+    mkdir($tabs_base, 0755, true);
+    @file_put_contents($tabs_base . '.htaccess', "Options -ExecCGI\nphp_flag engine off\n");
+}
+
 function getUserBgId($username, $pdo) {
     $st = $pdo->prepare("SELECT bg_id FROM bg_user_pref WHERE username = ? LIMIT 1");
     $st->execute([$username]);
@@ -2820,6 +2903,87 @@ function getUserUploadPath($username){
     global $upload_base;
     $safe=preg_replace('/[^a-zA-Z0-9_-]/','_',$username);
     $p=$upload_base.$safe.'/';if(!is_dir($p))mkdir($p,0755,true);return $p;
+}
+
+// ─── Custom collaboration tabs: helpers ────────────────────────────
+// These helpers are defined here (right after getUserUploadPath) so that
+// $tabs_base is set before any of them is called. Note that function
+// declarations at file scope are hoisted, but the global $tabs_base
+// dependency requires the variable to be assigned at call-time.
+
+function reservedTabSlugs(): array {
+    return [
+        'public', 'private', 'admin', 'trash', 'system', 'unknown',
+        'tabs', 'backgrounds', 'root', 'null', 'undefined',
+        'tab', 'tabs_', '_tabs', '_backgrounds',
+    ];
+}
+
+function isReservedSlug(PDO $pdo, string $slug): bool {
+    $slug = strtolower($slug);
+    if ($slug === '' || $slug[0] === '_') return true;
+    if (in_array($slug, reservedTabSlugs(), true)) return true;
+    // Username collision: any existing username (case-insensitive) is reserved.
+    $st = $pdo->prepare("SELECT 1 FROM users WHERE LOWER(username) = ? LIMIT 1");
+    $st->execute([$slug]);
+    return (bool)$st->fetchColumn();
+}
+
+function generateTabSlug(PDO $pdo, string $name): string {
+    $base = strtolower($name);
+    $base = preg_replace('/[^a-z0-9-]+/', '-', $base);
+    $base = preg_replace('/-+/', '-', $base);
+    $base = trim($base, '-');
+    $base = substr($base, 0, 40);
+    if ($base === '' || isReservedSlug($pdo, $base)) {
+        return 'tab-' . bin2hex(random_bytes(4));
+    }
+    return $base;
+}
+
+function getTabUploadPath(PDO $pdo, string $slug): string {
+    global $tabs_base;
+    if (!preg_match('/^[a-z0-9_-]{1,40}$/', $slug)) {
+        throw new InvalidArgumentException('Invalid tab slug: ' . $slug);
+    }
+    $p = $tabs_base . $slug . '/';
+    if (!is_dir($p)) mkdir($p, 0755, true);
+    return $p;
+}
+
+function getTabBySlug(PDO $pdo, string $slug): ?array {
+    $st = $pdo->prepare("SELECT * FROM custom_tabs WHERE slug = ? AND deleted_at IS NULL LIMIT 1");
+    $st->execute([$slug]);
+    $row = $st->fetch(PDO::FETCH_ASSOC);
+    return $row ?: null;
+}
+
+function getTabById(PDO $pdo, int $id): ?array {
+    $st = $pdo->prepare("SELECT * FROM custom_tabs WHERE id = ? AND deleted_at IS NULL LIMIT 1");
+    $st->execute([$id]);
+    $row = $st->fetch(PDO::FETCH_ASSOC);
+    return $row ?: null;
+}
+
+function isTabMember(PDO $pdo, int $tabId, string $username): bool {
+    $st = $pdo->prepare("SELECT 1 FROM custom_tab_members WHERE tab_id = ? AND username = ? LIMIT 1");
+    $st->execute([$tabId, $username]);
+    return (bool)$st->fetchColumn();
+}
+
+function getVisibleTabsForUser(PDO $pdo, string $username, string $role): array {
+    if ($role === 'admin') {
+        $st = $pdo->query("SELECT * FROM custom_tabs WHERE deleted_at IS NULL ORDER BY sort_order ASC, id ASC");
+        return $st->fetchAll(PDO::FETCH_ASSOC);
+    }
+    $st = $pdo->prepare("
+        SELECT t.* FROM custom_tabs t
+        INNER JOIN custom_tab_members m ON m.tab_id = t.id
+        WHERE m.username = ? AND t.deleted_at IS NULL
+        ORDER BY t.sort_order ASC, t.id ASC
+    ");
+    $st->execute([$username]);
+    return $st->fetchAll(PDO::FETCH_ASSOC);
 }
 
 function normalizeFilesArray($f){

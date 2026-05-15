@@ -7638,7 +7638,17 @@ elseif($action=='dashboard'){
     if(!isset($_SESSION['user'])){header("Location: index.php");exit;}
     cleanupExpiredOneTimeShares($pdo);
     $role=$_SESSION['role'];$csrf=generateCsrfToken();$search=trim($_GET['search']??'');
-    $activeTab=$_GET['tab']??'private';if(!in_array($activeTab,['private','public']))$activeTab='private';
+    $activeTab=$_GET['tab']??'private';
+    // Custom collaboration tabs: extend whitelist to include slugs the user can see.
+    // Admin: every non-deleted tab. Regular user: only tabs they're a member of.
+    $visibleTabs=getVisibleTabsForUser($pdo,$_SESSION['user'],$role);
+    $visibleSlugs=array_column($visibleTabs,'slug');
+    $allowedTabs=array_merge(['private','public'],$visibleSlugs);
+    if(!in_array($activeTab,$allowedTabs,true))$activeTab='private';
+    $activeCustomTab=null;
+    if($activeTab!=='private'&&$activeTab!=='public'){
+        foreach($visibleTabs as $vt){if($vt['slug']===$activeTab){$activeCustomTab=$vt;break;}}
+    }
     $viewUser=($role==='admin'&&isset($_GET['view_user']))?normalizeUsername($_GET['view_user']):$_SESSION['user'];
     $upload_path=getUserUploadPath($viewUser);
     $allUsernames=($role==='admin')?$pdo->query("SELECT username FROM users ORDER BY username ASC")->fetchAll(PDO::FETCH_COLUMN):[];
@@ -7658,6 +7668,13 @@ elseif($action=='dashboard'){
     $publicFiles=[];
     if($activeTab==='public'){
         $pfs=$pdo->query("SELECT * FROM public_files ORDER BY id DESC");$publicFiles=$pfs->fetchAll(PDO::FETCH_ASSOC);
+    }
+    // Custom-tab files (loaded only when a custom tab is active — one query, not always).
+    $tabFiles=[];
+    if($activeCustomTab){
+        $tfs=$pdo->prepare("SELECT * FROM custom_tab_files WHERE tab_id=? ORDER BY id DESC");
+        $tfs->execute([(int)$activeCustomTab['id']]);
+        $tabFiles=$tfs->fetchAll(PDO::FETCH_ASSOC);
     }
     // Folder management
     $userFolders = getUserFolders($pdo, $viewUser);
@@ -8105,17 +8122,20 @@ $_userBg = getUserBgUrl($_SESSION['user'], $pdo);
         <?php if($role==='admin'&&count($allUsernames)>1):?>
         <div class="user-switcher">
             <?php foreach($allUsernames as $un):?>
-            <a href="?action=dashboard&view_user=<?php echo urlencode($un);?>" class="user-chip <?php echo $viewUser===$un?'active':'';?>">
+            <a href="?action=dashboard&tab=private&view_user=<?php echo urlencode($un);?>" class="user-chip <?php echo $viewUser===$un?'active':'';?>">
                 <?php echo h($un);?><?php if($un===$_SESSION['user']):?> ✦<?php endif;?>
             </a>
             <?php endforeach;?>
         </div>
         <?php endif;?>
 
-        <!-- TABS: Private / Public -->
-        <div class="tab-bar">
-            <a href="?action=dashboard&tab=private<?php echo $viewUser!==$_SESSION['user']?'&view_user='.urlencode($viewUser):'';?>" class="tab-btn <?php echo $activeTab==='private'?'active':'';?>">🔒 خصوصی</a>
-            <a href="?action=dashboard&tab=public<?php echo $viewUser!==$_SESSION['user']?'&view_user='.urlencode($viewUser):'';?>" class="tab-btn <?php echo $activeTab==='public'?'active':'';?>">🌐 عمومی</a>
+        <!-- TABS: Private / Custom collaboration tabs / Public -->
+        <div class="tab-bar" style="overflow-x:auto;-webkit-overflow-scrolling:touch;">
+            <a href="?action=dashboard&tab=private<?php echo $viewUser!==$_SESSION['user']?'&view_user='.urlencode($viewUser):'';?>" class="tab-btn <?php echo $activeTab==='private'?'active':'';?>" style="flex-shrink:0;">🔒 خصوصی</a>
+            <?php foreach($visibleTabs as $vt): ?>
+            <a href="?action=dashboard&tab=<?php echo urlencode($vt['slug']);?>" class="tab-btn <?php echo $activeTab===$vt['slug']?'active':'';?>" title="<?php echo h($vt['name']);?>" style="flex-shrink:0;">👥 <?php echo h($vt['name']);?></a>
+            <?php endforeach; ?>
+            <a href="?action=dashboard&tab=public<?php echo $viewUser!==$_SESSION['user']?'&view_user='.urlencode($viewUser):'';?>" class="tab-btn <?php echo $activeTab==='public'?'active':'';?>" style="flex-shrink:0;">🌐 عمومی</a>
         </div>
 
         <?php if($activeTab==='private'):
@@ -8209,6 +8229,22 @@ $_userBg = getUserBgUrl($_SESSION['user'], $pdo);
                     <?php endif;?>
                 </div>
                 <?php endif;?>
+
+                <?php elseif($activeCustomTab): /* Custom collaboration tab */ ?>
+                <div class="section-card">
+                    <div class="section-title">📤 آپلود به تب «<?php echo h($activeCustomTab['name']);?>»</div>
+                    <form id="uploadFileForm" action="?action=tab_upload_process" method="POST" enctype="multipart/form-data">
+                        <input type="hidden" name="csrf_token" value="<?php echo $csrf;?>">
+                        <input type="hidden" name="tab_slug" value="<?php echo h($activeCustomTab['slug']);?>">
+                        <div class="drop-zone" id="dropZone">
+                            <div class="drop-icon">👥</div>
+                            <p class="drop-text" id="fileLabel">رها کنید یا <strong>انتخاب کنید</strong> (چند فایل)</p>
+                            <p class="format-note">همه فرمت‌ها — حداکثر 1G برای هر فایل (بدون محدودیت سهمیه)</p>
+                            <input type="file" name="fileToUpload[]" id="fileInput" multiple required>
+                        </div>
+                        <button type="submit" class="action-btn primary" id="uploadBtn">📤 آپلود به تب «<?php echo h($activeCustomTab['name']);?>»</button>
+                    </form>
+                </div>
 
                 <?php else: /* Public tab */ ?>
                 <?php if($role==='admin'):?>
@@ -8395,6 +8431,64 @@ $_userBg = getUserBgUrl($_SESSION['user'], $pdo);
                     </div>
                 </div>
                 <?php endif;?>
+
+            <?php elseif($activeCustomTab): /* Custom collaboration tab */ ?>
+                <div class="section-title" style="font-size:.88rem;font-weight:700;margin-bottom:14px">👥 <?php echo h($activeCustomTab['name']);?> — <?php echo count($tabFiles);?> فایل</div>
+                <div class="file-grid">
+                <?php if(!empty($tabFiles)):
+                    $tabSlugForPath=$activeCustomTab['slug'];
+                    foreach($tabFiles as $tf):
+                        $tfPath='uploads/_tabs/'.$tabSlugForPath.'/'.$tf['filename'];
+                        $tfExists=file_exists($tfPath);
+                        $tfSize=$tfExists?formatSizeUnits($tfPath):'نامشخص';
+                        $tfDate=to_jalali($tf['created_at']);
+                        $tfExt=strtolower(pathinfo($tf['filename'],PATHINFO_EXTENSION));
+                    ?>
+                    <div class="file-card">
+                        <div class="file-top">
+                            <div class="icon-box"><?php echo getFileIcon($tf['filename']);?></div>
+                            <div class="file-meta">
+                                <div class="file-name" title="<?php echo h($tf['filename']);?>"><?php echo h($tf['filename']);?></div>
+                                <div class="file-details">
+                                    <span><?php echo $tfDate;?></span>
+                                    <span><?php echo $tfSize;?></span>
+                                    <span class="shared-badge">👤 <?php echo h($tf['uploaded_by']);?></span>
+                                </div>
+                            </div>
+                        </div>
+                        <?php if($tfExists&&isGif($tf['filename'])):?>
+                        <div class="file-preview-wrap"><div class="file-preview-gif"><img src="<?php echo h($tfPath);?>?_t=<?php echo @filemtime($tfPath);?>" alt="<?php echo h($tf['filename']);?>"></div><span class="gif-badge">GIF</span></div>
+                        <?php elseif($tfExists&&isImage($tf['filename'])):?>
+                        <div class="file-preview"><img src="<?php echo h($tfPath);?>" alt="<?php echo h($tf['filename']);?>" loading="lazy"></div>
+                        <?php endif;?>
+                        <?php if(isCaptionable($tf['filename']) && !empty($tf['caption'])): ?>
+                        <div class="file-caption"><?php echo nl2br(h($tf['caption']));?></div>
+                        <?php endif;?>
+                        <div class="file-actions">
+                            <?php if($canDownload||$role==='admin'):?>
+                            <a href="?action=download&tab_file_id=<?php echo (int)$tf['id'];?>" class="btn-sm btn-dl">⬇ دانلود</a>
+                            <?php endif;?>
+                            <a href="?action=file_info&tab_file_id=<?php echo (int)$tf['id'];?>" class="btn-sm btn-info">🔍 بررسی</a>
+                            <?php if(raw_extension_allowed($tf['filename'])):?>
+                            <button class="btn-sm btn-raw" data-mint-kind="tab" data-mint-tab-id="<?php echo (int)$activeCustomTab['id'];?>" data-mint-file-id="<?php echo (int)$tf['id'];?>" title="نمایش خام (یکبار-مصرف)">👁 خام</button>
+                            <?php endif;?>
+                            <button class="btn-sm btn-rename" onclick="renameTabFile(<?php echo (int)$tf['id'];?>,<?php echo h(json_encode($tf['filename'],JSON_UNESCAPED_UNICODE|JSON_HEX_TAG|JSON_HEX_QUOT|JSON_HEX_APOS|JSON_HEX_AMP));?>)" title="تغییر نام">✏️</button>
+                            <?php if($canShare||$role==='admin'):?>
+                            <button class="btn-sm btn-share" onclick="shareTabFile(<?php echo (int)$tf['id'];?>,<?php echo h(json_encode($tf['filename'],JSON_UNESCAPED_UNICODE|JSON_HEX_TAG|JSON_HEX_QUOT|JSON_HEX_APOS|JSON_HEX_AMP));?>)" title="لینک عمومی">🔗</button>
+                            <?php endif;?>
+                            <?php if($canDelete||$role==='admin'):?>
+                            <a href="?action=tab_delete_file&file_id=<?php echo (int)$tf['id'];?>" class="btn-sm btn-del" onclick="return confirm('حذف «<?php echo h($tf['filename']);?>»؟')" style="background:#dc2626;color:#fff">🗑 حذف</a>
+                            <?php endif;?>
+                        </div>
+                    </div>
+                    <?php endforeach;
+                else:?>
+                    <div class="empty-state" style="grid-column:1/-1">
+                        <div class="icon">👥</div>
+                        <p>هنوز فایلی به این تب اضافه نشده</p>
+                    </div>
+                <?php endif;?>
+                </div>
 
             <?php else: /* Public tab */ ?>
                 <div class="file-grid">
@@ -8859,6 +8953,9 @@ $_userBg = getUserBgUrl($_SESSION['user'], $pdo);
             fd.append('kind', btn.dataset.mintKind);
             if (btn.dataset.mintKind === 'public') {
                 fd.append('file_id', btn.dataset.mintFileId);
+            } else if (btn.dataset.mintKind === 'tab') {
+                // raw_mint kind=tab derives the tab via JOIN on file_id; no need to send tab_id.
+                fd.append('file_id', btn.dataset.mintFileId);
             } else {
                 fd.append('owner', btn.dataset.mintOwner);
                 fd.append('name', btn.dataset.mintName);
@@ -8883,6 +8980,46 @@ $_userBg = getUserBgUrl($_SESSION['user'], $pdo);
     });
 
     function openRename(n){document.getElementById('renameOldName').value=n;document.getElementById('renameNewName').value=n;document.getElementById('renameModal').classList.add('active');setTimeout(()=>document.getElementById('renameNewName').focus(),100);}
+
+    // Tab file: minimal prompt-based rename + share-link. Phase 4 ships these
+    // without dedicated modals to keep scope tight; Phase 5 / a UX polish
+    // pass can replace with proper modals.
+    function renameTabFile(fileId, currentName){
+        const newName = prompt('نام جدید برای فایل:', currentName);
+        if (newName === null) return;
+        const trimmed = newName.trim();
+        if (trimmed === '' || trimmed === currentName) return;
+        const f = document.createElement('form');
+        f.method = 'POST';
+        f.action = '?action=tab_rename_file';
+        f.style.display = 'none';
+        const cs = document.createElement('input'); cs.type='hidden'; cs.name='csrf_token'; cs.value=<?php echo json_encode($csrf, JSON_UNESCAPED_UNICODE|JSON_HEX_TAG|JSON_HEX_QUOT|JSON_HEX_APOS|JSON_HEX_AMP);?>; f.appendChild(cs);
+        const fid = document.createElement('input'); fid.type='hidden'; fid.name='file_id'; fid.value=fileId; f.appendChild(fid);
+        const nm = document.createElement('input'); nm.type='hidden'; nm.name='new_name'; nm.value=trimmed; f.appendChild(nm);
+        document.body.appendChild(f);
+        f.submit();
+    }
+    async function shareTabFile(fileId, fileName){
+        const pwd = prompt('رمز عبور برای لینک (خالی = بدون رمز):', '');
+        if (pwd === null) return;  // user cancelled
+        const fd = new FormData();
+        fd.append('csrf_token', <?php echo json_encode($csrf, JSON_UNESCAPED_UNICODE|JSON_HEX_TAG|JSON_HEX_QUOT|JSON_HEX_APOS|JSON_HEX_AMP);?>);
+        fd.append('tab_file_id', fileId);
+        fd.append('ajax', '1');
+        if (pwd.trim() !== '') fd.append('password', pwd.trim());
+        try {
+            const r = await fetch('?action=share_create', { method:'POST', body: fd });
+            const j = await r.json();
+            if (j.ok && j.url) {
+                if (navigator.clipboard && navigator.clipboard.writeText) {
+                    try { await navigator.clipboard.writeText(j.url); } catch(_) {}
+                }
+                prompt('لینک ساخته شد (کپی شد):', j.url);
+            } else {
+                alert('خطا: ' + (j.error || 'ناشناخته'));
+            }
+        } catch (e) { alert('خطا در ارتباط با سرور'); }
+    }
     function closeRename(){document.getElementById('renameModal').classList.remove('active');}
     document.getElementById('renameModal').addEventListener('click',function(e){if(e.target===this)closeRename();});
     function openPasswordModal(){const m=document.getElementById('passwordModal');if(m){m.classList.add('active');setTimeout(()=>m.querySelector('input').focus(),100);}}

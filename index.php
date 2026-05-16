@@ -10784,6 +10784,21 @@ elseif($action=='activity_log'){
     $ats=$pdo->query("SELECT DISTINCT action_type FROM activity_log ORDER BY action_type ASC")->fetchAll(PDO::FETCH_COLUMN);
     $lus=$pdo->query("SELECT DISTINCT username FROM activity_log ORDER BY username ASC")->fetchAll(PDO::FETCH_COLUMN);
     $al=['login'=>'🔑 ورود','login_failed'=>'🚫 ورود ناموفق','logout'=>'🚪 خروج','upload'=>'📤 آپلود','upload_text'=>'📝 متن','download'=>'⬇️ دانلود','delete'=>'🗑️ حذف','rename'=>'✏️ تغییر نام','add_user'=>'👤 افزودن کاربر','delete_user'=>'❌ حذف کاربر','update_permissions'=>'🔧 دسترسی','change_password'=>'🔒 رمز','trash_restore'=>'↩ بازگردانی','trash_delete'=>'💀 حذف دائم','trash_empty'=>'🗑 تخلیه'];
+    // Phase 7: Persian labels for custom-collaboration-tab actions + the
+    // inbound-register defensive rejection. Dropdown auto-populates from
+    // SELECT DISTINCT action_type, so each label only appears once at
+    // least one row of that type exists in activity_log.
+    $al['tab_create']                = '👥 ساخت تب';
+    $al['tab_rename']                = '✏️ تغییر نام تب';
+    $al['tab_delete']                = '🗑️ حذف تب';
+    $al['tab_reorder']               = '🔀 ترتیب تب‌ها';
+    $al['tab_add_member']            = '➕ افزودن عضو به تب';
+    $al['tab_remove_member']         = '➖ حذف عضو از تب';
+    $al['tab_upload']                = '📤 آپلود در تب';
+    $al['tab_delete_file']           = '🗑️ حذف فایل تب';
+    $al['tab_rename_file']           = '✏️ تغییر نام فایل تب';
+    $al['tab_caption_set']           = '📝 توضیح فایل تب';
+    $al['inbound_register_rejected'] = '🚫 رد ثبت‌نام ایمیلی';
     ?><!DOCTYPE html><html lang="fa" dir="rtl"><head>
     <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
     <title>XCloud — لاگ</title>

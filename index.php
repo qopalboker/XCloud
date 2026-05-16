@@ -2767,6 +2767,55 @@ if (getSetting($pdo, 'username_audit_v1_done', '0') !== '1') {
     setSetting($pdo, 'username_audit_v1_done', '1');
 }
 
+// ── Bale bot auth: schema (idempotent) ─────────────────────────────
+try {
+    $pdo->exec("CREATE TABLE IF NOT EXISTS bale_auth_sessions (
+        token CHAR(64) NOT NULL,
+        purpose ENUM('register','recover') NOT NULL,
+        status ENUM('pending','verified','used','expired') NOT NULL DEFAULT 'pending',
+        pending_username VARCHAR(50) NULL,
+        pending_password_hash VARCHAR(255) NULL,
+        pending_email VARCHAR(255) NULL,
+        bale_user_id BIGINT NULL,
+        phone_number VARCHAR(15) NULL,
+        one_time_key CHAR(64) NULL,
+        ip_address VARCHAR(45) NULL,
+        user_agent VARCHAR(500) NULL,
+        csrf_origin VARCHAR(200) NULL,
+        created_at INT UNSIGNED NOT NULL,
+        expires_at INT UNSIGNED NOT NULL,
+        PRIMARY KEY (token),
+        INDEX idx_bale_otk (one_time_key),
+        INDEX idx_bale_user (bale_user_id, status),
+        INDEX idx_bale_expires (expires_at, status),
+        INDEX idx_bale_uname (pending_username, status)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+    $pdo->exec("CREATE TABLE IF NOT EXISTS bale_rate_limit (
+        ip_address VARCHAR(45) NOT NULL,
+        hour_bucket INT UNSIGNED NOT NULL,
+        count INT UNSIGNED NOT NULL DEFAULT 0,
+        PRIMARY KEY (ip_address, hour_bucket)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+    $pdo->exec("CREATE TABLE IF NOT EXISTS bale_unknown_updates (
+        id INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+        received_at INT UNSIGNED NOT NULL,
+        update_json JSON NOT NULL,
+        INDEX idx_bale_unk_received (received_at)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+    $pdo->exec("CREATE TABLE IF NOT EXISTS bale_config (
+        config_key VARCHAR(64) NOT NULL,
+        config_value TEXT NOT NULL,
+        updated_at INT UNSIGNED NOT NULL,
+        PRIMARY KEY (config_key)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+} catch (\Throwable $e) { /* idempotent CREATE IF NOT EXISTS */ }
+foreach ([
+    "ALTER TABLE users ADD COLUMN bale_user_id BIGINT NULL",
+    "ALTER TABLE users ADD UNIQUE KEY uq_bale_user_id (bale_user_id)",
+    "ALTER TABLE users ADD COLUMN phone_number VARCHAR(15) NULL",
+    "ALTER TABLE users ADD UNIQUE KEY uq_phone_number (phone_number)",
+] as $q) { try { $pdo->exec($q); } catch (\Exception $e) {} }
+
 $pdo->exec("UPDATE users SET can_download=1,can_change_password=1,can_delete=1,can_share=1 WHERE role='admin'");
 
 $defaultSettings = [
@@ -3690,6 +3739,10 @@ section[data-view].is-entering{
       <button type="submit" class="btn-primary">ارسال کد تأیید</button>
     </form>
     <?php endif; ?>
+    <?php if (function_exists('bale_configured') && bale_configured()): ?>
+    <div class="or-divider"><span>یا</span></div>
+    <a href="?action=bale_register_form" class="btn-secondary" style="display:block;text-align:center;text-decoration:none">📱 ثبت‌نام با بله</a>
+    <?php endif; ?>
     <div class="auth-link-row">
       قبلاً ثبت‌نام کرده‌اید؟ <a href="?action=auth_shell&view=login" data-spa-link="login">ورود</a>
     </div>
@@ -3715,6 +3768,10 @@ section[data-view].is-entering{
       </div>
       <button type="submit" class="btn-primary">ارسال کد بازیابی</button>
     </form>
+    <?php if (function_exists('bale_configured') && bale_configured()): ?>
+    <div class="or-divider"><span>یا</span></div>
+    <a href="?action=bale_forgot_form" class="btn-secondary" style="display:block;text-align:center;text-decoration:none">📱 بازیابی با بله</a>
+    <?php endif; ?>
     <div class="auth-link-row">
       <a href="?action=auth_shell&view=login" data-spa-link="login">بازگشت به ورود</a>
     </div>
@@ -7641,6 +7698,1082 @@ if($action=='bg_set'){
     exit;
 }
 
+
+// ================================================================
+// BALE BOT AUTH (registration + password recovery)
+// ================================================================
+// All bale_* actions and admin_bale_settings live here. Schema lives near
+// the top of this file with the other migrations. Config (bot_token,
+// bot_username, webhook_secret) is stored in the bale_config table and
+// managed via ?action=admin_bale_settings.
+
+if (!defined('BALE_SESSION_TTL_SECONDS')) define('BALE_SESSION_TTL_SECONDS', 600);
+if (!defined('BALE_START_RATE_LIMIT'))    define('BALE_START_RATE_LIMIT', 10);
+if (!defined('BALE_DEEP_LINK_BASE'))      define('BALE_DEEP_LINK_BASE', 'https://ble.ir/');
+if (!defined('BALE_BRAND'))               define('BALE_BRAND', 'XCloud — فضای ابری شخصی');
+
+function bale_msg(string $key): string {
+    static $m = null;
+    if ($m === null) {
+        $b = BALE_BRAND;
+        $m = [
+            'btn_send_contact'    => '📱 ارسال شماره موبایل',
+            'token_invalid'       => "این لینک منقضی شده یا قبلاً استفاده شده.\n\nاز سایت دوباره شروع کن.",
+            'start_no_payload'    => "سلام! من بات ورود {$b} هستم.\n\nبرای ثبت‌نام یا بازیابی رمز، به سایت ما برو و گزینه‌ی مناسب رو انتخاب کن.",
+            'contact_not_yours'   => '❌ فقط می‌تونی شماره‌ی خودت رو ارسال کنی، نه شماره‌ی مخاطبینت.',
+            'contact_not_iran'    => 'این بات فعلاً فقط شماره‌های ایرانی (+98) رو می‌پذیره.',
+            'session_expired'     => 'نشست منقضی شده. لطفاً از سایت دوباره شروع کن.',
+            'welcome_register'    => "سلام 👋\n\nبرای تکمیل ثبت‌نام در {$b}، روی دکمه‌ی پایین بزن.\n\n🔒 شماره فقط برای تأیید هویته.",
+            'register_phone_taken'=> "این شماره قبلاً ثبت‌نام کرده.\n\nاگه رمزت رو فراموش کردی، از سایت → «بازیابی رمز» اقدام کن.",
+            'register_success'    => "✅ شماره تأیید شد. حسابت ساخته شد.\n\nبه مرورگرت برگرد — تا چند ثانیه‌ی دیگه وارد میشی.",
+            'welcome_recover'     => "سلام 🔑\n\nبرای تغییر رمز در {$b}، روی دکمه‌ی پایین بزن.",
+            'recover_no_account'  => "حسابی با این شماره پیدا نشد.\n\nاگه قبلاً با ایمیل ثبت‌نام کردی، از سایت → «بازیابی با ایمیل» اقدام کن.",
+            'recover_success'     => "✅ رمز جدیدت ثبت شد.\n\nبه مرورگرت برگرد — تا چند ثانیه‌ی دیگه وارد میشی.",
+            'already_done'        => "این عملیات تموم شده. برای ادامه، به سایت برو.\n\nاگه مشکلی داشتی: /support",
+            'pending_reminder'    => 'لطفاً روی دکمه‌ی «ارسال شماره موبایل» بزن.',
+            'help'                => "📖 راهنمای بات {$b}\n\nاین بات برای ثبت‌نام و بازیابی رمز استفاده میشه.\n\nنحوه‌ی استفاده:\n۱. به سایت برو\n۲. گزینه‌ی «ثبت‌نام» یا «بازیابی رمز» رو انتخاب کن\n۳. مشخصاتت رو وارد کن\n۴. به این بات هدایت میشی، شماره رو تأیید کن\n۵. به مرورگر برگرد — تموم شد\n\nدستورات: /start  /help  /support",
+            'support'             => "📞 پشتیبانی {$b}\n\nبرای دریافت پشتیبانی، از داشبورد سایت با ادمین تماس بگیر.",
+            'fallback'            => "متوجه پیامت نشدم.\n\nاگه می‌خوای از {$b} استفاده کنی، از سایت شروع کن.\nبرای راهنما: /help",
+        ];
+    }
+    return $m[$key] ?? '';
+}
+
+function bale_config(string $key, ?string $default = null): ?string {
+    static $cache = null;
+    if ($cache === null) {
+        global $pdo;
+        $cache = [];
+        try {
+            $stmt = $pdo->query("SELECT config_key, config_value FROM bale_config");
+            foreach ($stmt as $row) { $cache[$row['config_key']] = $row['config_value']; }
+        } catch (\Throwable $e) {
+            error_log('bale_config load: ' . $e->getMessage());
+        }
+    }
+    return $cache[$key] ?? $default;
+}
+
+function bale_config_set(string $key, string $value): void {
+    global $pdo;
+    $stmt = $pdo->prepare(
+        "INSERT INTO bale_config (config_key, config_value, updated_at) VALUES (?, ?, ?)
+         ON DUPLICATE KEY UPDATE config_value = VALUES(config_value), updated_at = VALUES(updated_at)"
+    );
+    $stmt->execute([$key, $value, time()]);
+}
+
+function bale_app_url(): string {
+    $scheme = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https' : 'http';
+    $host = $_SERVER['HTTP_HOST'] ?? 'localhost';
+    return $scheme . '://' . $host;
+}
+
+function bale_api(string $method, array $params = []): array {
+    $token = bale_config('bot_token');
+    if (!$token) {
+        error_log('Bale API: token not configured');
+        return ['ok' => false, 'error' => 'token_not_configured'];
+    }
+    $url = "https://tapi.bale.ai/bot{$token}/{$method}";
+    $ch = curl_init($url);
+    curl_setopt_array($ch, [
+        CURLOPT_POST           => true,
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_HTTPHEADER     => ['Content-Type: application/json'],
+        CURLOPT_POSTFIELDS     => json_encode($params, JSON_UNESCAPED_UNICODE),
+        CURLOPT_TIMEOUT        => 10,
+        CURLOPT_SSL_VERIFYPEER => true,
+    ]);
+    $response  = curl_exec($ch);
+    $http_code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+    $decoded = json_decode($response ?: '', true);
+    if ($http_code !== 200 || !($decoded['ok'] ?? false)) {
+        error_log("Bale API [{$method}]: " . substr((string)$response, 0, 500));
+        return is_array($decoded) ? array_merge(['ok' => false], $decoded) : ['ok' => false];
+    }
+    return $decoded;
+}
+
+function bale_send(int $chat_id, string $text, ?array $reply_markup = null): void {
+    $p = ['chat_id' => $chat_id, 'text' => $text];
+    if ($reply_markup) $p['reply_markup'] = $reply_markup;
+    bale_api('sendMessage', $p);
+}
+
+function bale_contact_keyboard(): array {
+    return [
+        'keyboard'          => [[['text' => bale_msg('btn_send_contact'), 'request_contact' => true]]],
+        'resize_keyboard'   => true,
+        'one_time_keyboard' => true,
+    ];
+}
+function bale_remove_keyboard(): array { return ['remove_keyboard' => true]; }
+
+function bale_deep_link(string $token): string {
+    $username = ltrim((string)bale_config('bot_username', ''), '@');
+    return BALE_DEEP_LINK_BASE . $username . '?start=' . $token;
+}
+
+function bale_normalize_iran_phone(string $raw): ?string {
+    $d = preg_replace('/\D/', '', $raw);
+    $n = null;
+    if (strlen($d) === 12 && substr($d, 0, 3) === '989') {
+        $n = '0' . substr($d, 2);
+    } elseif (strlen($d) === 11 && substr($d, 0, 2) === '09') {
+        $n = $d;
+    } elseif (strlen($d) === 10 && substr($d, 0, 1) === '9') {
+        $n = '0' . $d;
+    }
+    return ($n && preg_match('/^09\d{9}$/', $n)) ? $n : null;
+}
+
+function bale_check_origin(): bool {
+    $allowed = $_SERVER['HTTP_HOST'] ?? '';
+    if (!$allowed) return false;
+    $allowed = strtolower($allowed);
+    $origin  = $_SERVER['HTTP_ORIGIN']  ?? '';
+    $referer = $_SERVER['HTTP_REFERER'] ?? '';
+    if ($origin)  return strtolower((string)parse_url($origin,  PHP_URL_HOST)) === $allowed;
+    if ($referer) return strtolower((string)parse_url($referer, PHP_URL_HOST)) === $allowed;
+    return false;
+}
+
+function bale_csrf_ok_json(): bool {
+    $t = $_POST['csrf_token'] ?? '';
+    if (empty($t) || !hash_equals($_SESSION['csrf_token'] ?? '', $t)) {
+        http_response_code(403);
+        echo json_encode(['error' => 'csrf']);
+        return false;
+    }
+    return true;
+}
+
+function bale_rate_limit_check(string $ip, int $max): bool {
+    global $pdo;
+    $bucket = (int)(time() / 3600);
+    try {
+        $pdo->prepare(
+            "INSERT INTO bale_rate_limit (ip_address, hour_bucket, count) VALUES (?, ?, 1)
+             ON DUPLICATE KEY UPDATE count = count + 1"
+        )->execute([$ip, $bucket]);
+        $stmt = $pdo->prepare("SELECT count FROM bale_rate_limit WHERE ip_address = ? AND hour_bucket = ?");
+        $stmt->execute([$ip, $bucket]);
+        $row = $stmt->fetch(\PDO::FETCH_ASSOC);
+        return ((int)($row['count'] ?? 0)) <= $max;
+    } catch (\Throwable $e) {
+        error_log('bale_rate_limit_check: ' . $e->getMessage());
+        return true;
+    }
+}
+
+function bale_is_admin(): bool {
+    return isset($_SESSION['user']) && ($_SESSION['role'] ?? '') === 'admin';
+}
+
+function bale_configured(): bool {
+    return !empty(bale_config('bot_token')) && !empty(bale_config('bot_username'));
+}
+
+function bale_validate_username_msg(string $u): ?string {
+    if (!validate_username($u)) {
+        return 'یوزرنیم باید با حرف انگلیسی شروع بشه، ۳ تا ۳۰ کاراکتر، فقط حروف/عدد/_/-';
+    }
+    $reserved = ['admin', 'root', 'support', 'help', 'api', 'www', 'xcloud', 'retrivo'];
+    if (in_array(strtolower($u), $reserved, true)) return 'این یوزرنیم رزرو شده.';
+    return null;
+}
+function bale_validate_password_msg(string $p): ?string {
+    if (!validate_password_strength($p)) return 'رمز حداقل ۸ کاراکتر، شامل حرف و عدد باشه.';
+    return null;
+}
+function bale_validate_email_optional(?string $e): ?string {
+    if ($e === null || $e === '') return null;
+    if (!filter_var($e, FILTER_VALIDATE_EMAIL)) return 'فرمت ایمیل نامعتبره.';
+    return null;
+}
+
+// ── webhook helpers ────────────────────────────────────────────────
+function bale_handle_start(int $chat_id, int $from_id, string $token): void {
+    global $pdo;
+    if (!preg_match('/^[a-f0-9]{64}$/', $token)) {
+        bale_send($chat_id, bale_msg('token_invalid'));
+        return;
+    }
+    $stmt = $pdo->prepare("SELECT * FROM bale_auth_sessions WHERE token = ?");
+    $stmt->execute([$token]);
+    $s = $stmt->fetch(\PDO::FETCH_ASSOC);
+    if (!$s || $s['status'] !== 'pending' || (int)$s['expires_at'] < time()) {
+        bale_send($chat_id, bale_msg('token_invalid'));
+        return;
+    }
+    $pdo->prepare(
+        "UPDATE bale_auth_sessions SET status='expired'
+         WHERE bale_user_id = ? AND status='pending' AND token != ?"
+    )->execute([$from_id, $token]);
+    $pdo->prepare("UPDATE bale_auth_sessions SET bale_user_id = ? WHERE token = ?")
+        ->execute([$from_id, $token]);
+    bale_send(
+        $chat_id,
+        $s['purpose'] === 'register' ? bale_msg('welcome_register') : bale_msg('welcome_recover'),
+        bale_contact_keyboard()
+    );
+}
+
+function bale_handle_contact(int $chat_id, int $from_id, array $contact): void {
+    global $pdo;
+    if (!isset($contact['user_id']) || (int)$contact['user_id'] !== $from_id) {
+        bale_send($chat_id, bale_msg('contact_not_yours'));
+        return;
+    }
+    $phone = bale_normalize_iran_phone((string)($contact['phone_number'] ?? ''));
+    if ($phone === null) {
+        bale_send($chat_id, bale_msg('contact_not_iran'));
+        return;
+    }
+    $stmt = $pdo->prepare(
+        "SELECT * FROM bale_auth_sessions
+         WHERE bale_user_id = ? AND status='pending' AND expires_at > ?
+         ORDER BY created_at DESC LIMIT 1"
+    );
+    $stmt->execute([$from_id, time()]);
+    $s = $stmt->fetch(\PDO::FETCH_ASSOC);
+    if (!$s) {
+        // I-3 idempotency: if a recent session is already verified, replay success.
+        $stmt = $pdo->prepare(
+            "SELECT purpose FROM bale_auth_sessions
+             WHERE bale_user_id = ? AND status='verified' AND expires_at > ?
+             ORDER BY created_at DESC LIMIT 1"
+        );
+        $stmt->execute([$from_id, time()]);
+        $rv = $stmt->fetch(\PDO::FETCH_ASSOC);
+        if ($rv) {
+            bale_send(
+                $chat_id,
+                $rv['purpose'] === 'register' ? bale_msg('register_success') : bale_msg('recover_success'),
+                bale_remove_keyboard()
+            );
+            return;
+        }
+        bale_send($chat_id, bale_msg('session_expired'), bale_remove_keyboard());
+        return;
+    }
+    $stmt = $pdo->prepare("SELECT id FROM users WHERE phone_number = ? LIMIT 1");
+    $stmt->execute([$phone]);
+    $existing = $stmt->fetch(\PDO::FETCH_ASSOC);
+    if ($s['purpose'] === 'register' && $existing) {
+        bale_send($chat_id, bale_msg('register_phone_taken'), bale_remove_keyboard());
+        $pdo->prepare("UPDATE bale_auth_sessions SET status='expired' WHERE token=?")
+            ->execute([$s['token']]);
+        return;
+    }
+    if ($s['purpose'] === 'recover' && !$existing) {
+        bale_send($chat_id, bale_msg('recover_no_account'), bale_remove_keyboard());
+        $pdo->prepare("UPDATE bale_auth_sessions SET status='expired' WHERE token=?")
+            ->execute([$s['token']]);
+        return;
+    }
+    $one_time_key = bin2hex(random_bytes(32));
+    $pdo->prepare(
+        "UPDATE bale_auth_sessions
+         SET status='verified', phone_number=?, one_time_key=?
+         WHERE token=?"
+    )->execute([$phone, $one_time_key, $s['token']]);
+    bale_send(
+        $chat_id,
+        $s['purpose'] === 'register' ? bale_msg('register_success') : bale_msg('recover_success'),
+        bale_remove_keyboard()
+    );
+}
+
+function bale_handle_freetext(int $chat_id, int $from_id, array $msg): void {
+    global $pdo;
+    $stmt = $pdo->prepare(
+        "SELECT status, expires_at FROM bale_auth_sessions
+         WHERE bale_user_id = ? ORDER BY created_at DESC LIMIT 1"
+    );
+    $stmt->execute([$from_id]);
+    $latest = $stmt->fetch(\PDO::FETCH_ASSOC);
+    if ($latest && $latest['status'] === 'pending' && (int)$latest['expires_at'] > time()) {
+        bale_send($chat_id, bale_msg('pending_reminder'), bale_contact_keyboard());
+        return;
+    }
+    if ($latest && in_array($latest['status'], ['verified', 'used'], true)) {
+        bale_send($chat_id, bale_msg('already_done'));
+        return;
+    }
+    // M-2 redact sensitive fields before logging.
+    $sanitized = $msg;
+    unset($sanitized['contact'], $sanitized['location']);
+    try {
+        $pdo->prepare("INSERT INTO bale_unknown_updates (received_at, update_json) VALUES (?, ?)")
+            ->execute([time(), json_encode($sanitized, JSON_UNESCAPED_UNICODE)]);
+    } catch (\Throwable $e) {
+        error_log('bale unknown log: ' . $e->getMessage());
+    }
+    bale_send($chat_id, bale_msg('fallback'));
+}
+
+// ── Action handlers ────────────────────────────────────────────────
+
+if ($action === 'bale_check_username') {
+    header('Content-Type: application/json');
+    if (!bale_csrf_ok_json()) exit;
+    $u = trim($_POST['username'] ?? '');
+    if ($e = bale_validate_username_msg($u)) {
+        echo json_encode(['available' => false, 'message' => $e]); exit;
+    }
+    $stmt = $pdo->prepare("SELECT 1 FROM users WHERE username = ? LIMIT 1");
+    $stmt->execute([$u]);
+    if ($stmt->fetch()) {
+        echo json_encode(['available' => false, 'message' => 'این یوزرنیم قبلاً گرفته شده.']); exit;
+    }
+    $stmt = $pdo->prepare(
+        "SELECT 1 FROM bale_auth_sessions
+         WHERE pending_username = ? AND status='pending' AND expires_at > ? LIMIT 1"
+    );
+    $stmt->execute([$u, time()]);
+    if ($stmt->fetch()) {
+        echo json_encode(['available' => false, 'message' => 'این یوزرنیم در حال رزرو موقت است.']); exit;
+    }
+    echo json_encode(['available' => true]); exit;
+}
+
+if ($action === 'bale_register_start') {
+    header('Content-Type: application/json');
+    if (!bale_csrf_ok_json()) exit;
+    if (!bale_configured()) {
+        http_response_code(503);
+        echo json_encode(['error' => 'not_configured', 'message' => 'بات بله هنوز توسط ادمین فعال نشده.']); exit;
+    }
+    if (!bale_check_origin()) {
+        http_response_code(403);
+        echo json_encode(['error' => 'origin']); exit;
+    }
+    $ip = $_SERVER['REMOTE_ADDR'] ?? '0.0.0.0';
+    if (!bale_rate_limit_check($ip, BALE_START_RATE_LIMIT)) {
+        http_response_code(429);
+        echo json_encode(['error' => 'rate_limit', 'message' => 'بیش از حد تلاش کردی. کمی صبر کن.']); exit;
+    }
+    $username = trim($_POST['username'] ?? '');
+    $password = (string)($_POST['password'] ?? '');
+    $email    = trim($_POST['email'] ?? '');
+    if ($email === '') {
+        $email = null;
+    } else {
+        $email = mb_strtolower($email);
+    }
+    if ($e = bale_validate_username_msg($username)) { echo json_encode(['error'=>'invalid_username','message'=>$e]); exit; }
+    if ($e = bale_validate_password_msg($password)) { echo json_encode(['error'=>'invalid_password','message'=>$e]); exit; }
+    if ($e = bale_validate_email_optional($email))  { echo json_encode(['error'=>'invalid_email','message'=>$e]); exit; }
+
+    $stmt = $pdo->prepare("SELECT 1 FROM users WHERE username = ? LIMIT 1");
+    $stmt->execute([$username]);
+    if ($stmt->fetch()) {
+        echo json_encode(['error'=>'username_taken','message'=>'این یوزرنیم قبلاً گرفته شده.']); exit;
+    }
+    if ($email) {
+        $stmt = $pdo->prepare("SELECT 1 FROM users WHERE email = ? LIMIT 1");
+        $stmt->execute([$email]);
+        if ($stmt->fetch()) {
+            echo json_encode(['error'=>'email_taken','message'=>'این ایمیل قبلاً ثبت شده.']); exit;
+        }
+    }
+
+    $token = bin2hex(random_bytes(32));
+    $hash  = password_hash($password, PASSWORD_DEFAULT);
+    $now   = time();
+    $stmt = $pdo->prepare(
+        "INSERT INTO bale_auth_sessions
+         (token, purpose, status, pending_username, pending_password_hash, pending_email,
+          ip_address, user_agent, csrf_origin, created_at, expires_at)
+         VALUES (?, 'register', 'pending', ?, ?, ?, ?, ?, ?, ?, ?)"
+    );
+    $stmt->execute([
+        $token, $username, $hash, $email,
+        $ip,
+        substr((string)($_SERVER['HTTP_USER_AGENT'] ?? ''), 0, 500),
+        substr((string)($_SERVER['HTTP_ORIGIN']     ?? ''), 0, 200),
+        $now, $now + BALE_SESSION_TTL_SECONDS,
+    ]);
+    echo json_encode([
+        'token'      => $token,
+        'bot_url'    => bale_deep_link($token),
+        'expires_in' => BALE_SESSION_TTL_SECONDS,
+    ]);
+    exit;
+}
+
+if ($action === 'bale_forgot_start') {
+    header('Content-Type: application/json');
+    if (!bale_csrf_ok_json()) exit;
+    if (!bale_configured()) {
+        http_response_code(503);
+        echo json_encode(['error' => 'not_configured']); exit;
+    }
+    if (!bale_check_origin()) {
+        http_response_code(403);
+        echo json_encode(['error' => 'origin']); exit;
+    }
+    $ip = $_SERVER['REMOTE_ADDR'] ?? '0.0.0.0';
+    if (!bale_rate_limit_check($ip, BALE_START_RATE_LIMIT)) {
+        http_response_code(429);
+        echo json_encode(['error'=>'rate_limit','message'=>'بیش از حد تلاش کردی.']); exit;
+    }
+    $password = (string)($_POST['password'] ?? '');
+    if ($e = bale_validate_password_msg($password)) {
+        echo json_encode(['error'=>'invalid_password','message'=>$e]); exit;
+    }
+    $token = bin2hex(random_bytes(32));
+    $hash  = password_hash($password, PASSWORD_DEFAULT);
+    $now   = time();
+    $stmt = $pdo->prepare(
+        "INSERT INTO bale_auth_sessions
+         (token, purpose, status, pending_password_hash, ip_address, user_agent,
+          csrf_origin, created_at, expires_at)
+         VALUES (?, 'recover', 'pending', ?, ?, ?, ?, ?, ?)"
+    );
+    $stmt->execute([
+        $token, $hash, $ip,
+        substr((string)($_SERVER['HTTP_USER_AGENT'] ?? ''), 0, 500),
+        substr((string)($_SERVER['HTTP_ORIGIN']     ?? ''), 0, 200),
+        $now, $now + BALE_SESSION_TTL_SECONDS,
+    ]);
+    echo json_encode([
+        'token'      => $token,
+        'bot_url'    => bale_deep_link($token),
+        'expires_in' => BALE_SESSION_TTL_SECONDS,
+    ]);
+    exit;
+}
+
+if ($action === 'bale_status') {
+    header('Content-Type: application/json');
+    $token = $_GET['token'] ?? '';
+    if (!preg_match('/^[a-f0-9]{64}$/', (string)$token)) {
+        echo json_encode(['status' => 'unknown']); exit;
+    }
+    $stmt = $pdo->prepare(
+        "SELECT status, one_time_key, expires_at, purpose FROM bale_auth_sessions WHERE token = ?"
+    );
+    $stmt->execute([$token]);
+    $s = $stmt->fetch(\PDO::FETCH_ASSOC);
+    if (!$s) { echo json_encode(['status'=>'unknown']); exit; }
+    if ((int)$s['expires_at'] < time() && $s['status'] === 'pending') {
+        echo json_encode(['status'=>'expired']); exit;
+    }
+    if ($s['status'] === 'verified') {
+        echo json_encode(['status'=>'verified', 'one_time_key' => $s['one_time_key']]); exit;
+    }
+    echo json_encode(['status' => $s['status']]); exit;
+}
+
+if ($action === 'bale_complete') {
+    header('Content-Type: application/json');
+    if (!bale_csrf_ok_json()) exit;
+    $key = $_POST['one_time_key'] ?? '';
+    if (!preg_match('/^[a-f0-9]{64}$/', (string)$key)) {
+        http_response_code(400);
+        echo json_encode(['error' => 'missing_key']); exit;
+    }
+    $pdo->beginTransaction();
+    try {
+        $stmt = $pdo->prepare(
+            "SELECT * FROM bale_auth_sessions
+             WHERE one_time_key = ? AND status='verified' AND expires_at > ?
+             FOR UPDATE"
+        );
+        $stmt->execute([$key, time()]);
+        $s = $stmt->fetch(\PDO::FETCH_ASSOC);
+        if (!$s) {
+            $pdo->rollBack();
+            http_response_code(401);
+            echo json_encode(['error'=>'invalid_or_expired']); exit;
+        }
+        $pdo->prepare("UPDATE bale_auth_sessions SET status='used' WHERE token = ?")
+            ->execute([$s['token']]);
+
+        if ($s['purpose'] === 'register') {
+            try {
+                $can_download        = (int)(getSetting($pdo,'default_user_can_download','1')        === '1');
+                $can_change_password = (int)(getSetting($pdo,'default_user_can_change_password','1') === '1');
+                $can_delete          = (int)(getSetting($pdo,'default_user_can_delete','0')          === '1');
+                $can_share           = (int)(getSetting($pdo,'default_user_can_share','0')           === '1');
+                $stmt = $pdo->prepare(
+                    "INSERT INTO users (username, password, email, phone_number, bale_user_id, role,
+                                        can_download, can_change_password, can_delete, can_share)
+                     VALUES (?, ?, ?, ?, ?, 'user', ?, ?, ?, ?)"
+                );
+                $stmt->execute([
+                    $s['pending_username'],
+                    $s['pending_password_hash'],
+                    $s['pending_email'],
+                    $s['phone_number'],
+                    $s['bale_user_id'],
+                    $can_download, $can_change_password, $can_delete, $can_share,
+                ]);
+                $username_final = $s['pending_username'];
+                $role_final     = 'user';
+            } catch (\PDOException $e) {
+                $pdo->rollBack();
+                if ($e->getCode() === '23000') {
+                    http_response_code(409);
+                    echo json_encode([
+                        'error'   => 'duplicate',
+                        'message' => 'یوزرنیم یا اطلاعات در حین فرایند توسط فرد دیگری ثبت شد. لطفاً دوباره تلاش کن.',
+                    ]); exit;
+                }
+                throw $e;
+            }
+        } elseif ($s['purpose'] === 'recover') {
+            $stmt = $pdo->prepare("SELECT id, username, role FROM users WHERE phone_number = ? LIMIT 1");
+            $stmt->execute([$s['phone_number']]);
+            $user = $stmt->fetch(\PDO::FETCH_ASSOC);
+            if (!$user) {
+                $pdo->rollBack();
+                http_response_code(404);
+                echo json_encode(['error'=>'no_account']); exit;
+            }
+            $pdo->prepare("UPDATE users SET password=?, bale_user_id=? WHERE id=?")
+                ->execute([$s['pending_password_hash'], $s['bale_user_id'], $user['id']]);
+            $username_final = $user['username'];
+            $role_final     = $user['role'];
+        } else {
+            $pdo->rollBack();
+            http_response_code(500);
+            echo json_encode(['error'=>'invalid_purpose']); exit;
+        }
+        $pdo->commit();
+        session_regenerate_id(true);
+        $_SESSION['user'] = $username_final;
+        $_SESSION['role'] = $role_final;
+        logActivity(
+            $pdo, $username_final,
+            $s['purpose'] === 'register' ? 'register_bale' : 'password_reset_bale',
+            null,
+            $s['purpose'] === 'register' ? 'ثبت‌نام موفق با بله' : 'تغییر رمز موفق با بله'
+        );
+        echo json_encode(['ok' => true, 'redirect' => '?action=dashboard']);
+        exit;
+    } catch (\Throwable $e) {
+        if ($pdo->inTransaction()) $pdo->rollBack();
+        error_log('bale_complete: ' . $e->getMessage());
+        http_response_code(500);
+        echo json_encode(['error'=>'internal']); exit;
+    }
+}
+
+if ($action === 'bale_webhook') {
+    $secret = bale_config('webhook_secret');
+    $given  = $_GET['s'] ?? '';
+    if (!$secret || !hash_equals((string)$secret, (string)$given)) {
+        http_response_code(403); exit;
+    }
+    $body   = file_get_contents('php://input');
+    $update = json_decode($body ?: '{}', true);
+    if (!is_array($update) || !isset($update['message'])) {
+        echo '{}'; exit;
+    }
+    $msg     = $update['message'];
+    $chat_id = isset($msg['chat']['id']) ? (int)$msg['chat']['id'] : 0;
+    $from_id = isset($msg['from']['id']) ? (int)$msg['from']['id'] : 0;
+    $text    = isset($msg['text']) ? (string)$msg['text'] : '';
+    if (!$chat_id || !$from_id) { echo '{}'; exit; }
+    try {
+        if ($text === '/help')              { bale_send($chat_id, bale_msg('help')); }
+        elseif ($text === '/support')       { bale_send($chat_id, bale_msg('support')); }
+        elseif (strncmp($text, '/start', 6) === 0) {
+            $parts = explode(' ', $text, 2);
+            $tok   = isset($parts[1]) ? trim($parts[1]) : '';
+            if ($tok === '') bale_send($chat_id, bale_msg('start_no_payload'));
+            else             bale_handle_start($chat_id, $from_id, $tok);
+        }
+        elseif (isset($msg['contact']))     { bale_handle_contact($chat_id, $from_id, $msg['contact']); }
+        else                                 { bale_handle_freetext($chat_id, $from_id, $msg); }
+    } catch (\Throwable $e) {
+        error_log('Bale webhook: ' . $e->getMessage());
+    }
+    echo '{}';
+    exit;
+}
+
+if ($action === 'bale_cleanup_cron') {
+    $given  = $_GET['s'] ?? '';
+    $secret = bale_config('webhook_secret');
+    if (!$secret || !hash_equals((string)$secret, (string)$given)) {
+        http_response_code(403); exit;
+    }
+    $now = time();
+    $pdo->prepare("UPDATE bale_auth_sessions SET status='expired' WHERE status='pending' AND expires_at < ?")
+        ->execute([$now]);
+    $pdo->prepare("DELETE FROM bale_auth_sessions WHERE created_at < ?")
+        ->execute([$now - 86400]);
+    $oldBucket = (int)($now / 3600) - 2;
+    $pdo->prepare("DELETE FROM bale_rate_limit WHERE hour_bucket < ?")
+        ->execute([$oldBucket]);
+    $pdo->prepare("DELETE FROM bale_unknown_updates WHERE received_at < ?")
+        ->execute([$now - 7*86400]);
+    header('Content-Type: application/json');
+    echo json_encode(['ok' => true]);
+    exit;
+}
+
+// ── Public-facing forms ─────────────────────────────────────────────
+
+if ($action === 'bale_register_form') {
+    if (!bale_configured()) {
+        header('Location: ?action=register_step1'); exit;
+    }
+    $csrf = generateCsrfToken();
+    ?>
+<!DOCTYPE html><html lang="fa" dir="rtl"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ثبت‌نام با بله — XCloud</title>
+<?= renderHeadAssets() ?>
+<style>
+<?= getAuthSharedCss() ?>
+.hint{font-size:.78rem;margin-top:4px;min-height:1.1em}
+.hint.ok{color:#10b981}.hint.err{color:#ef4444}
+.status-box{margin-top:14px;padding:10px 12px;border-radius:8px;background:#1e293b;color:#e2e8f0;font-size:.86rem;min-height:42px;display:flex;align-items:center;line-height:1.6}
+.status-box small{display:block;color:#94a3b8;margin-top:4px;font-size:.75rem}
+.alt-row{margin-top:18px;display:flex;justify-content:space-between;font-size:.82rem}
+.alt-row a{color:#60a5fa;text-decoration:none}
+</style></head><body>
+<div class="bg-glow bg-glow-1"></div>
+<div class="bg-glow bg-glow-2"></div>
+<div class="auth-card">
+  <h1>📱 ثبت‌نام با بله</h1>
+  <div class="auth-subtitle">شماره موبایلت رو از طریق بله تأیید کن</div>
+  <form id="bale-register-form" autocomplete="off">
+    <input type="hidden" name="csrf_token" value="<?= h($csrf) ?>">
+    <div class="field">
+      <label>یوزرنیم</label>
+      <input type="text" id="bf-username" name="username" required minlength="3" maxlength="30" autocomplete="off">
+      <div id="bf-username-status" class="hint"></div>
+    </div>
+    <div class="field">
+      <label>رمز عبور</label>
+      <input type="password" id="bf-password" name="password" required minlength="8" autocomplete="new-password">
+    </div>
+    <div class="field">
+      <label>تکرار رمز</label>
+      <input type="password" id="bf-password2" required autocomplete="new-password">
+    </div>
+    <div class="field">
+      <label>ایمیل (اختیاری — برای امکان بازیابی با ایمیل)</label>
+      <input type="email" id="bf-email" name="email" autocomplete="off">
+    </div>
+    <button class="btn-primary" type="submit">ثبت‌نام و تأیید با بله</button>
+  </form>
+  <div id="bf-status" class="status-box" hidden></div>
+  <div class="alt-row">
+    <a href="?action=register_step1">ثبت‌نام با ایمیل</a>
+    <a href="index.php">ورود</a>
+  </div>
+</div>
+<script>
+(function(){
+  var csrf = document.querySelector('[name=csrf_token]').value;
+  var u  = document.getElementById('bf-username');
+  var us = document.getElementById('bf-username-status');
+  var timer;
+  u.addEventListener('input', function(){
+    clearTimeout(timer);
+    var v = u.value.trim();
+    if (v.length < 3) { us.textContent=''; us.className='hint'; return; }
+    timer = setTimeout(function(){
+      var fd = new FormData();
+      fd.append('username', v);
+      fd.append('csrf_token', csrf);
+      fetch('?action=bale_check_username', { method:'POST', body: fd })
+        .then(function(r){ return r.json(); })
+        .then(function(d){
+          if (d.available) { us.textContent='✓ در دسترس'; us.className='hint ok'; }
+          else { us.textContent = d.message || '✗'; us.className='hint err'; }
+        }).catch(function(){ us.textContent=''; us.className='hint'; });
+    }, 400);
+  });
+  function poll(token, expires_in) {
+    var st = document.getElementById('bf-status');
+    var startedAt = Date.now();
+    var iv = setInterval(function(){
+      if (Date.now() - startedAt > expires_in*1000) {
+        clearInterval(iv);
+        st.innerHTML = '⏰ زمان تأیید تموم شد. لطفاً دوباره تلاش کن.';
+        return;
+      }
+      fetch('?action=bale_status&token=' + encodeURIComponent(token))
+        .then(function(r){ return r.json(); })
+        .then(function(d){
+          if (d.status === 'verified') {
+            clearInterval(iv);
+            st.textContent = '✅ تأیید شد. در حال ساخت حساب...';
+            var fd = new FormData();
+            fd.append('one_time_key', d.one_time_key);
+            fd.append('csrf_token', csrf);
+            fetch('?action=bale_complete', { method:'POST', body: fd })
+              .then(function(r){ return r.json().then(function(j){ return {ok:r.ok, body:j}; }); })
+              .then(function(res){
+                if (res.ok && res.body.ok) window.location.href = res.body.redirect || '?action=dashboard';
+                else st.textContent = '❌ ' + ((res.body && res.body.message) || 'خطا در تکمیل ورود. دوباره تلاش کن.');
+              });
+          } else if (d.status === 'expired' || d.status === 'unknown') {
+            clearInterval(iv);
+            st.innerHTML = '⏰ نشست منقضی شد.';
+          }
+        });
+    }, 2500);
+  }
+  document.getElementById('bale-register-form').addEventListener('submit', function(e){
+    e.preventDefault();
+    var st = document.getElementById('bf-status');
+    st.hidden = false;
+    var p1 = document.getElementById('bf-password').value;
+    var p2 = document.getElementById('bf-password2').value;
+    if (p1 !== p2) { st.textContent = '❌ رمزها مطابقت ندارن.'; return; }
+    // popup must open in user gesture context, BEFORE await.
+    var popup = window.open('about:blank', '_blank');
+    if (!popup) {
+      st.innerHTML = '⚠️ مرورگرت popup رو block کرد. لطفاً popup رو برای این سایت فعال کن و دوباره تلاش کن.';
+      return;
+    }
+    st.textContent = '⏳ در حال آماده‌سازی...';
+    var fd = new FormData();
+    fd.append('username', u.value.trim());
+    fd.append('password', p1);
+    var em = document.getElementById('bf-email').value.trim();
+    if (em) fd.append('email', em);
+    fd.append('csrf_token', csrf);
+    fetch('?action=bale_register_start', { method:'POST', body: fd })
+      .then(function(r){ return r.json().then(function(j){ return {ok:r.ok, body:j}; }); })
+      .then(function(res){
+        if (!res.ok || res.body.error) {
+          popup.close();
+          st.textContent = '❌ ' + ((res.body && res.body.message) || 'خطا');
+          return;
+        }
+        popup.location.href = res.body.bot_url;
+        st.innerHTML = '📱 توی بله شماره‌ت رو تأیید کن.<br><small>منتظر تأیید...</small>';
+        poll(res.body.token, res.body.expires_in);
+      })
+      .catch(function(){ popup.close(); st.textContent = '❌ خطای شبکه.'; });
+  });
+})();
+</script>
+</body></html>
+    <?php
+    exit;
+}
+
+if ($action === 'bale_forgot_form') {
+    if (!bale_configured()) {
+        header('Location: ?action=forgot_password_step1'); exit;
+    }
+    $csrf = generateCsrfToken();
+    ?>
+<!DOCTYPE html><html lang="fa" dir="rtl"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>بازیابی رمز با بله — XCloud</title>
+<?= renderHeadAssets() ?>
+<style>
+<?= getAuthSharedCss() ?>
+.status-box{margin-top:14px;padding:10px 12px;border-radius:8px;background:#1e293b;color:#e2e8f0;font-size:.86rem;min-height:42px;display:flex;align-items:center;line-height:1.6}
+.status-box small{display:block;color:#94a3b8;margin-top:4px;font-size:.75rem}
+.alt-row{margin-top:18px;display:flex;justify-content:space-between;font-size:.82rem}
+.alt-row a{color:#60a5fa;text-decoration:none}
+</style></head><body>
+<div class="bg-glow bg-glow-1"></div>
+<div class="bg-glow bg-glow-2"></div>
+<div class="auth-card">
+  <h1>🔑 بازیابی رمز با بله</h1>
+  <div class="auth-subtitle">رمز جدید رو وارد کن، بعد شماره‌ت رو با بله تأیید کن</div>
+  <form id="bale-forgot-form" autocomplete="off">
+    <input type="hidden" name="csrf_token" value="<?= h($csrf) ?>">
+    <div class="field">
+      <label>رمز جدید</label>
+      <input type="password" id="bff-password" name="password" required minlength="8" autocomplete="new-password">
+    </div>
+    <div class="field">
+      <label>تکرار رمز جدید</label>
+      <input type="password" id="bff-password2" required autocomplete="new-password">
+    </div>
+    <button class="btn-primary" type="submit">بازیابی با بله</button>
+  </form>
+  <div id="bff-status" class="status-box" hidden></div>
+  <div class="alt-row">
+    <a href="?action=forgot_password_step1">بازیابی با ایمیل</a>
+    <a href="index.php">ورود</a>
+  </div>
+</div>
+<script>
+(function(){
+  var csrf = document.querySelector('[name=csrf_token]').value;
+  function poll(token, expires_in) {
+    var st = document.getElementById('bff-status');
+    var startedAt = Date.now();
+    var iv = setInterval(function(){
+      if (Date.now() - startedAt > expires_in*1000) {
+        clearInterval(iv);
+        st.innerHTML = '⏰ زمان تأیید تموم شد. لطفاً دوباره تلاش کن.';
+        return;
+      }
+      fetch('?action=bale_status&token=' + encodeURIComponent(token))
+        .then(function(r){ return r.json(); })
+        .then(function(d){
+          if (d.status === 'verified') {
+            clearInterval(iv);
+            st.textContent = '✅ تأیید شد. در حال اعمال رمز جدید...';
+            var fd = new FormData();
+            fd.append('one_time_key', d.one_time_key);
+            fd.append('csrf_token', csrf);
+            fetch('?action=bale_complete', { method:'POST', body: fd })
+              .then(function(r){ return r.json().then(function(j){ return {ok:r.ok, body:j}; }); })
+              .then(function(res){
+                if (res.ok && res.body.ok) window.location.href = res.body.redirect || '?action=dashboard';
+                else st.textContent = '❌ ' + ((res.body && res.body.message) || 'خطا.');
+              });
+          } else if (d.status === 'expired' || d.status === 'unknown') {
+            clearInterval(iv);
+            st.innerHTML = '⏰ نشست منقضی شد.';
+          }
+        });
+    }, 2500);
+  }
+  document.getElementById('bale-forgot-form').addEventListener('submit', function(e){
+    e.preventDefault();
+    var st = document.getElementById('bff-status');
+    st.hidden = false;
+    var p1 = document.getElementById('bff-password').value;
+    var p2 = document.getElementById('bff-password2').value;
+    if (p1 !== p2) { st.textContent = '❌ رمزها مطابقت ندارن.'; return; }
+    var popup = window.open('about:blank', '_blank');
+    if (!popup) {
+      st.innerHTML = '⚠️ مرورگرت popup رو block کرد. لطفاً popup رو فعال کن و دوباره تلاش کن.';
+      return;
+    }
+    st.textContent = '⏳ در حال آماده‌سازی...';
+    var fd = new FormData();
+    fd.append('password', p1);
+    fd.append('csrf_token', csrf);
+    fetch('?action=bale_forgot_start', { method:'POST', body: fd })
+      .then(function(r){ return r.json().then(function(j){ return {ok:r.ok, body:j}; }); })
+      .then(function(res){
+        if (!res.ok || res.body.error) {
+          popup.close();
+          st.textContent = '❌ ' + ((res.body && res.body.message) || 'خطا');
+          return;
+        }
+        popup.location.href = res.body.bot_url;
+        st.innerHTML = '📱 توی بله شماره‌ت رو تأیید کن.<br><small>منتظر تأیید...</small>';
+        poll(res.body.token, res.body.expires_in);
+      })
+      .catch(function(){ popup.close(); st.textContent = '❌ خطای شبکه.'; });
+  });
+})();
+</script>
+</body></html>
+    <?php
+    exit;
+}
+
+if ($action === 'admin_bale_settings') {
+    if (!bale_is_admin()) {
+        http_response_code(403);
+        echo 'Access denied';
+        exit;
+    }
+
+    if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+        verifyCsrf();
+        $op = $_POST['op'] ?? 'save';
+
+        if ($op === 'save') {
+            $bot_token      = trim($_POST['bot_token']      ?? '');
+            $bot_username   = trim($_POST['bot_username']   ?? '');
+            $webhook_secret = trim($_POST['webhook_secret'] ?? '');
+            if ($bot_token !== '')      bale_config_set('bot_token',      $bot_token);
+            if ($bot_username !== '')   bale_config_set('bot_username',   ltrim($bot_username, '@'));
+            if ($webhook_secret !== '') bale_config_set('webhook_secret', $webhook_secret);
+            $_SESSION['flash'] = '✅ تنظیمات ذخیره شد.';
+            logActivity($pdo, $_SESSION['user'], 'admin_bale_settings_saved');
+            header('Location: ?action=admin_bale_settings'); exit;
+        }
+        if ($op === 'generate_secret') {
+            $new = bin2hex(random_bytes(32));
+            bale_config_set('webhook_secret', $new);
+            $_SESSION['flash'] = '✅ secret جدید ساخته شد. حالا webhook رو دوباره ثبت کن.';
+            logActivity($pdo, $_SESSION['user'], 'admin_bale_secret_rotated');
+            header('Location: ?action=admin_bale_settings'); exit;
+        }
+        if ($op === 'test_connection') {
+            $res = bale_api('getMe');
+            $_SESSION['flash'] = !empty($res['ok'])
+                ? '✅ اتصال موفق. نام بات: @' . ($res['result']['username'] ?? '?')
+                : '❌ اتصال شکست خورد. توکن رو بررسی کن.';
+            header('Location: ?action=admin_bale_settings'); exit;
+        }
+        if ($op === 'register_webhook') {
+            $secret = bale_config('webhook_secret');
+            if (!$secret) {
+                $_SESSION['flash'] = '❌ اول webhook secret رو ست کن.';
+                header('Location: ?action=admin_bale_settings'); exit;
+            }
+            $url = bale_app_url() . '/?action=bale_webhook&s=' . $secret;
+            $res = bale_api('setWebhook', ['url' => $url]);
+            $_SESSION['flash'] = !empty($res['ok'])
+                ? '✅ Webhook با موفقیت ثبت شد.'
+                : '❌ ثبت webhook شکست خورد: ' . h(substr((string)($res['description'] ?? ''), 0, 200));
+            logActivity($pdo, $_SESSION['user'], 'admin_bale_webhook_set', null, !empty($res['ok']) ? 'ok' : 'failed');
+            header('Location: ?action=admin_bale_settings'); exit;
+        }
+        if ($op === 'delete_webhook') {
+            $res = bale_api('deleteWebhook');
+            $_SESSION['flash'] = !empty($res['ok']) ? '✅ Webhook حذف شد.' : '❌ خطا در حذف webhook.';
+            logActivity($pdo, $_SESSION['user'], 'admin_bale_webhook_deleted');
+            header('Location: ?action=admin_bale_settings'); exit;
+        }
+        if ($op === 'set_commands') {
+            $res = bale_api('setMyCommands', [
+                'commands' => [
+                    ['command' => 'start',   'description' => 'شروع'],
+                    ['command' => 'help',    'description' => 'راهنما'],
+                    ['command' => 'support', 'description' => 'ارتباط با پشتیبانی'],
+                ],
+            ]);
+            $_SESSION['flash'] = !empty($res['ok'])
+                ? '✅ منوی دستورات بات ست شد.'
+                : '⚠️ بله ممکنه این method رو پشتیبانی نکنه. بات بدون منو هم کار می‌کنه.';
+            header('Location: ?action=admin_bale_settings'); exit;
+        }
+        header('Location: ?action=admin_bale_settings'); exit;
+    }
+
+    $bot_token      = (string)bale_config('bot_token',      '');
+    $bot_username   = (string)bale_config('bot_username',   '');
+    $webhook_secret = (string)bale_config('webhook_secret', '');
+    $webhook_info   = $bot_token ? bale_api('getWebhookInfo') : ['ok' => false];
+    $webhook_url    = !empty($webhook_info['ok']) ? ($webhook_info['result']['url'] ?? '') : '';
+    $token_masked   = $bot_token      ? substr($bot_token, 0, 4)      . '...' . substr($bot_token, -4)      : 'ست نشده';
+    $secret_masked  = $webhook_secret ? substr($webhook_secret, 0, 4) . '...' . substr($webhook_secret, -4) : 'ست نشده';
+    $flash = $_SESSION['flash'] ?? '';
+    unset($_SESSION['flash']);
+    $csrf = generateCsrfToken();
+    ?>
+<!DOCTYPE html><html lang="fa" dir="rtl"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>تنظیمات بات بله — XCloud Admin</title>
+<?= renderHeadAssets() ?>
+<style>
+body{font-family:Tahoma,system-ui,sans-serif;background:#0f172a;color:#e2e8f0;margin:0;padding:24px}
+.wrap{max-width:780px;margin:0 auto;background:#1e293b;border:1px solid #334155;border-radius:14px;padding:24px}
+h1{margin:0 0 6px;font-size:1.25rem}
+h2{font-size:.98rem;margin:18px 0 8px;color:#cbd5e1}
+.flash{padding:10px 14px;border-radius:8px;background:#0f4c2e;color:#bbf7d0;margin:0 0 16px;font-size:.88rem}
+.grid{display:grid;gap:10px;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));margin:12px 0;font-size:.84rem}
+.grid > div{padding:10px;background:#0f172a;border:1px solid #334155;border-radius:8px}
+.grid code{color:#fbbf24;display:block;margin-top:4px;word-break:break-all;font-size:.78rem}
+label{display:block;font-size:.82rem;margin:10px 0 4px;color:#cbd5e1}
+input[type=text],input[type=password]{width:100%;box-sizing:border-box;padding:8px 10px;background:#0f172a;border:1px solid #334155;border-radius:6px;color:#e2e8f0;font-family:inherit;font-size:.86rem}
+small{display:block;color:#94a3b8;font-size:.75rem;margin-top:3px}
+button{padding:8px 14px;background:#3b82f6;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:.84rem;margin:4px 4px 4px 0;font-family:inherit}
+button:hover{background:#2563eb}
+button.danger{background:#a33}
+button.danger:hover{background:#922}
+hr{border:0;border-top:1px solid #334155;margin:18px 0}
+.actions{display:flex;flex-wrap:wrap;gap:6px}
+.actions form{display:inline-block;margin:0}
+details{margin-top:14px;padding:10px;background:#0f172a;border:1px solid #334155;border-radius:8px;font-size:.82rem}
+details summary{cursor:pointer;color:#60a5fa}
+details ol{margin:10px 0 4px;padding-right:18px;line-height:1.8}
+.top-link{display:inline-block;margin-bottom:12px;color:#60a5fa;font-size:.82rem;text-decoration:none}
+</style></head><body>
+<div class="wrap">
+  <a class="top-link" href="?action=dashboard">← داشبورد</a>
+  <h1>🤖 تنظیمات بات بله</h1>
+  <?php if ($flash): ?><div class="flash"><?= h($flash) ?></div><?php endif; ?>
+
+  <div class="grid">
+    <div><strong>توکن فعلی</strong><code><?= h($token_masked) ?></code></div>
+    <div><strong>یوزرنیم بات</strong><code><?= $bot_username ? '@' . h($bot_username) : 'ست نشده' ?></code></div>
+    <div><strong>Webhook secret</strong><code><?= h($secret_masked) ?></code></div>
+    <div><strong>Webhook ثبت شده</strong><code><?= $webhook_url ? h($webhook_url) : 'ثبت نشده' ?></code></div>
+  </div>
+
+  <hr>
+  <h2>ذخیره‌ی تنظیمات</h2>
+  <form method="POST" action="?action=admin_bale_settings" autocomplete="off">
+    <input type="hidden" name="csrf_token" value="<?= h($csrf) ?>">
+    <input type="hidden" name="op" value="save">
+
+    <label>توکن بات (از BotFather)</label>
+    <input type="password" name="bot_token"
+           placeholder="<?= $bot_token ? 'برای تغییر، توکن جدید بزن (خالی = بدون تغییر)' : 'مثال: 123456789:ABC-DEF...' ?>"
+           autocomplete="new-password">
+    <small>⚠️ توکن حساسه. در نمایش فقط ۴ حرف اول و آخر دیده میشه. اگه خالی بذاری، توکن قبلی دست‌نخورده باقی می‌مونه.</small>
+
+    <label>یوزرنیم بات (بدون @)</label>
+    <input type="text" name="bot_username"
+           placeholder="<?= $bot_username ? h($bot_username) : 'مثلاً XCloudAuthBot' ?>">
+
+    <label>Webhook secret</label>
+    <input type="password" name="webhook_secret"
+           placeholder="<?= $webhook_secret ? 'خالی = بدون تغییر' : 'یا از دکمه «ساخت secret» استفاده کن' ?>"
+           autocomplete="new-password">
+
+    <div style="margin-top:14px"><button type="submit">💾 ذخیره</button></div>
+  </form>
+
+  <hr>
+  <h2>عملیات</h2>
+  <div class="actions">
+    <form method="POST" action="?action=admin_bale_settings">
+      <input type="hidden" name="csrf_token" value="<?= h($csrf) ?>">
+      <input type="hidden" name="op" value="generate_secret">
+      <button type="submit" onclick="return confirm('secret جدید جایگزین قبلی میشه. مطمئنی؟')">🔑 ساخت secret جدید</button>
+    </form>
+    <form method="POST" action="?action=admin_bale_settings">
+      <input type="hidden" name="csrf_token" value="<?= h($csrf) ?>">
+      <input type="hidden" name="op" value="test_connection">
+      <button type="submit">🔌 تست اتصال (getMe)</button>
+    </form>
+    <form method="POST" action="?action=admin_bale_settings">
+      <input type="hidden" name="csrf_token" value="<?= h($csrf) ?>">
+      <input type="hidden" name="op" value="register_webhook">
+      <button type="submit">📡 ثبت webhook</button>
+    </form>
+    <form method="POST" action="?action=admin_bale_settings">
+      <input type="hidden" name="csrf_token" value="<?= h($csrf) ?>">
+      <input type="hidden" name="op" value="set_commands">
+      <button type="submit">📋 ست کردن منوی دستورات</button>
+    </form>
+    <form method="POST" action="?action=admin_bale_settings">
+      <input type="hidden" name="csrf_token" value="<?= h($csrf) ?>">
+      <input type="hidden" name="op" value="delete_webhook">
+      <button type="submit" class="danger" onclick="return confirm('بات از کار می‌افته تا دوباره webhook ثبت بشه. مطمئنی؟')">❌ حذف webhook</button>
+    </form>
+  </div>
+
+  <details>
+    <summary>راهنمای راه‌اندازی اولیه</summary>
+    <ol>
+      <li>به @botfather در بله برو و یه بات جدید بساز</li>
+      <li>توکنی که BotFather می‌ده رو در «توکن بات» قرار بده</li>
+      <li>یوزرنیم بات (بدون @) رو وارد کن</li>
+      <li>روی «ساخت secret جدید» کلیک کن</li>
+      <li>«ذخیره» کن</li>
+      <li>«تست اتصال» بزن — باید نام بات رو نشون بده</li>
+      <li>«ثبت webhook» بزن — بات فعال میشه</li>
+      <li>«ست کردن منوی دستورات» (اختیاری)</li>
+    </ol>
+  </details>
+</div>
+</body></html>
+    <?php
+    exit;
+}
+
+// END of BALE BOT AUTH block.
 // ================================================================
 // LOGIN PAGE
 // ================================================================
@@ -11391,5 +12524,6 @@ elseif($action=='receipt_generator'){
     </div>
     </body></html><?php
 }
+
 else{header("Location: index.php");exit;}
 ?>

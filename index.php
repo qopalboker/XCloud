@@ -5571,6 +5571,31 @@ if($action=='trash_restore'){
     $s=$pdo->prepare("SELECT * FROM trash_items WHERE id=?");$s->execute([$tid]);$item=$s->fetch();
     if($item){
         $tp=$trash_base.$item['trash_filename'];
+        // Tab-file branch FIRST — must come before is_public/user-folder so a
+        // tab file (which has its own original_owner uploader) doesn't fall
+        // into the default user-folder branch. Mirror collision-suffix and
+        // logActivity conventions of the other two branches.
+        if(!empty($item['tab_id'])){
+            $tab=getTabById($pdo,(int)$item['tab_id']);
+            if(!$tab){header("Location: ?action=trash&msg=tab_gone");exit;}
+            try{$restoreDir=getTabUploadPath($pdo,$tab['slug']);}
+            catch(InvalidArgumentException $e){header("Location: ?action=trash&msg=tab_gone");exit;}
+            $rp=$restoreDir.$item['original_filename'];
+            if(file_exists($rp)){$ext=pathinfo($item['original_filename'],PATHINFO_EXTENSION);$nm=pathinfo($item['original_filename'],PATHINFO_FILENAME);$rp=$restoreDir.$nm.'_restored_'.time().($ext?".$ext":'');}
+            if(file_exists($tp)&&rename($tp,$rp)){
+                $restoredName=basename($rp);
+                // CRITICAL: uploaded_by = original_owner (the uploader Phase 3.2
+                // preserved at trash-time), NOT deleted_by (the admin who
+                // pressed delete). Using deleted_by would silently transfer
+                // ownership to whoever cleaned up trash.
+                $ins=$pdo->prepare("INSERT INTO custom_tab_files (tab_id,filename,uploaded_by,file_size) VALUES(?,?,?,?)");
+                $ins->execute([(int)$tab['id'],$restoredName,$item['original_owner'],(int)$item['file_size']]);
+                $pdo->prepare("DELETE FROM trash_items WHERE id=?")->execute([$tid]);
+                logActivity($pdo,$_SESSION['user'],'trash_restore',$restoredName,"tab={$tab['slug']} uploader={$item['original_owner']}");
+                header("Location: ?action=trash&msg=restored");exit;
+            }
+            header("Location: ?action=trash&msg=restore_error");exit;
+        }
         $isPublic=!empty($item['is_public'])||$item['original_owner']==='__public__';
         if($isPublic){
             $rp=$public_base.$item['original_filename'];
@@ -9612,13 +9637,17 @@ function applyBg(id,url){
 elseif($action=='trash'){
     if(!isset($_SESSION['user'])||$_SESSION['role']!=='admin'){header("Location: index.php");exit;}
     $csrf=generateCsrfToken();
-    $trashItems=$pdo->query("SELECT * FROM trash_items ORDER BY deleted_at DESC")->fetchAll();
+    // LEFT JOIN custom_tabs so tab files render with their tab name in one
+    // pass. Hard-deleted tabs return NULL → '?' fallback in the row render.
+    // ORDER BY deleted_at DESC preserved (do NOT switch to id DESC — would
+    // change ordering semantics for non-tab files).
+    $trashItems=$pdo->query("SELECT ti.*, ct.name AS tab_name, ct.slug AS tab_slug FROM trash_items ti LEFT JOIN custom_tabs ct ON ct.id=ti.tab_id ORDER BY ti.deleted_at DESC")->fetchAll();
     $trashSize=0;foreach($trashItems as $it){$tp=$trash_base.$it['trash_filename'];if(file_exists($tp))$trashSize+=filesize($tp);}
     $cleanupMonths=(int)getSetting($pdo,'trash_auto_cleanup_months',1);
     $lastCleanup=getSetting($pdo,'trash_last_cleanup','هرگز');
     if($lastCleanup&&$lastCleanup!=='هرگز')$lastCleanup=to_jalali($lastCleanup);
     $nextCleanup=$cleanupMonths>0&&getSetting($pdo,'trash_last_cleanup')?to_jalali(date('Y-m-d H:i:s',strtotime(getSetting($pdo,'trash_last_cleanup',date('Y-m-d'))." +$cleanupMonths months"))):'غیرفعال';
-    $trashMsgs=['restored'=>['✅','فایل بازگردانی شد'],'restore_error'=>['❌','خطا در بازگردانی'],'perm_deleted'=>['🗑️','فایل حذف دائم شد'],'emptied'=>['🗑️','سطل زباله خالی شد'],'not_found'=>['❌','فایل یافت نشد'],'settings_saved'=>['✅','تنظیمات ذخیره شد']];
+    $trashMsgs=['restored'=>['✅','فایل بازگردانی شد'],'restore_error'=>['❌','خطا در بازگردانی'],'perm_deleted'=>['🗑️','فایل حذف دائم شد'],'emptied'=>['🗑️','سطل زباله خالی شد'],'not_found'=>['❌','فایل یافت نشد'],'settings_saved'=>['✅','تنظیمات ذخیره شد'],'tab_gone'=>['❌','تب مورد نظر حذف شده — بازگردانی ممکن نیست']];
     $msg=$_GET['msg']??'';
     ?><!DOCTYPE html><html lang="fa" dir="rtl"><head>
     <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
@@ -9710,7 +9739,10 @@ elseif($action=='trash'){
             <div class="trash-meta">
                 <div class="trash-name" title="<?php echo h($it['original_filename']);?>"><?php echo h($it['original_filename']);?></div>
                 <div class="trash-details">
-                    <?php if(!empty($it['is_public'])||$it['original_owner']==='__public__'):?>
+                    <?php if(!empty($it['tab_id'])):?>
+                        <span style="background:rgba(99,102,241,.15);color:#a5b4fc;padding:1px 8px;border-radius:4px">👥 تب «<?php echo h($it['tab_name']??'?');?>»</span>
+                        <span>👤 <?php echo h($it['original_owner']);?></span>
+                    <?php elseif(!empty($it['is_public'])||$it['original_owner']==='__public__'):?>
                         <span style="background:#dbeafe;color:#1e40af;padding:1px 6px;border-radius:4px">📢 عمومی</span>
                     <?php else:?>
                         <span>👤 <?php echo h($it['original_owner']);?></span>

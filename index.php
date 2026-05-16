@@ -8084,6 +8084,7 @@ $_userBg = getUserBgUrl($_SESSION['user'], $pdo);
                 <a href="?action=activity_log" class="nav-btn nb-log" title="لاگ"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg><span class="btn-text">لاگ</span></a>
                 <a href="?action=bg_admin" class="nav-btn" style="background:rgba(139,92,246,.1);color:#a78bfa;border:1px solid rgba(139,92,246,.2)" title="مدیریت گالری بک‌گراند"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" width="13" height="13"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21"/></svg><span class="btn-text">گالری</span></a>
                 <a href="?action=users" class="nav-btn nb-users" title="کاربران"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/></svg><span class="btn-text">کاربران</span></a>
+                <a href="?action=admin_tabs" class="nav-btn" style="background:rgba(99,102,241,.1);color:#a5b4fc;border:1px solid rgba(99,102,241,.25)" title="تب‌های اشتراکی"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" width="13" height="13"><path d="M3 7h18M3 12h18M3 17h18"/></svg><span class="btn-text">📑 تب‌ها</span></a>
                 <a href="?action=inbound_settings" class="nav-btn nb-users" title="دریافت ایمیل"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22,6 12,13 2,6"/></svg><span class="btn-text">📨</span></a>
                 <a href="?action=receipt_generator" class="nav-btn" style="background:rgba(245,158,11,.1);color:#fcd34d;border:1px solid rgba(245,158,11,.25)" title="مولد رسید نمونه (DEMO)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" width="13" height="13"><path d="M14 2H6a2 2 0 0 0-2 2v16l3-2 3 2 3-2 3 2 3-2V8z"/><line x1="8" y1="10" x2="16" y2="10"/><line x1="8" y1="14" x2="16" y2="14"/></svg><span class="btn-text">رسید</span></a>
                 <?php endif;?>
@@ -10139,6 +10140,403 @@ elseif($action=='users'){
             });
         }
         renderPage();
+    })();
+    </script>
+    </body></html><?php
+}
+
+// ================================================================
+// ADMIN TAB MANAGEMENT PAGE
+// ================================================================
+elseif($action=='admin_tabs'){
+    if(!isset($_SESSION['user'])||$_SESSION['role']!=='admin'){header("Location: index.php");exit;}
+    $csrf=generateCsrfToken();
+
+    // Load all non-deleted tabs with correlated member_count + file_count.
+    // For N tabs the subqueries are 2N + 1 queries; acceptable for small N.
+    $tabs=$pdo->query("
+        SELECT t.*,
+               (SELECT COUNT(*) FROM custom_tab_members m WHERE m.tab_id=t.id) AS member_count,
+               (SELECT COUNT(*) FROM custom_tab_files f WHERE f.tab_id=t.id) AS file_count
+        FROM custom_tabs t
+        WHERE t.deleted_at IS NULL
+        ORDER BY t.sort_order ASC, t.id ASC
+    ")->fetchAll(PDO::FETCH_ASSOC);
+
+    $allUsers=$pdo->query("SELECT username FROM users ORDER BY username ASC")->fetchAll(PDO::FETCH_COLUMN);
+
+    // Pre-render per-tab member modal initial state so the modal opens
+    // without a first AJAX fetch. Keyed by tab_id; carried into the trigger
+    // button via a data-members attribute. Add/remove cycles still hit AJAX
+    // and re-render from the JSON response.
+    $tabMembersJson=[];
+    foreach($tabs as $t){
+        $ms=$pdo->prepare("SELECT username,added_by,added_at FROM custom_tab_members WHERE tab_id=? ORDER BY added_at DESC");
+        $ms->execute([(int)$t['id']]);
+        $members=$ms->fetchAll(PDO::FETCH_ASSOC);
+        foreach($members as &$m){$m['added_at_jalali']=to_jalali($m['added_at']);}unset($m);
+        $memberNames=array_column($members,'username');
+        $tabMembersJson[(int)$t['id']]=[
+            'ok'=>true,
+            'members'=>$members,
+            'non_members'=>array_values(array_diff($allUsers,$memberNames)),
+        ];
+    }
+
+    $atMsgs=[
+        'tab_created'=>['✅','تب ساخته شد'],
+        'tab_renamed'=>['✅','نام تب تغییر کرد'],
+        'tab_deleted'=>['🗑️','تب حذف شد'],
+        'tab_reordered'=>['✅','ترتیب تب‌ها بروزرسانی شد'],
+        'member_added'=>['✅','عضو به تب افزوده شد'],
+        'member_removed'=>['🗑️','عضو از تب حذف شد'],
+        'invalid_name'=>['❌','نام تب نامعتبر است'],
+        'tab_not_found'=>['❌','تب یافت نشد'],
+        'user_not_found'=>['❌','کاربر یافت نشد'],
+        'delete_error'=>['❌','خطا در حذف تب'],
+        'reorder_error'=>['❌','خطا در تغییر ترتیب'],
+    ];
+    $msg=$_GET['msg']??'';
+    ?><!DOCTYPE html><html lang="fa" dir="rtl"><head>
+    <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+    <title>XCloud — تب‌های اشتراکی</title>
+<?= renderHeadAssets() ?>
+    <style>
+    *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+    body{font-family:'Dana',-apple-system,system-ui,Tahoma,sans-serif;background:#0a0e1a;color:#e2e8f0;min-height:100vh;padding:18px;line-height:1.6}
+    .wrap{max-width:1080px;margin:0 auto}
+    .app-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:18px;flex-wrap:wrap;gap:10px}
+    .back-link{color:#3b82f6;text-decoration:none;font-size:.85rem}
+    .back-link:hover{color:#60a5fa}
+    h1{font-size:1.15rem;color:#f1f5f9;display:flex;align-items:center;gap:8px;margin:0}
+    .top-bar{display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;gap:10px;flex-wrap:wrap}
+    .action-btn{padding:10px 18px;border:none;border-radius:10px;font-weight:700;font-size:.85rem;cursor:pointer;font-family:inherit;text-decoration:none;display:inline-block}
+    .action-btn.primary{background:linear-gradient(135deg,#3b82f6,#6366f1);color:#fff;box-shadow:0 4px 14px rgba(59,130,246,.25)}
+    .action-btn.primary:hover{transform:translateY(-1px)}
+    .table-wrap{background:#111827;border:1px solid #1e293b;border-radius:14px;overflow:auto}
+    table{width:100%;border-collapse:collapse;font-size:.84rem;min-width:720px}
+    th,td{padding:10px 12px;text-align:right;border-bottom:1px solid #1e293b;vertical-align:middle}
+    th{background:#0f172a;color:#94a3b8;font-weight:600;font-size:.78rem;position:sticky;top:0}
+    tbody tr:hover{background:rgba(255,255,255,.02)}
+    code{background:#0a0e1a;color:#a78bfa;padding:2px 8px;border-radius:6px;font-size:.78rem;direction:ltr;display:inline-block}
+    .reorder-cell{white-space:nowrap;display:inline-flex;gap:2px}
+    .reorder-btn{background:#1e293b;color:#cbd5e1;border:1px solid #334155;border-radius:6px;width:26px;height:26px;font-size:.85rem;cursor:pointer;padding:0;display:inline-flex;align-items:center;justify-content:center}
+    .reorder-btn:hover:not(:disabled){background:#334155}
+    .reorder-btn:disabled{opacity:.3;cursor:not-allowed}
+    .members-btn{background:rgba(59,130,246,.1);color:#93c5fd;border:1px solid rgba(59,130,246,.2);border-radius:8px;padding:5px 10px;font-size:.78rem;cursor:pointer;font-family:inherit}
+    .members-btn:hover{background:rgba(59,130,246,.18)}
+    .row-actions{display:inline-flex;gap:4px}
+    .row-btn{background:#1e293b;color:#cbd5e1;border:1px solid #334155;border-radius:6px;padding:5px 10px;font-size:.78rem;cursor:pointer;font-family:inherit}
+    .row-btn:hover{background:#334155}
+    .empty{padding:48px 20px;text-align:center;color:#64748b}
+    .modal-overlay{display:none;position:fixed;inset:0;z-index:2000;background:rgba(0,0,0,.65);backdrop-filter:blur(4px);align-items:center;justify-content:center;padding:16px}
+    .modal-overlay.open{display:flex}
+    .modal-box{background:#111827;border-radius:14px;padding:24px;width:100%;max-width:480px;border:1px solid #1e293b;max-height:90vh;overflow:auto}
+    .modal-box.wide{max-width:640px}
+    .modal-box h3{font-size:.95rem;margin-bottom:14px;color:#f1f5f9}
+    .modal-box input[type=text],.modal-box input[type=search]{width:100%;background:#0a0e1a;border:1.5px solid #1e293b;padding:10px 12px;border-radius:10px;color:#e2e8f0;outline:none;font-size:.85rem;font-family:inherit}
+    .modal-box input:focus{border-color:#3b82f6}
+    .modal-actions{display:flex;gap:8px;margin-top:14px}
+    .modal-actions button{flex:1;padding:10px;border-radius:8px;font-weight:700;cursor:pointer;border:none;font-size:.84rem;font-family:inherit}
+    .modal-actions .cancel{background:#1e293b;color:#cbd5e1}
+    .modal-actions .confirm{background:#3b82f6;color:#fff}
+    .pick-label{font-size:.78rem;font-weight:700;color:#cbd5e1;margin:12px 0 8px}
+    .checkbox-list{max-height:200px;overflow-y:auto;background:#0a0e1a;border:1px solid #1e293b;border-radius:8px;padding:8px}
+    .checkbox-list label{display:flex;align-items:center;gap:8px;padding:5px 6px;border-radius:6px;cursor:pointer;font-size:.82rem}
+    .checkbox-list label:hover{background:#1e293b}
+    .checkbox-list input{margin:0}
+    .member-cols{display:flex;gap:14px}
+    .member-cols>div{flex:1;min-width:0}
+    .member-list{max-height:280px;overflow-y:auto;background:#0a0e1a;border:1px solid #1e293b;border-radius:8px;padding:6px;display:flex;flex-direction:column;gap:4px}
+    .member-row{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:6px 8px;border-radius:6px;background:rgba(255,255,255,.02);font-size:.78rem}
+    .member-row .meta{color:#64748b;font-size:.7rem;display:block;margin-top:2px}
+    .member-row .name{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis}
+    .member-row button{background:#334155;color:#cbd5e1;border:none;border-radius:6px;padding:4px 8px;font-size:.74rem;cursor:pointer;font-family:inherit}
+    .member-row button.add{background:rgba(34,197,94,.15);color:#86efac}
+    .member-row button.remove{background:#dc2626;color:#fff}
+    .member-list-empty{text-align:center;color:#64748b;font-size:.78rem;padding:20px 8px}
+    @media (max-width:640px){.member-cols{flex-direction:column}}
+    .toast{position:fixed;top:72px;left:50%;transform:translateX(-50%) translateY(-16px);background:#1a2235;border:1px solid #1e293b;border-radius:12px;padding:12px 20px;z-index:3000;font-size:.82rem;font-weight:600;box-shadow:0 12px 40px rgba(0,0,0,.4);opacity:0;pointer-events:none;transition:all .4s cubic-bezier(.16,1,.3,1);display:flex;align-items:center;gap:8px}
+    .toast.show{opacity:1;transform:translateX(-50%) translateY(0);pointer-events:auto}
+    </style>
+    </head><body>
+    <div class="wrap">
+    <header class="app-header">
+        <a href="?action=dashboard" class="back-link">← بازگشت به داشبورد</a>
+    </header>
+
+    <div class="top-bar">
+        <h1>📑 تب‌های اشتراکی</h1>
+        <button class="action-btn primary" onclick="openCreateModal()">➕ ساخت تب جدید</button>
+    </div>
+
+    <div class="table-wrap">
+        <table>
+            <thead>
+                <tr>
+                    <th>ترتیب</th>
+                    <th>نام</th>
+                    <th>Slug</th>
+                    <th>اعضا</th>
+                    <th>فایل‌ها</th>
+                    <th>تاریخ ایجاد</th>
+                    <th>عملیات</th>
+                </tr>
+            </thead>
+            <tbody>
+                <?php if(empty($tabs)):?>
+                <tr><td class="empty" colspan="7">هنوز تبی ایجاد نشده. اولین تب اشتراکی را بسازید.</td></tr>
+                <?php else:
+                    $allIds=array_column($tabs,'id');
+                    foreach($tabs as $i=>$t):
+                        // Compute swap-up and swap-down order arrays server-side
+                        // so the reorder forms work without JavaScript.
+                        $upOrder=$allIds;
+                        if($i>0){[$upOrder[$i-1],$upOrder[$i]]=[$upOrder[$i],$upOrder[$i-1]];}
+                        $downOrder=$allIds;
+                        if($i<count($tabs)-1){[$downOrder[$i],$downOrder[$i+1]]=[$downOrder[$i+1],$downOrder[$i]];}
+                        $tabNameJs=json_encode($t['name'],JSON_UNESCAPED_UNICODE|JSON_HEX_TAG|JSON_HEX_QUOT|JSON_HEX_APOS|JSON_HEX_AMP);
+                        $membersJson=json_encode($tabMembersJson[(int)$t['id']],JSON_UNESCAPED_UNICODE|JSON_HEX_TAG|JSON_HEX_QUOT|JSON_HEX_APOS|JSON_HEX_AMP);
+                ?>
+                <tr>
+                    <td>
+                        <span class="reorder-cell">
+                            <form method="POST" action="?action=tab_reorder" style="display:inline">
+                                <input type="hidden" name="csrf_token" value="<?php echo $csrf;?>">
+                                <?php foreach($upOrder as $oid):?><input type="hidden" name="order[]" value="<?php echo (int)$oid;?>"><?php endforeach;?>
+                                <button type="submit" class="reorder-btn" title="بالا" <?php echo $i===0?'disabled':'';?>>▲</button>
+                            </form>
+                            <form method="POST" action="?action=tab_reorder" style="display:inline">
+                                <input type="hidden" name="csrf_token" value="<?php echo $csrf;?>">
+                                <?php foreach($downOrder as $oid):?><input type="hidden" name="order[]" value="<?php echo (int)$oid;?>"><?php endforeach;?>
+                                <button type="submit" class="reorder-btn" title="پایین" <?php echo $i===count($tabs)-1?'disabled':'';?>>▼</button>
+                            </form>
+                        </span>
+                    </td>
+                    <td><?php echo h($t['name']);?></td>
+                    <td><code><?php echo h($t['slug']);?></code></td>
+                    <td>
+                        <button class="members-btn" onclick='openMembersModal(<?php echo (int)$t['id'];?>,<?php echo h($tabNameJs);?>)' data-members='<?php echo h($membersJson);?>'>
+                            👥 <?php echo (int)$t['member_count'];?> عضو
+                        </button>
+                    </td>
+                    <td><?php echo (int)$t['file_count'];?></td>
+                    <td><?php echo h(to_jalali($t['created_at']));?></td>
+                    <td>
+                        <span class="row-actions">
+                            <button class="row-btn" onclick='openRenameModal(<?php echo (int)$t['id'];?>,<?php echo h($tabNameJs);?>)'>✏️ تغییر نام</button>
+                            <form method="POST" action="?action=tab_delete" onsubmit="return confirm('آیا از حذف تب «<?php echo h(addslashes($t['name']));?>» اطمینان دارید؟ تمام فایل‌های این تب به سطل زباله منتقل می‌شوند.');" style="display:inline">
+                                <input type="hidden" name="csrf_token" value="<?php echo $csrf;?>">
+                                <input type="hidden" name="tab_id" value="<?php echo (int)$t['id'];?>">
+                                <button type="submit" class="row-btn" style="background:#dc2626;color:#fff;border-color:#dc2626">🗑 حذف</button>
+                            </form>
+                        </span>
+                    </td>
+                </tr>
+                <?php endforeach; endif;?>
+            </tbody>
+        </table>
+    </div>
+    </div>
+
+    <div class="toast" id="toast"></div>
+
+    <!-- Create-tab modal. Deliberately NOT AJAX — matches Phase 2.1
+         redirect-based handler. Do NOT unify with member modal (Task 5.6,
+         which IS AJAX with pre-rendered initial state). -->
+    <div class="modal-overlay" id="createModal">
+        <div class="modal-box">
+            <h3>➕ ساخت تب جدید</h3>
+            <form method="POST" action="?action=tab_create">
+                <input type="hidden" name="csrf_token" value="<?php echo $csrf;?>">
+                <input type="text" name="name" placeholder="نام تب (مثلاً: طراحی)" required maxlength="100" autocomplete="off">
+                <div class="pick-label">اعضای اولیه (انتخاب اختیاری):</div>
+                <div class="checkbox-list">
+                    <?php foreach($allUsers as $u): if($u===$_SESSION['user'])continue; ?>
+                    <label><input type="checkbox" name="members[]" value="<?php echo h($u);?>"> <?php echo h($u);?></label>
+                    <?php endforeach;?>
+                </div>
+                <div class="modal-actions">
+                    <button type="button" class="cancel" onclick="closeCreateModal()">انصراف</button>
+                    <button type="submit" class="confirm">ساخت تب</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- Rename modal. Redirect-based POST. -->
+    <div class="modal-overlay" id="renameModal">
+        <div class="modal-box">
+            <h3>✏️ تغییر نام تب</h3>
+            <form method="POST" action="?action=tab_rename">
+                <input type="hidden" name="csrf_token" value="<?php echo $csrf;?>">
+                <input type="hidden" name="tab_id" id="renameTabId">
+                <input type="text" name="new_name" id="renameTabName" placeholder="نام جدید" required maxlength="100" autocomplete="off">
+                <div class="modal-actions">
+                    <button type="button" class="cancel" onclick="closeRenameModal()">انصراف</button>
+                    <button type="submit" class="confirm">ذخیره</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- Member modal. AJAX — mirrors share_create dual-mode pattern. -->
+    <div class="modal-overlay" id="memberModal">
+        <div class="modal-box wide">
+            <h3 id="memberModalTitle">اعضای تب</h3>
+            <div class="member-cols">
+                <div>
+                    <div class="pick-label">اعضای فعلی</div>
+                    <div class="member-list" id="currentMembers"></div>
+                </div>
+                <div>
+                    <div class="pick-label">کاربران غیرعضو</div>
+                    <input type="search" id="memberSearch" placeholder="🔎 جستجو..." oninput="filterNonMembers()">
+                    <div class="member-list" id="nonMembers" style="margin-top:6px"></div>
+                </div>
+            </div>
+            <div class="modal-actions">
+                <button type="button" class="cancel" onclick="closeMembersModal()">بستن</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+    (function(){
+        const csrf = <?php echo json_encode($csrf, JSON_UNESCAPED_UNICODE|JSON_HEX_TAG);?>;
+
+        window.openCreateModal = function(){
+            document.getElementById('createModal').classList.add('open');
+            const inp = document.querySelector('#createModal input[name="name"]');
+            if(inp) setTimeout(()=>inp.focus(),50);
+        };
+        window.closeCreateModal = function(){
+            document.getElementById('createModal').classList.remove('open');
+        };
+        window.openRenameModal = function(tabId, tabName){
+            document.getElementById('renameTabId').value = tabId;
+            document.getElementById('renameTabName').value = tabName;
+            document.getElementById('renameModal').classList.add('open');
+            setTimeout(()=>document.getElementById('renameTabName').focus(),50);
+        };
+        window.closeRenameModal = function(){
+            document.getElementById('renameModal').classList.remove('open');
+        };
+
+        // Member modal: initial state pre-rendered server-side into the
+        // trigger button's data-members attribute. No fetch on open.
+        // Add/remove cycles re-render from AJAX response (Phase 2.5/2.6).
+        let currentTabId = null;
+
+        window.openMembersModal = function(tabId, tabName){
+            currentTabId = tabId;
+            document.getElementById('memberModalTitle').textContent = 'اعضای تب: ' + tabName;
+            document.getElementById('memberModal').dataset.tabId = tabId;
+            const trigger = document.querySelector('.members-btn[onclick*="openMembersModal(' + tabId + ',"]');
+            let initial = null;
+            if (trigger && trigger.dataset.members) {
+                try { initial = JSON.parse(trigger.dataset.members); } catch(e) {}
+            }
+            renderMembers(initial);
+            document.getElementById('memberModal').classList.add('open');
+        };
+        window.closeMembersModal = function(){
+            document.getElementById('memberModal').classList.remove('open');
+            currentTabId = null;
+        };
+
+        async function postMember(action, username){
+            const fd = new FormData();
+            fd.append('tab_id', currentTabId);
+            fd.append('username', username);
+            fd.append('csrf_token', csrf);
+            fd.append('ajax', '1');
+            try {
+                const r = await fetch('?action=' + action, { method:'POST', credentials:'same-origin', body: fd });
+                return await r.json();
+            } catch (e) { return null; }
+        }
+
+        window.addMember = async function(username){
+            const j = await postMember('tab_add_member', username);
+            if (j && j.ok) renderMembers(j);
+            else if (j && j.error) alert('خطا: ' + j.error);
+            else alert('خطا در ارتباط با سرور');
+        };
+        window.removeMember = async function(username){
+            const j = await postMember('tab_remove_member', username);
+            if (j && j.ok) renderMembers(j);
+            else if (j && j.error) alert('خطا: ' + j.error);
+            else alert('خطا در ارتباط با سرور');
+        };
+
+        function renderMembers(j){
+            const memList = document.getElementById('currentMembers');
+            const nonList = document.getElementById('nonMembers');
+            memList.innerHTML = '';
+            nonList.innerHTML = '';
+            if (!j || !j.ok) {
+                memList.innerHTML = '<div class="member-list-empty">خطا در بارگیری اعضا</div>';
+                return;
+            }
+            const members = Array.isArray(j.members) ? j.members : [];
+            const nonMembers = Array.isArray(j.non_members) ? j.non_members : [];
+            if (members.length === 0) {
+                memList.innerHTML = '<div class="member-list-empty">هیچ عضوی وجود ندارد</div>';
+            } else {
+                members.forEach(m => {
+                    const row = document.createElement('div'); row.className = 'member-row';
+                    const left = document.createElement('div'); left.className = 'name';
+                    const nm = document.createElement('div'); nm.textContent = m.username || '';
+                    const meta = document.createElement('span'); meta.className = 'meta';
+                    meta.textContent = 'افزوده شده توسط ' + (m.added_by || '?') + ' در ' + (m.added_at_jalali || '?');
+                    left.appendChild(nm); left.appendChild(meta);
+                    const btn = document.createElement('button'); btn.className = 'remove'; btn.textContent = '× حذف';
+                    btn.addEventListener('click', () => removeMember(m.username));
+                    row.appendChild(left); row.appendChild(btn);
+                    memList.appendChild(row);
+                });
+            }
+            if (nonMembers.length === 0) {
+                nonList.innerHTML = '<div class="member-list-empty">هیچ کاربر غیرعضوی نیست</div>';
+            } else {
+                nonMembers.forEach(u => {
+                    const row = document.createElement('div'); row.className = 'member-row';
+                    const nm = document.createElement('div'); nm.className = 'name'; nm.textContent = u;
+                    const btn = document.createElement('button'); btn.className = 'add'; btn.textContent = '+ افزودن';
+                    btn.addEventListener('click', () => addMember(u));
+                    row.appendChild(nm); row.appendChild(btn);
+                    nonList.appendChild(row);
+                });
+            }
+            filterNonMembers();
+        }
+
+        window.filterNonMembers = function(){
+            const q = (document.getElementById('memberSearch').value || '').toLowerCase().trim();
+            document.querySelectorAll('#nonMembers .member-row').forEach(row => {
+                const name = (row.querySelector('.name')?.textContent || '').toLowerCase();
+                row.style.display = (!q || name.indexOf(q) !== -1) ? '' : 'none';
+            });
+        };
+
+        // Close modals when clicking outside the box
+        ['createModal','renameModal','memberModal'].forEach(id => {
+            const el = document.getElementById(id);
+            if (el) el.addEventListener('click', function(e){ if(e.target===this) el.classList.remove('open'); });
+        });
+
+        // Flash toast
+        const msgs = <?php echo json_encode($atMsgs, JSON_UNESCAPED_UNICODE|JSON_HEX_TAG|JSON_HEX_QUOT|JSON_HEX_APOS|JSON_HEX_AMP);?>;
+        const msg = <?php echo json_encode($msg, JSON_UNESCAPED_UNICODE|JSON_HEX_TAG|JSON_HEX_QUOT|JSON_HEX_APOS|JSON_HEX_AMP);?>;
+        if (msg && msgs[msg]) {
+            const t = document.getElementById('toast');
+            const ic = document.createElement('span'); ic.textContent = msgs[msg][0];
+            const tx = document.createElement('span'); tx.textContent = msgs[msg][1];
+            t.innerHTML = ''; t.appendChild(ic); t.appendChild(tx);
+            setTimeout(()=>t.classList.add('show'),80);
+            setTimeout(()=>t.classList.remove('show'),3200);
+        }
     })();
     </script>
     </body></html><?php
